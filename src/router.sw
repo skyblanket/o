@@ -118,15 +118,51 @@ fun route_company(db, conn, method, p, body) {
         cid = string_sub(rest, 0, string_length(rest) - 7)
         route_issues(db, conn, method, cid, body)
     } else {
-        if (method == 'GET') {
-            row = Store.company_row(db, rest)
-            if (row == nil) {
-                respond(conn, 404, err_json("company not found"))
+        if (string_ends_with(rest, "/agents") == 'true') {
+            acid = string_sub(rest, 0, string_length(rest) - 7)
+            route_agents(db, conn, method, acid, body)
+        } else {
+            if (method == 'GET') {
+                row = Store.company_row(db, rest)
+                if (row == nil) {
+                    respond(conn, 404, err_json("company not found"))
+                } else {
+                    respond(conn, 200, json_encode(row))
+                }
             } else {
-                respond(conn, 200, json_encode(row))
+                respond(conn, 405, err_json("method not allowed"))
             }
+        }
+    }
+}
+
+fun route_agents(db, conn, method, cid, body) {
+    if (method == 'GET') {
+        respond(conn, 200, json_encode(Store.agents_for(db, cid)))
+    } else {
+        if (method == 'POST') {
+            create_agent(db, conn, cid, body)
         } else {
             respond(conn, 405, err_json("method not allowed"))
+        }
+    }
+}
+
+fun create_agent(db, conn, cid, body) {
+    if (string_length(body) == 0) {
+        respond(conn, 400, err_json("request body required"))
+    } else {
+        data = json_decode(body)
+        name = map_get(data, "name")
+        if (name == nil) {
+            respond(conn, 400, err_json("field 'name' is required"))
+        } else {
+            role = default_str(map_get(data, "role"), "generalist")
+            runtime = default_str(map_get(data, "runtime"), "claude-code")
+            model = default_str(map_get(data, "model"), "")
+            id = Store.agent_create(db, cid, name, role, runtime, model)
+            _l = Store.log_activity(db, cid, "operator", "agent.hire", id)
+            respond(conn, 201, json_encode(Store.agent_row(db, id)))
         }
     }
 }

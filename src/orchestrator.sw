@@ -4,18 +4,18 @@
 #
 # A single sw process is the sole authority for scheduling
 # state — all mutations flow through it, so two ticks can never
-# double-dispatch the same issue. Every `tick_interval()` ms a
-# separate `ticker` process pokes it, and on each tick it:
+# double-dispatch the same issue. A separate `ticker` process
+# pokes it every tick_interval(); on each tick it:
 #
 #   1. reconcile — kill + retry any run past the stall timeout
 #   2. fetch     — candidate issues (non-terminal, unclaimed)
-#   3. dispatch  — spawn workers up to the concurrency cap
+#   3. dispatch  — assign an agent + spawn a worker, up to a cap
 #
-# Run completion arrives as {'run_done', ...} messages. Failed
-# and stalled runs are retried with exponential backoff.
-#
-# P1 scope: the loop itself. Workers are deterministic stubs —
-# P2 swaps them for real agent runtimes (claude-code / native).
+# P2: workers run REAL agent runtimes selected by the assigned
+# agent's `runtime` field:
+#   claude-code  — headless `claude -p` in a per-issue workspace
+#   native       — single-shot LLM call over HTTP
+#   sim          — deterministic stub (no spend; pipeline tests)
 #
 # In-memory scheduling state (Symphony model — reconstructible
 # from the DB on restart):
@@ -28,12 +28,13 @@ import Store
 
 export [start]
 
-# ---- tunables (P1 demo values; PRD production values noted) --
-fun max_concurrent() { 3 }       # PRD: configurable, default 10
-fun tick_interval()  { 5000 }    # PRD: 30000
-fun stall_timeout()  { 3000 }    # silent run killed after this
-fun backoff_base()   { 2000 }    # PRD: 10000
-fun max_backoff()    { 60000 }   # PRD: 300000
+# ---- tunables ------------------------------------------------
+fun max_concurrent() { 3 }        # PRD: configurable, default 10
+fun tick_interval()  { 5000 }     # PRD: 30000
+fun stall_timeout()  { 600000 }   # 10 min — real agent runs are slow
+fun backoff_base()   { 2000 }     # PRD: 10000
+fun max_backoff()    { 60000 }    # PRD: 300000
+fun claude_bin()     { "/Users/sky/.local/bin/claude" }
 
 # ---- small math helpers --------------------------------------
 fun pow2(k) {
@@ -46,6 +47,14 @@ fun min2(a, b) {
 
 fun backoff_ms(attempt) {
     min2(backoff_base() * pow2(attempt - 1), max_backoff())
+}
+
+fun default_body(v) {
+    if (v == nil) { "" } else { v }
+}
+
+fun build_prompt(title, body) {
+    "You are an autonomous agent in a fresh working directory. Complete the task below, creating whatever files are needed. Be concise.\n\nTask: " ++ title ++ "\n\n" ++ body
 }
 
 # ---- startup -------------------------------------------------
@@ -147,40 +156,90 @@ fun dispatch_batch(db, cands, slots, running, retry, now) {
     }
 }
 
+# Assign an agent, open a workspace, persist a run, spawn a worker.
+# Skips the issue (running unchanged) if the company has no agents.
 fun dispatch_one(db, issue, iid, attempt, running, now) {
-    run_id = Store.run_create(db, iid, attempt, "Running")
-    _s = Store.issue_set_status(db, iid, "In Progress")
-    _a = Store.log_activity(db, "", "orchestrator", "run.dispatch", iid)
-    outcome = decide_outcome(issue, attempt)
-    wpid = spawn(worker(self(), run_id, iid, outcome))
-    map_put(running, iid, %{run_id: run_id, worker_pid: wpid, started_at: now, attempt: attempt})
+    company_id = map_get(issue, "company_id")
+    agent = Store.agent_first_active(db, company_id)
+    if (agent == nil) {
+        running
+    } else {
+        agent_id = map_get(agent, "id")
+        runtime = map_get(agent, "runtime")
+        home = getenv("HOME")
+        workspace = f"{home}/.o/workspaces/{iid}"
+        run_id = Store.run_create(db, iid, agent_id, attempt, "Running", workspace)
+        _s = Store.issue_set_status(db, iid, "In Progress")
+        _as = Store.issue_assign(db, iid, agent_id)
+        _a = Store.log_activity(db, company_id, "orchestrator", "run.dispatch", iid)
+        ident = map_get(issue, "identifier")
+        print(f"[orch] dispatch {ident} via {runtime} (attempt {attempt})")
+        prompt = build_prompt(map_get(issue, "title"), default_body(map_get(issue, "body")))
+        sim_outcome = if (runtime == "sim") { decide_outcome(issue, attempt) } else { 'none' }
+        wpid = spawn(run_worker(self(), run_id, iid, runtime, prompt, workspace, sim_outcome))
+        map_put(running, iid, %{run_id: run_id, worker_pid: wpid, started_at: now, attempt: attempt})
+    }
 }
 
-# ---- the worker stub (P2 replaces with real agent runtimes) --
-# Outcome is decided up front for a deterministic P1 demo:
-#   attempt >= 2        -> always succeeds (so retries resolve)
-#   sort_order % 3 == 0 -> crashes on attempt 1
-#   sort_order % 3 == 1 -> stalls (hangs) on attempt 1
-#   else                -> succeeds
-fun decide_outcome(issue, attempt) {
-    if (attempt >= 2) {
-        'succeeded'
+# ---- workers: real agent runtimes ----------------------------
+
+fun run_worker(orch, run_id, issue_id, runtime, prompt, workspace, sim_outcome) {
+    _mk = shell(f"mkdir -p {workspace}")
+    if (runtime == "sim") {
+        run_sim(orch, run_id, issue_id, sim_outcome)
     } else {
-        kind = map_get(issue, "sort_order") % 3
-        if (kind == 0) {
-            'crashed'
+        if (runtime == "native") {
+            run_native(orch, run_id, issue_id, prompt, workspace)
         } else {
-            if (kind == 1) { 'stalled' } else { 'succeeded' }
+            run_claude_code(orch, run_id, issue_id, prompt, workspace)
         }
     }
 }
 
-fun worker(orch, run_id, issue_id, outcome) {
-    if (outcome == 'stalled') {
-        sleep(900000)
+# claude-code runtime — a real headless `claude -p` run in the
+# per-issue workspace. Exit 0 = succeeded; anything else = retry.
+fun run_claude_code(orch, run_id, issue_id, prompt, workspace) {
+    _w = file_write(f"{workspace}/PROMPT.txt", prompt)
+    bin = claude_bin()
+    cmd = f"cd {workspace} && cat PROMPT.txt | {bin} -p --dangerously-skip-permissions --output-format json > result.json 2> err.log"
+    result = shell(cmd)
+    code = elem(result, 0)
+    if (code == 0) {
+        send(orch, {'run_done', run_id, issue_id, 'succeeded'})
     } else {
-        sleep(1000)
-        send(orch, {'run_done', run_id, issue_id, outcome})
+        send(orch, {'run_done', run_id, issue_id, 'crashed'})
+    }
+}
+
+# native runtime — single-shot LLM call. Needs O_LLM_URL/O_LLM_KEY.
+fun run_native(orch, run_id, issue_id, prompt, workspace) {
+    url = getenv("O_LLM_URL")
+    if (url == nil) {
+        send(orch, {'run_done', run_id, issue_id, 'crashed'})
+    } else {
+        key = getenv("O_LLM_KEY")
+        reqbody = json_encode(%{messages: [%{role: "user", content: prompt}]})
+        headers = ["Content-Type: application/json", f"Authorization: Bearer {key}"]
+        resp = http_post(url, headers, reqbody)
+        _save = file_write(f"{workspace}/result.json", resp)
+        send(orch, {'run_done', run_id, issue_id, 'succeeded'})
+    }
+}
+
+# sim runtime — deterministic stub, no spend. Used to exercise the
+# scheduling pipeline (dispatch, retry, concurrency) without agents.
+fun run_sim(orch, run_id, issue_id, outcome) {
+    sleep(1000)
+    send(orch, {'run_done', run_id, issue_id, outcome})
+}
+
+# attempt 1 of an even-sort_order issue crashes (then retries clean);
+# everything else succeeds.
+fun decide_outcome(issue, attempt) {
+    if (attempt >= 2) {
+        'succeeded'
+    } else {
+        if (map_get(issue, "sort_order") % 2 == 0) { 'crashed' } else { 'succeeded' }
     }
 }
 
