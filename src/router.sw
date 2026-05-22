@@ -121,6 +121,7 @@ fun route(db, conn, method, path, body) {
         p when string_starts_with(p, "/api/companies/") == 'true' -> route_company(db, conn, method, p, body)
         p when string_starts_with(p, "/api/approvals/") == 'true' -> decide_approval(db, conn, method, p, body)
         p when string_starts_with(p, "/api/runs/") == 'true' -> run_result(db, conn, p)
+        p when string_starts_with(p, "/api/issues/") == 'true' -> route_issue(db, conn, method, p, body)
         _ -> respond(conn, 404, err_json("no route for that path"))
     }
 }
@@ -311,6 +312,32 @@ fun decide_approval(db, conn, method, p, body) {
         }
     } else {
         respond(conn, 405, err_json("method not allowed"))
+    }
+}
+
+# GET/POST /api/issues/:id — fetch or update a single issue. POST
+# changes the operator-editable fields: status, priority, assignee.
+fun route_issue(db, conn, method, p, body) {
+    id = string_sub(p, 12, string_length(p) - 12)
+    cur = Store.issue_row(db, id)
+    if (cur == nil) {
+        respond(conn, 404, err_json("issue not found"))
+    } else {
+        if (method == 'GET') {
+            respond(conn, 200, json_encode(cur))
+        } else {
+            if (method == 'POST') {
+                data = json_decode(body)
+                status = default_str(map_get(data, "status"), map_get(cur, "status"))
+                priority = default_str(map_get(data, "priority"), map_get(cur, "priority"))
+                assignee = default_str(map_get(data, "assignee_agent_id"), map_get(cur, "assignee_agent_id"))
+                _u = Store.issue_update(db, id, status, priority, assignee)
+                _l = Store.log_activity(db, map_get(cur, "company_id"), "operator", "issue.update", id)
+                respond(conn, 200, json_encode(Store.issue_row(db, id)))
+            } else {
+                respond(conn, 405, err_json("method not allowed"))
+            }
+        }
     }
 }
 

@@ -409,17 +409,22 @@ async function doManage(id){
   closeM(); poll();
 }
 
-//--- issue detail ----------------------------------------------------
+//--- issue detail (editable: status, assignee, priority) -------------
 async function mIssue(id){
   const i=S.issues.find(x=>x.id===id); if(!i)return;
-  const ag=S.agents.find(a=>a.id===i.assignee_agent_id);
   const runs=S.runs.filter(r=>r.issue_id===id);
-  openM({ wide:true, body:F({ title:esc(i.identifier)+'  ·  '+esc(i.status),
-   body:`<div style="font-size:16px;font-weight:600;margin-bottom:2px">${esc(i.title)}</div>
-    <div class="meta-row">
-      <span class="badge ${i.status==='Done'?'active':'paused'}">${esc(i.status)}</span>
-      <span class="pill">priority <b>${esc(i.priority||'medium')}</b></span>
-      <span class="pill">agent <b>${ag?esc(ag.name):'unassigned'}</b></span>
+  const agOpts='<option value="">— unassigned —</option>'+S.agents.map(a=>
+    `<option value="${a.id}" ${a.id===i.assignee_agent_id?'selected':''}>${esc(a.name)} · ${a.runtime}</option>`).join('');
+  const stOpts=['Backlog','In Progress','Done','Canceled'].map(s=>
+    `<option ${s===i.status?'selected':''}>${s}</option>`).join('');
+  const prOpts=['high','medium','low'].map(s=>
+    `<option ${s===(i.priority||'medium')?'selected':''}>${s}</option>`).join('');
+  openM({ wide:true, body:F({ title:esc(i.identifier),
+   body:`<div style="font-size:16px;font-weight:600;margin-bottom:13px">${esc(i.title)}</div>
+    <div style="display:flex;gap:9px;margin-bottom:14px">
+      <label class="fld" style="flex:1;margin:0"><span>Status</span><select id="e-status">${stOpts}</select></label>
+      <label class="fld" style="flex:1.5;margin:0"><span>Assignee</span><select id="e-assignee">${agOpts}</select></label>
+      <label class="fld" style="flex:.8;margin:0"><span>Priority</span><select id="e-prio">${prOpts}</select></label>
     </div>
     ${i.body?`<div class="box">${esc(i.body)}</div>`:'<div style="color:var(--faint);font-size:12px">No details provided.</div>'}
     <h4 class="sec">Runs (${runs.length})</h4>
@@ -429,9 +434,8 @@ async function mIssue(id){
         <span style="color:var(--dim)">${dur(r.started_at,r.ended_at)}</span>
         <span style="margin-left:auto;color:var(--dim)">${r.cost_cents?money(r.cost_cents):''}</span>
       </div>`).join(''):'<div style="color:var(--faint);font-size:12px">Not run yet — the orchestrator will pick it up.</div>'}
-    <div id="rr"></div>` ,
-   foot:`<button class="primary" onclick="closeM()">Close</button>` })});
-  // load the agent's output for the latest run that has a workspace
+    <div id="rr"></div>`,
+   foot:`<button class="primary" onclick="saveIssue('${id}')">Save changes</button>` })});
   const last=runs[0];
   if(last){
     try{ const r=await api('/runs/'+last.id+'/result');
@@ -441,10 +445,15 @@ async function mIssue(id){
         `<h4 class="sec">Agent result</h4>`+
         (summary?`<div class="box">${esc(summary)}</div>`:
           raw?`<div class="box mono">${esc(raw.slice(0,1200))}</div>`:
-          `<div style="color:var(--faint);font-size:12px">No result artifact (sim run or none produced).</div>`)+
+          `<div style="color:var(--faint);font-size:12px">No result artifact yet.</div>`)+
         (r.workspace?`<div class="box mono" style="margin-top:7px">workspace · ${esc(r.workspace)}</div>`:'');
     }catch(_){}
   }
+}
+async function saveIssue(id){
+  await post('/issues/'+id,{ status:$('#e-status').value,
+    assignee_agent_id:$('#e-assignee').value, priority:$('#e-prio').value });
+  closeM(); poll();
 }
 
 poll();

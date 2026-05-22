@@ -162,9 +162,24 @@ fun dispatch_batch(db, cands, slots, running, retry, now) {
 
 # Assign an agent, open a workspace, persist a run, spawn a worker.
 # Skips the issue (running unchanged) if the company has no agents.
+# Pick the agent for an issue: its manual assignee if set and valid,
+# otherwise the company's first active agent.
+fun pick_agent(db, company_id, assignee) {
+    if (assignee == nil) {
+        Store.agent_first_active(db, company_id)
+    } else {
+        if (string_length(assignee) == 0) {
+            Store.agent_first_active(db, company_id)
+        } else {
+            a = Store.agent_row(db, assignee)
+            if (a == nil) { Store.agent_first_active(db, company_id) } else { a }
+        }
+    }
+}
+
 fun dispatch_one(db, issue, iid, attempt, running, now) {
     company_id = map_get(issue, "company_id")
-    agent = Store.agent_first_active(db, company_id)
+    agent = pick_agent(db, company_id, map_get(issue, "assignee_agent_id"))
     if (agent == nil) {
         running
     } else {

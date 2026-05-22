@@ -11,7 +11,7 @@ module Store
 
 export [next_id, companies, company_row, company_create, company_update,
         company_add_spend, enforce_budget,
-        issues_for, issue_row, issue_create, issue_set_status, issue_assign,
+        issues_for, issue_row, issue_create, issue_set_status, issue_assign, issue_update,
         log_activity, activity_recent, candidate_issues,
         run_create, run_finish, runs_all, run_row,
         agents_for, agent_row, agent_first_active, agent_create,
@@ -122,7 +122,13 @@ fun issue_assign(db, id, agent_id) {
 # Non-terminal issues belonging to ACTIVE companies (a paused company
 # — budget hard-stop — yields no candidates). Priority, then age.
 fun candidate_issues(db) {
-    db_query(db, "SELECT id, company_id, identifier, title, body, status, priority, sort_order FROM issue WHERE status NOT IN ('Done', 'Canceled') AND company_id IN (SELECT id FROM company WHERE status = 'active') ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, created_at ASC", [])
+    db_query(db, "SELECT id, company_id, identifier, title, body, status, priority, assignee_agent_id, sort_order FROM issue WHERE status NOT IN ('Done', 'Canceled') AND company_id IN (SELECT id FROM company WHERE status = 'active') ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, created_at ASC", [])
+}
+
+# Partial update of the operator-editable issue fields.
+fun issue_update(db, id, status, priority, assignee) {
+    _u = db_query(db, "UPDATE issue SET status = ?, priority = ?, assignee_agent_id = ?, updated_at = ? WHERE id = ?", [status, priority, assignee, timestamp(), id])
+    id
 }
 
 # ---- agents ---------------------------------------------------
