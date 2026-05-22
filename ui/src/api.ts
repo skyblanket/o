@@ -60,7 +60,7 @@ export const api = {
   runs: () => req<Run[]>("/runs"),
   activity: () => req<Activity[]>("/activity"),
   orchestrator: () => req<Orchestrator>("/orchestrator"),
-  runResult: (id: string) => req<{ workspace: string; result: string }>(`/runs/${id}/result`),
+  runResult: (id: string) => req<{ workspace: string; result: string; error: string }>(`/runs/${id}/result`),
   fs: (path: string) =>
     post("/fs", { path }) as Promise<{ path: string; parent: string; listing: string; gits: string }>,
   agentMessages: (id: string) => req<Message[]>(`/agents/${id}/messages`),

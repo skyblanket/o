@@ -4,7 +4,7 @@ import {
   type Company, type Issue, type Agent, type Run, type Activity, type Orchestrator, type Message,
 } from "./api";
 
-const LANES = ["Backlog", "In Progress", "Done"];
+const LANES = ["Backlog", "In Progress", "Done", "Failed"];
 
 // ---- generic modal -------------------------------------------------
 function Modal(props: {
@@ -193,6 +193,7 @@ function IssueModal({ issue, agents, runs, onClose, done }: {
   const [assignee, setAssignee] = useState(issue.assignee_agent_id || "");
   const [prio, setPrio] = useState(issue.priority || "medium");
   const [result, setResult] = useState<string | null>(null);
+  const [errlog, setErrlog] = useState<string>("");
   const mine = runs.filter(r => r.issue_id === issue.id);
 
   useEffect(() => {
@@ -202,6 +203,7 @@ function IssueModal({ issue, agents, runs, onClose, done }: {
       let summary = "";
       try { summary = JSON.parse(r.result).result || ""; } catch { /* not json */ }
       setResult(summary || r.result || "");
+      setErrlog(r.error || "");
     }).catch(() => {});
   }, [issue.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -217,7 +219,7 @@ function IssueModal({ issue, agents, runs, onClose, done }: {
       <div className="row3">
         <Field label="Status">
           <select value={status} onChange={e => setStatus(e.target.value)}>
-            {["Backlog", "In Progress", "Done", "Canceled"].map(s => <option key={s}>{s}</option>)}
+            {["Backlog", "In Progress", "Done", "Failed", "Canceled"].map(s => <option key={s}>{s}</option>)}
           </select>
         </Field>
         <Field label="Assignee">
@@ -244,9 +246,13 @@ function IssueModal({ issue, agents, runs, onClose, done }: {
           <span style={{ marginLeft: "auto", color: "var(--dim)" }}>{r.cost_cents ? money(r.cost_cents) : ""}</span>
         </div>
       )) : <div className="hint">Not run yet — the orchestrator will pick it up.</div>}
-      {result !== null && <>
+      {result !== null && result.length > 0 && <>
         <h4 className="sec">Agent result</h4>
-        <div className="box">{result || "No result artifact yet."}</div>
+        <div className="box">{result}</div>
+      </>}
+      {errlog.length > 0 && <>
+        <h4 className="sec" style={{ color: "var(--red)" }}>Error log</h4>
+        <div className="box mono" style={{ color: "var(--red)" }}>{errlog.slice(0, 2000)}</div>
       </>}
     </Modal>
   );

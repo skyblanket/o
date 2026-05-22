@@ -313,6 +313,25 @@ fun route_agents(db, conn, method, cid, body) {
     }
 }
 
+# Return "" if the repo path is empty or valid; an error message
+# otherwise. Catches the typo class up front so hiring fails loudly,
+# not silently in a retry loop.
+fun validate_repo(repo) {
+    if (string_length(repo) == 0) {
+        ""
+    } else {
+        if (file_exists(repo) == 'false') {
+            f"repo path does not exist: {repo}"
+        } else {
+            if (file_exists(f"{repo}/.git") == 'false') {
+                f"not a git repo (no .git): {repo}"
+            } else {
+                ""
+            }
+        }
+    }
+}
+
 fun create_agent(db, conn, cid, body) {
     if (string_length(body) == 0) {
         respond(conn, 400, err_json("request body required"))
@@ -322,19 +341,24 @@ fun create_agent(db, conn, cid, body) {
         if (name == nil) {
             respond(conn, 400, err_json("field 'name' is required"))
         } else {
-            role = default_str(map_get(data, "role"), "generalist")
-            runtime = default_str(map_get(data, "runtime"), "claude-code")
-            model = default_str(map_get(data, "model"), "")
             repo = default_str(map_get(data, "repo"), "")
-            if (approvals_required() == 'true') {
-                payload = json_encode(%{company_id: cid, name: name, role: role, runtime: runtime, model: model, repo: repo})
-                aid = Store.approval_create(db, cid, "agent.hire", payload)
-                _l = Store.log_activity(db, cid, "operator", "approval.requested", aid)
-                respond(conn, 202, json_encode(%{status: "pending_approval", action: "agent.hire", approval_id: aid}))
+            verr = validate_repo(repo)
+            if (string_length(verr) > 0) {
+                respond(conn, 400, err_json(verr))
             } else {
-                id = Store.agent_create(db, cid, name, role, runtime, model, repo)
-                _l = Store.log_activity(db, cid, "operator", "agent.hire", id)
-                respond(conn, 201, json_encode(Store.agent_row(db, id)))
+                role = default_str(map_get(data, "role"), "generalist")
+                runtime = default_str(map_get(data, "runtime"), "claude-code")
+                model = default_str(map_get(data, "model"), "")
+                if (approvals_required() == 'true') {
+                    payload = json_encode(%{company_id: cid, name: name, role: role, runtime: runtime, model: model, repo: repo})
+                    aid = Store.approval_create(db, cid, "agent.hire", payload)
+                    _l = Store.log_activity(db, cid, "operator", "approval.requested", aid)
+                    respond(conn, 202, json_encode(%{status: "pending_approval", action: "agent.hire", approval_id: aid}))
+                } else {
+                    id = Store.agent_create(db, cid, name, role, runtime, model, repo)
+                    _l = Store.log_activity(db, cid, "operator", "agent.hire", id)
+                    respond(conn, 201, json_encode(Store.agent_row(db, id)))
+                }
             }
         }
     }
@@ -413,11 +437,10 @@ fun run_result(db, conn, p) {
         } else {
             ws = map_get(run, "workspace_path")
             rpath = f"{ws}/result.json"
-            if (file_exists(rpath) == 'true') {
-                respond(conn, 200, json_encode(%{workspace: ws, result: file_read(rpath)}))
-            } else {
-                respond(conn, 200, json_encode(%{workspace: ws, result: ""}))
-            }
+            epath = f"{ws}/err.log"
+            res = if (file_exists(rpath) == 'true') { file_read(rpath) } else { "" }
+            errlog = if (file_exists(epath) == 'true') { file_read(epath) } else { "" }
+            respond(conn, 200, json_encode(%{workspace: ws, result: res, error: errlog}))
         }
     } else {
         respond(conn, 404, err_json("not found"))

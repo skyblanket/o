@@ -34,6 +34,7 @@ fun tick_interval()  { 5000 }     # PRD: 30000
 fun stall_timeout()  { 600000 }   # 10 min — real agent runs are slow
 fun backoff_base()   { 2000 }     # PRD: 10000
 fun max_backoff()    { 60000 }    # PRD: 300000
+fun max_attempts()   { 3 }        # after this many failed runs, the issue is marked Failed
 fun claude_bin()     { "/Users/sky/.local/bin/claude" }
 fun swarm_bin()      { "/Users/sky/swarm-code/bin/swarm-code" }
 
@@ -475,11 +476,19 @@ fun handle_done(db, running, retry, run_id, issue_id, outcome, cost, session_id)
             _a = Store.log_activity(db, company_id, "orchestrator", "run.succeeded", issue_id)
             %{running: map_remove(running, issue_id), retry: map_remove(retry, issue_id)}
         } else {
+            attempt = map_get(info, "attempt")
             _m = Store.run_finish(db, run_id, "Failed", cost)
             account_cost(db, company_id, cost)
-            _a = Store.log_activity(db, company_id, "orchestrator", "run.failed", issue_id)
-            retry2 = schedule_retry(retry, issue_id, map_get(info, "attempt"), now)
-            %{running: map_remove(running, issue_id), retry: retry2}
+            if (attempt >= max_attempts()) {
+                # exhausted retries — mark the issue Failed (terminal), don't loop
+                _s = Store.issue_set_status(db, issue_id, "Failed")
+                _a = Store.log_activity(db, company_id, "orchestrator", "run.failed_final", issue_id)
+                %{running: map_remove(running, issue_id), retry: map_remove(retry, issue_id)}
+            } else {
+                _a = Store.log_activity(db, company_id, "orchestrator", "run.failed", issue_id)
+                retry2 = schedule_retry(retry, issue_id, attempt, now)
+                %{running: map_remove(running, issue_id), retry: retry2}
+            }
         }
     }
 }
