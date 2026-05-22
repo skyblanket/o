@@ -12,7 +12,7 @@ module Store
 export [next_id, companies, company_row, company_create, company_update,
         company_add_spend, enforce_budget,
         issues_for, issue_row, issue_create, issue_set_status, issue_assign,
-        log_activity, candidate_issues,
+        log_activity, activity_recent, candidate_issues,
         run_create, run_finish, runs_all,
         agents_for, agent_row, agent_first_active, agent_create,
         approval_create, approvals_pending, approval_row, approval_set]
@@ -192,4 +192,8 @@ fun log_activity(db, company_id, actor, verb, target) {
     id = next_id("act")
     _ins = db_query(db, "INSERT INTO activity (id, company_id, actor, verb, target, ts) VALUES (?, ?, ?, ?, ?, ?)", [id, company_id, actor, verb, target, timestamp()])
     id
+}
+
+fun activity_recent(db) {
+    db_query(db, "SELECT id, company_id, actor, verb, target, ts FROM activity ORDER BY ts DESC LIMIT 60", [])
 }

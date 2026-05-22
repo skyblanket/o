@@ -64,6 +64,18 @@ fun approvals_required() {
     if (getenv("O_REQUIRE_APPROVALS") == nil) { 'false' } else { 'true' }
 }
 
+# Serve the operator dashboard (single HTML file). O_WEB overrides
+# the path; default is cwd-relative web/dashboard.html.
+fun serve_dashboard(conn) {
+    path = default_str(getenv("O_WEB"), "web/dashboard.html")
+    if (file_exists(path) == 'true') {
+        html = file_read(path)
+        http_respond(conn, 200, ["Content-Type: text/html; charset=utf-8", "Access-Control-Allow-Origin: *"], html)
+    } else {
+        respond(conn, 200, json_encode(%{name: "O", version: "v4", service: "swarmd", dashboard: "not found - set O_WEB"}))
+    }
+}
+
 # Ask the orchestrator process for a live scheduling snapshot.
 fun orch_snapshot(conn) {
     send(whereis('orchestrator'), {'snapshot', self()})
@@ -84,9 +96,10 @@ fun dispatch(db, conn, method, path, body) {
 
 fun route(db, conn, method, path, body) {
     case path {
-        "/" -> respond(conn, 200, json_encode(%{name: "O", version: "v4", service: "swarmd"}))
+        "/" -> serve_dashboard(conn)
         "/api/health" -> respond(conn, 200, json_encode(%{status: "ok", service: "o-v4", version: "v4"}))
         "/api/runs" -> respond(conn, 200, json_encode(Store.runs_all(db)))
+        "/api/activity" -> respond(conn, 200, json_encode(Store.activity_recent(db)))
         "/api/orchestrator" -> orch_snapshot(conn)
         "/api/approvals" -> route_approvals(db, conn, method)
         "/api/companies" -> route_companies(db, conn, method, body)

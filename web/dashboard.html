@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>O v4 — orchestrator</title>
+<style>
+  :root {
+    --bg:#181818; --panel:#202020; --panel2:#262626; --border:#333;
+    --text:#dcdcdc; --dim:#8a8a8a; --accent:#9a7cf7;
+    --green:#4ec9a0; --red:#e06c6c; --amber:#d8a657; --blue:#6cb6ff;
+  }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body {
+    background:var(--bg); color:var(--text);
+    font:13px/1.5 'Inter',-apple-system,BlinkMacSystemFont,system-ui,sans-serif;
+    height:100vh; overflow:hidden;
+  }
+  a { color:var(--accent); }
+  .dim { color:var(--dim); }
+  button {
+    background:var(--panel2); color:var(--text); border:1px solid var(--border);
+    border-radius:6px; padding:5px 10px; font:inherit; font-size:12px; cursor:pointer;
+  }
+  button:hover { border-color:var(--accent); }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  input, select {
+    background:var(--bg); color:var(--text); border:1px solid var(--border);
+    border-radius:6px; padding:5px 8px; font:inherit; font-size:12px;
+  }
+  input:focus, select:focus { outline:none; border-color:var(--accent); }
+
+  header {
+    height:46px; display:flex; align-items:center; gap:14px;
+    padding:0 16px; border-bottom:1px solid var(--border); background:var(--panel);
+  }
+  .logo { font-weight:600; font-size:15px; letter-spacing:.5px; }
+  .logo .v { color:var(--dim); font-weight:400; font-size:12px; margin-left:2px; }
+  .pill {
+    margin-left:auto; display:flex; gap:14px; align-items:center;
+    background:var(--panel2); border:1px solid var(--border);
+    border-radius:20px; padding:5px 14px; font-size:12px;
+  }
+  .pill b { color:var(--text); font-weight:600; }
+  .dot { width:7px; height:7px; border-radius:50%; background:var(--green); display:inline-block; }
+  .dot.live { animation:pulse 2s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.25} }
+
+  .layout { display:grid; grid-template-columns:260px 1fr 330px; height:calc(100vh - 46px); }
+  .col { overflow-y:auto; padding:14px; }
+  .col.mid { background:var(--bg); }
+  .col.left, .col.right { background:var(--panel); }
+  .col.left { border-right:1px solid var(--border); }
+  .col.right { border-left:1px solid var(--border); }
+
+  .secthead {
+    font-size:11px; text-transform:uppercase; letter-spacing:.8px; color:var(--dim);
+    margin:2px 0 10px; display:flex; align-items:center; justify-content:space-between;
+  }
+  .secthead:not(:first-child) { margin-top:22px; }
+
+  .card {
+    background:var(--panel2); border:1px solid var(--border); border-radius:8px;
+    padding:10px; margin-bottom:8px; cursor:pointer;
+  }
+  .card:hover { border-color:#444; }
+  .card.sel { border-color:var(--accent); }
+  .card .nm { font-weight:600; }
+  .row { display:flex; align-items:center; gap:8px; }
+  .spread { display:flex; align-items:center; justify-content:space-between; }
+
+  .badge {
+    font-size:10px; padding:2px 7px; border-radius:10px; text-transform:uppercase;
+    letter-spacing:.5px; border:1px solid var(--border);
+  }
+  .badge.active { color:var(--green); border-color:#2c4a3e; }
+  .badge.paused { color:var(--red); border-color:#4a2c2c; }
+
+  .bar { height:5px; background:var(--bg); border-radius:3px; overflow:hidden; margin-top:7px; }
+  .bar > div { height:100%; background:var(--accent); }
+  .bar > div.over { background:var(--red); }
+
+  .board { display:flex; gap:10px; margin-top:12px; }
+  .lane { flex:1; min-width:0; }
+  .lane h4 {
+    font-size:11px; text-transform:uppercase; letter-spacing:.6px; color:var(--dim);
+    padding:0 2px 8px; display:flex; justify-content:space-between;
+  }
+  .issue {
+    background:var(--panel2); border:1px solid var(--border); border-left:2px solid var(--border);
+    border-radius:6px; padding:8px; margin-bottom:7px; font-size:12px;
+  }
+  .issue .id { color:var(--dim); font-size:10px; font-weight:600; }
+  .issue.p-high { border-left-color:var(--red); }
+  .issue.p-medium { border-left-color:var(--amber); }
+  .issue.p-low { border-left-color:var(--dim); }
+
+  .chip {
+    display:inline-flex; align-items:center; gap:6px; background:var(--panel2);
+    border:1px solid var(--border); border-radius:14px; padding:4px 10px;
+    font-size:11px; margin:0 6px 6px 0;
+  }
+  .rt { font-size:9px; padding:1px 5px; border-radius:4px; background:var(--bg); color:var(--dim); }
+  .rt.cc { color:var(--blue); } .rt.sim { color:var(--dim); } .rt.native { color:var(--amber); }
+
+  .run, .act { padding:7px 0; border-bottom:1px solid var(--border); font-size:12px; }
+  .st { font-size:10px; font-weight:600; }
+  .st.Succeeded { color:var(--green); } .st.Failed { color:var(--red); }
+  .st.Running { color:var(--blue); } .st.Stalled { color:var(--amber); }
+
+  .form { display:none; flex-direction:column; gap:6px; margin-bottom:10px;
+          background:var(--panel2); border:1px solid var(--border); border-radius:8px; padding:10px; }
+  .form.open { display:flex; }
+  .form .row { gap:6px; }
+  .form input, .form select { flex:1; min-width:0; }
+  .empty { color:var(--dim); font-size:12px; padding:20px 4px; text-align:center; }
+  .mission { color:var(--dim); font-size:12px; margin:3px 0 14px; }
+</style>
+</head>
+<body>
+
+<header>
+  <span class="logo">◯ O<span class="v">v4</span></span>
+  <span class="dim" style="font-size:12px">agent-company orchestrator</span>
+  <span class="pill">
+    <span><span class="dot live"></span></span>
+    <span class="dim">tick <b id="o-tick">–</b></span>
+    <span class="dim">running <b id="o-run">–</b></span>
+    <span class="dim">retry <b id="o-retry">–</b></span>
+  </span>
+</header>
+
+<div class="layout">
+  <!-- companies -->
+  <div class="col left">
+    <div class="secthead">Companies <button onclick="toggleForm('f-co')">+ new</button></div>
+    <div class="form" id="f-co">
+      <input id="co-name" placeholder="company name" />
+      <div class="row">
+        <input id="co-prefix" placeholder="prefix" style="flex:.6" />
+        <input id="co-budget" type="number" placeholder="budget ¢" style="flex:1" />
+      </div>
+      <button class="primary" onclick="newCompany()">create</button>
+    </div>
+    <div id="companies"></div>
+  </div>
+
+  <!-- selected company -->
+  <div class="col mid" id="detail">
+    <div class="empty">select or create a company</div>
+  </div>
+
+  <!-- runs + activity -->
+  <div class="col right">
+    <div class="secthead">Recent runs</div>
+    <div id="runs"></div>
+    <div class="secthead">Activity</div>
+    <div id="activity"></div>
+  </div>
+</div>
+
+<script>
+const api  = (p)        => fetch('/api'+p).then(r=>r.json());
+const post = (p,b)      => fetch('/api'+p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)}).then(r=>r.json());
+const esc  = (s)        => (s==null?'':String(s)).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const cents= (c)        => '$'+((Number(c)||0)/100).toFixed(2);
+const ago  = (ts)       => { const s=(Date.now()-ts)/1000; if(s<60)return Math.floor(s)+'s';
+                             if(s<3600)return Math.floor(s/60)+'m'; return Math.floor(s/3600)+'h'; };
+const LANES = ['Backlog','Todo','In Progress','In Review','Done'];
+
+let state = { companies:[], selected:null, issues:[], agents:[], runs:[], activity:[] };
+
+function toggleForm(id){ document.getElementById(id).classList.toggle('open'); }
+
+async function refresh(){
+  try {
+    const [companies,orch,runs,activity] = await Promise.all(
+      [api('/companies'),api('/orchestrator'),api('/runs'),api('/activity')]);
+    state.companies=companies; state.runs=runs; state.activity=activity;
+    document.getElementById('o-tick').textContent  = orch.tick ?? '–';
+    document.getElementById('o-run').textContent   = orch.running ?? '–';
+    document.getElementById('o-retry').textContent = orch.retrying ?? '–';
+    if(!state.selected && companies.length) state.selected=companies[0].id;
+    if(state.selected){
+      state.issues = await api('/companies/'+state.selected+'/issues');
+      state.agents = await api('/companies/'+state.selected+'/agents');
+    }
+    render();
+  } catch(e){ console.error(e); }
+}
+
+function render(){ renderCompanies(); renderDetail(); renderRuns(); renderActivity(); }
+
+function renderCompanies(){
+  document.getElementById('companies').innerHTML = state.companies.map(c=>{
+    const pct = c.budget_monthly_cents>0 ? Math.min(100, 100*c.spent_cents/c.budget_monthly_cents) : 0;
+    const over = c.budget_monthly_cents>0 && c.spent_cents>=c.budget_monthly_cents;
+    return `<div class="card ${c.id===state.selected?'sel':''}" onclick="pick('${c.id}')">
+      <div class="spread"><span class="nm">${esc(c.name)}</span>
+        <span class="badge ${c.status}">${c.status}</span></div>
+      <div class="dim" style="font-size:11px;margin-top:3px">${esc(c.issue_prefix)} ·
+        ${cents(c.spent_cents)}${c.budget_monthly_cents>0?' / '+cents(c.budget_monthly_cents):' spent'}</div>
+      ${c.budget_monthly_cents>0?`<div class="bar"><div class="${over?'over':''}" style="width:${pct}%"></div></div>`:''}
+    </div>`;
+  }).join('') || '<div class="empty">no companies yet</div>';
+}
+
+function renderDetail(){
+  const c = state.companies.find(x=>x.id===state.selected);
+  const d = document.getElementById('detail');
+  if(!c){ d.innerHTML='<div class="empty">select or create a company</div>'; return; }
+  const lanes = LANES.map(L=>{
+    const items = state.issues.filter(i=>i.status===L);
+    return `<div class="lane"><h4>${L}<span>${items.length}</span></h4>
+      ${items.map(i=>`<div class="issue p-${i.priority||'medium'}">
+        <div class="id">${esc(i.identifier)}</div>${esc(i.title)}</div>`).join('')}</div>`;
+  }).join('');
+  d.innerHTML = `
+    <div class="spread"><h2 style="font-size:18px">${esc(c.name)}</h2>
+      <span class="badge ${c.status}">${c.status}</span></div>
+    <div class="mission">${esc(c.mission)||'<span class="dim">no mission set</span>'}</div>
+
+    <div class="secthead">Agents
+      <span><button onclick="toggleForm('f-ag')">+ hire</button></span></div>
+    <div class="form" id="f-ag">
+      <div class="row"><input id="ag-name" placeholder="agent name" />
+        <select id="ag-runtime">
+          <option value="claude-code">claude-code</option>
+          <option value="sim">sim</option>
+          <option value="native">native</option></select></div>
+      <button class="primary" onclick="hireAgent()">hire</button>
+    </div>
+    <div>${state.agents.map(a=>`<span class="chip">${esc(a.name)}
+      <span class="rt ${a.runtime==='claude-code'?'cc':a.runtime}">${a.runtime}</span></span>`).join('')
+      || '<span class="dim">no agents — issues wont dispatch until one is hired</span>'}</div>
+
+    <div class="secthead">Board
+      <span><button onclick="toggleForm('f-iss')">+ issue</button></span></div>
+    <div class="form" id="f-iss">
+      <input id="iss-title" placeholder="issue title" />
+      <div class="row"><select id="iss-prio">
+        <option value="high">high</option><option value="medium" selected>medium</option>
+        <option value="low">low</option></select>
+        <button class="primary" onclick="newIssue()" style="flex:1">create issue</button></div>
+    </div>
+    <div class="board">${lanes}</div>`;
+}
+
+function renderRuns(){
+  document.getElementById('runs').innerHTML = state.runs.slice(0,14).map(r=>`
+    <div class="run spread"><span><span class="st ${r.state}">${r.state}</span>
+      <span class="dim"> attempt ${r.attempt}</span></span>
+      <span class="dim">${r.cost_cents?cents(r.cost_cents):''}</span></div>`).join('')
+    || '<div class="empty">no runs yet</div>';
+}
+
+function renderActivity(){
+  document.getElementById('activity').innerHTML = state.activity.slice(0,30).map(a=>`
+    <div class="act spread"><span><b>${esc(a.verb)}</b>
+      <span class="dim"> ${esc(a.actor)}</span></span>
+      <span class="dim">${ago(a.ts)}</span></div>`).join('')
+    || '<div class="empty">nothing yet</div>';
+}
+
+function pick(id){ state.selected=id; refresh(); }
+
+async function newCompany(){
+  const name=document.getElementById('co-name').value.trim(); if(!name)return;
+  await post('/companies',{ name,
+    issue_prefix:(document.getElementById('co-prefix').value.trim()||'TASK'),
+    budget_monthly_cents:Number(document.getElementById('co-budget').value)||0 });
+  document.getElementById('co-name').value=''; toggleForm('f-co'); refresh();
+}
+async function newIssue(){
+  const t=document.getElementById('iss-title').value.trim(); if(!t||!state.selected)return;
+  await post('/companies/'+state.selected+'/issues',
+    { title:t, priority:document.getElementById('iss-prio').value });
+  document.getElementById('iss-title').value=''; toggleForm('f-iss'); refresh();
+}
+async function hireAgent(){
+  const n=document.getElementById('ag-name').value.trim(); if(!n||!state.selected)return;
+  await post('/companies/'+state.selected+'/agents',
+    { name:n, runtime:document.getElementById('ag-runtime').value });
+  document.getElementById('ag-name').value=''; toggleForm('f-ag'); refresh();
+}
+
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>

@@ -11,19 +11,19 @@ This is **v4** — the swarmrt rebuild, succeeding the O-v3 Python studio.
 
 > Design: see [`PRD-SWARM-ORCHESTRATOR.md`](../PRD-SWARM-ORCHESTRATOR.md).
 
-## Status — P3 (governance)
+## Status — P4 (the operator dashboard)
 
-- **P0 — spine:** SQLite control-plane (8 tables) · `swarmd` daemon · HTTP server · REST CRUD.
-- **P1 — engine:** single-authority orchestrator · Symphony-style tick loop · bounded
+- **P0 — spine** · SQLite control-plane (8 tables) · `swarmd` daemon · HTTP + REST CRUD.
+- **P1 — engine** · single-authority orchestrator · Symphony-style tick loop · bounded
   concurrency · crash retry with exponential backoff · stall detection.
-- **P2 — agents:** runtime-pluggable workers — `claude-code` (real headless `claude -p` in a
-  per-issue workspace), `native` (single-shot LLM over HTTP), `sim` (deterministic stub).
-- **P3 — governance:** per-company budgets with a **hard-stop** (a company at its cap is
-  paused — dispatch and in-flight retries both freeze) · **cost hook** (real `claude-code`
-  spend parsed per run and accumulated) · **approval gates** (governed actions queue for
-  operator sign-off when `O_REQUIRE_APPROVALS` is set; off by default).
+- **P2 — agents** · runtime-pluggable workers — `claude-code` (real headless `claude -p`),
+  `native` (LLM over HTTP), `sim` (deterministic stub).
+- **P3 — governance** · per-company budgets + hard-stop · cost hook · approval gates.
+- **P4 — dashboard** · `swarmd` serves a single-file operator UI at `/` — companies, a
+  per-company kanban board, agents, live runs + activity feed. Create companies, file
+  issues, and hire agents from the browser.
 
-Next: P4 — the O-Docs UI (graph + kanban + dashboard over this daemon).
+Next: P5 — polish: `curl | sh` installer, docs, an example company template.
 
 ## Build & run
 
@@ -32,7 +32,8 @@ make            # builds bin/swarmd  (needs swarmrt at ../swarmrt)
 make run        # starts the daemon on http://127.0.0.1:4100
 ```
 
-The control-plane database is created automatically at `~/.o/o.db`.
+The control-plane database is created automatically at `~/.o/o.db`. Open
+**http://localhost:4100** for the operator dashboard.
 
 ## API (P0)
 
