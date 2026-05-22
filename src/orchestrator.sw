@@ -339,7 +339,7 @@ fun chat_worker(dbpath, agent_id, message) {
         ""
     } else {
         runtime = map_get(agent, "runtime")
-        rawses = map_get(agent, "session_id")
+        rawses = map_get(agent, "chat_session_id")
         session_id = if (rawses == nil) { "" } else { rawses }
         home = getenv("HOME")
         workspace = f"{home}/.o/chat/{agent_id}"
@@ -348,7 +348,7 @@ fun chat_worker(dbpath, agent_id, message) {
         outcome = chat_invoke(runtime, workspace, session_id)
         new_session = map_get(outcome, "session")
         if (string_length(new_session) > 0) {
-            _ss = Store.agent_set_session(db, agent_id, new_session)
+            _ss = Store.agent_set_chat_session(db, agent_id, new_session)
         } else {
             ""
         }
@@ -369,7 +369,15 @@ fun chat_invoke(runtime, workspace, session_id) {
         bin = claude_bin()
         resume = if (string_length(session_id) > 0) { f" --resume {session_id}" } else { "" }
         _r = shell(f"cd {workspace} && cat CHAT.txt | {bin} -p{resume} --dangerously-skip-permissions --output-format json > reply.json 2> err.log")
-        %{reply: chat_reply_claude(f"{workspace}/reply.json"), session: parse_session(f"{workspace}/reply.json")}
+        reply = chat_reply_claude(f"{workspace}/reply.json")
+        if (reply == "(no reply)") {
+            # the stored session was stale / not found in this dir —
+            # retry once with a fresh session so chat never dead-ends.
+            _r2 = shell(f"cd {workspace} && cat CHAT.txt | {bin} -p --dangerously-skip-permissions --output-format json > reply.json 2> err.log")
+            %{reply: chat_reply_claude(f"{workspace}/reply.json"), session: parse_session(f"{workspace}/reply.json")}
+        } else {
+            %{reply: reply, session: parse_session(f"{workspace}/reply.json")}
+        }
     }
 }
 

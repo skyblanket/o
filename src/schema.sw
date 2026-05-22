@@ -47,6 +47,10 @@ fun migrate(db) {
     # additive columns for older databases (error harmlessly if present)
     _alt = db_exec(db, "ALTER TABLE agent ADD COLUMN repo TEXT DEFAULT ''")
     _alt_ses = db_exec(db, "ALTER TABLE agent ADD COLUMN session_id TEXT DEFAULT ''")
+    # chat keeps its OWN session: claude sessions are scoped to the
+    # directory they were created in, so chat (stable ~/.o/chat/<id>)
+    # cannot resume a session captured inside an issue worktree.
+    _alt_cs = db_exec(db, "ALTER TABLE agent ADD COLUMN chat_session_id TEXT DEFAULT ''")
 
     print("  schema     migrated (9 tables)")
 }

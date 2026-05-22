@@ -14,7 +14,8 @@ export [next_id, companies, company_row, company_create, company_update,
         issues_for, issue_row, issue_create, issue_set_status, issue_assign, issue_update,
         log_activity, activity_recent, candidate_issues,
         run_create, run_finish, runs_all, run_row,
-        agents_for, agent_row, agent_first_active, agent_create, agent_set_session,
+        agents_for, agent_row, agent_first_active, agent_create,
+        agent_set_session, agent_set_chat_session,
         message_create, messages_for,
         approval_create, approvals_pending, approval_row, approval_set]
 
@@ -139,7 +140,7 @@ fun agents_for(db, company_id) {
 }
 
 fun agent_row(db, id) {
-    rows = db_query(db, "SELECT id, company_id, name, role, department, model, runtime, repo, session_id, status, created_at FROM agent WHERE id = ?", [id])
+    rows = db_query(db, "SELECT id, company_id, name, role, department, model, runtime, repo, session_id, chat_session_id, status, created_at FROM agent WHERE id = ?", [id])
     if (length(rows) == 0) { nil } else { hd(rows) }
 }
 
@@ -159,6 +160,12 @@ fun agent_create(db, company_id, name, role, runtime, model, repo) {
 # so the agent accumulates context across all the work it does.
 fun agent_set_session(db, agent_id, session_id) {
     _u = db_query(db, "UPDATE agent SET session_id = ? WHERE id = ?", [session_id, agent_id])
+    agent_id
+}
+
+# The chat conversation's own session — separate from issue runs.
+fun agent_set_chat_session(db, agent_id, session_id) {
+    _u = db_query(db, "UPDATE agent SET chat_session_id = ? WHERE id = ?", [session_id, agent_id])
     agent_id
 }
 
