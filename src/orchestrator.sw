@@ -35,6 +35,7 @@ fun stall_timeout()  { 600000 }   # 10 min — real agent runs are slow
 fun backoff_base()   { 2000 }     # PRD: 10000
 fun max_backoff()    { 60000 }    # PRD: 300000
 fun claude_bin()     { "/Users/sky/.local/bin/claude" }
+fun swarm_bin()      { "/Users/sky/swarm-code/bin/swarm-code" }
 
 # ---- small math helpers --------------------------------------
 fun pow2(k) {
@@ -97,8 +98,8 @@ fun tick_loop(db, tick_n, running, retry) {
             qc = map_size(nq)
             print(f"[orch] tick {tick_n}  running={rc}  retry={qc}")
             tick_loop(db, tick_n + 1, nr, nq)
-        {'run_done', run_id, issue_id, outcome, cost} ->
-            r = handle_done(db, running, retry, run_id, issue_id, outcome, cost)
+        {'run_done', run_id, issue_id, outcome, cost, session_id} ->
+            r = handle_done(db, running, retry, run_id, issue_id, outcome, cost, session_id)
             tick_loop(db, tick_n, map_get(r, "running"), map_get(r, "retry"))
         {'snapshot', from} ->
             send(from, {'snapshot_reply', %{tick: tick_n, running: map_size(running), retrying: map_size(retry), tick_interval_ms: tick_interval(), max_concurrent: max_concurrent()}})
@@ -191,6 +192,10 @@ fun dispatch_one(db, issue, iid, attempt, running, now) {
         runtime = map_get(agent, "runtime")
         rawrepo = map_get(agent, "repo")
         repo = if (rawrepo == nil) { "" } else { rawrepo }
+        # The agent's durable runtime session — empty on its first ever
+        # run, then resumed on every issue after, so it accumulates context.
+        rawses = map_get(agent, "session_id")
+        session_id = if (rawses == nil) { "" } else { rawses }
         home = getenv("HOME")
         workspace = f"{home}/.o/workspaces/{iid}"
         run_id = Store.run_create(db, iid, agent_id, attempt, "Running", workspace)
@@ -198,17 +203,18 @@ fun dispatch_one(db, issue, iid, attempt, running, now) {
         _as = Store.issue_assign(db, iid, agent_id)
         _a = Store.log_activity(db, company_id, "orchestrator", "run.dispatch", iid)
         ident = map_get(issue, "identifier")
-        print(f"[orch] dispatch {ident} via {runtime} (attempt {attempt})")
+        resumed = if (string_length(session_id) > 0) { "resume" } else { "fresh" }
+        print(f"[orch] dispatch {ident} via {runtime} ({resumed} session, attempt {attempt})")
         prompt = build_prompt(map_get(issue, "title"), default_body(map_get(issue, "body")), repo)
         sim_outcome = if (runtime == "sim") { decide_outcome(issue, attempt) } else { 'none' }
-        wpid = spawn(run_worker(self(), run_id, iid, runtime, prompt, workspace, repo, sim_outcome))
-        map_put(running, iid, %{run_id: run_id, worker_pid: wpid, started_at: now, attempt: attempt, company_id: company_id})
+        wpid = spawn(run_worker(self(), run_id, iid, runtime, prompt, workspace, repo, session_id, sim_outcome))
+        map_put(running, iid, %{run_id: run_id, worker_pid: wpid, started_at: now, attempt: attempt, company_id: company_id, agent_id: agent_id})
     }
 }
 
 # ---- workers: real agent runtimes ----------------------------
 
-fun run_worker(orch, run_id, issue_id, runtime, prompt, workspace, repo, sim_outcome) {
+fun run_worker(orch, run_id, issue_id, runtime, prompt, workspace, repo, session_id, sim_outcome) {
     if (runtime == "sim") {
         run_sim(orch, run_id, issue_id, sim_outcome)
     } else {
@@ -216,7 +222,11 @@ fun run_worker(orch, run_id, issue_id, runtime, prompt, workspace, repo, sim_out
             _mk = shell(f"mkdir -p {workspace}")
             run_native(orch, run_id, issue_id, prompt, workspace)
         } else {
-            run_claude_code(orch, run_id, issue_id, prompt, workspace, repo)
+            if (runtime == "swarm-code") {
+                run_swarm_code(orch, run_id, issue_id, prompt, workspace, repo)
+            } else {
+                run_claude_code(orch, run_id, issue_id, prompt, workspace, repo, session_id)
+            }
         }
     }
 }
@@ -224,7 +234,13 @@ fun run_worker(orch, run_id, issue_id, runtime, prompt, workspace, repo, sim_out
 # claude-code runtime — a real headless `claude -p` run in the
 # per-issue workspace. Exit 0 = succeeded; anything else = retry.
 # Real cost is parsed from result.json (total_cost_usd).
-fun run_claude_code(orch, run_id, issue_id, prompt, workspace, repo) {
+#
+# Shape B — persistent agent: if the agent already has a session_id,
+# the run is `claude -p --resume <id>`, so the agent's conversation
+# CONTINUES across every issue it's handed. The (possibly new)
+# session id is parsed back out and returned in run_done, where the
+# orchestrator persists it onto the agent.
+fun run_claude_code(orch, run_id, issue_id, prompt, workspace, repo, session_id) {
     if (string_length(repo) > 0) {
         prepare_worktree(repo, workspace, issue_id)
     } else {
@@ -232,14 +248,16 @@ fun run_claude_code(orch, run_id, issue_id, prompt, workspace, repo) {
     }
     _w = file_write(f"{workspace}/PROMPT.txt", prompt)
     bin = claude_bin()
-    cmd = f"cd {workspace} && cat PROMPT.txt | {bin} -p --dangerously-skip-permissions --output-format json > result.json 2> err.log"
+    resume = if (string_length(session_id) > 0) { f" --resume {session_id}" } else { "" }
+    cmd = f"cd {workspace} && cat PROMPT.txt | {bin} -p{resume} --dangerously-skip-permissions --output-format json > result.json 2> err.log"
     result = shell(cmd)
     code = elem(result, 0)
     cost = parse_cost(f"{workspace}/result.json")
+    new_session = parse_session(f"{workspace}/result.json")
     if (code == 0) {
-        send(orch, {'run_done', run_id, issue_id, 'succeeded', cost})
+        send(orch, {'run_done', run_id, issue_id, 'succeeded', cost, new_session})
     } else {
-        send(orch, {'run_done', run_id, issue_id, 'crashed', cost})
+        send(orch, {'run_done', run_id, issue_id, 'crashed', cost, new_session})
     }
 }
 
@@ -256,6 +274,40 @@ fun parse_cost(path) {
     } else {
         0
     }
+}
+
+# Parse the session_id from a claude-code result.json. This is the
+# durable thread the agent resumes on its next issue.
+fun parse_session(path) {
+    if (file_exists(path) == 'true') {
+        raw = file_read(path)
+        if (string_length(raw) == 0) {
+            ""
+        } else {
+            sid = map_get(json_decode(raw), "session_id")
+            if (sid == nil) { "" } else { sid }
+        }
+    } else {
+        ""
+    }
+}
+
+# swarm-code runtime — the swarmrt-native coding agent. The code path
+# is wired and structured, but swarm-code is interactive-only today:
+# piped a prompt it does the work, then sits at its REPL prompt and
+# never exits — so O cannot drive it one-shot. It DOES already persist
+# + auto-resume its own per-cwd session (its continuity is built in).
+#
+# The single missing piece is a headless mode — `swarm -p "<prompt>"`
+# that runs the agent to task-completion and exits 0. Once swarm-code
+# ships that, the body below becomes a one-line `shell(...)` swap and
+# swarm-code is a first-class runtime. Until then this fails fast with
+# a clear reason rather than hanging the orchestrator for minutes.
+fun run_swarm_code(orch, run_id, issue_id, prompt, workspace, repo) {
+    _mk = shell(f"mkdir -p {workspace}")
+    _w = file_write(f"{workspace}/PROMPT.txt", prompt)
+    _e = file_write(f"{workspace}/err.log", "swarm-code runtime not yet drivable: swarm-code is interactive-only and never exits after a task. It needs a headless `swarm -p` mode. Use the claude-code runtime until then.")
+    send(orch, {'run_done', run_id, issue_id, 'crashed', 0, ""})
 }
 
 # Create an isolated git worktree of `repo` for this issue, on a fresh
@@ -275,14 +327,14 @@ fun prepare_worktree(repo, workspace, issue_id) {
 fun run_native(orch, run_id, issue_id, prompt, workspace) {
     url = getenv("O_LLM_URL")
     if (url == nil) {
-        send(orch, {'run_done', run_id, issue_id, 'crashed', 0})
+        send(orch, {'run_done', run_id, issue_id, 'crashed', 0, ""})
     } else {
         key = getenv("O_LLM_KEY")
         reqbody = json_encode(%{messages: [%{role: "user", content: prompt}]})
         headers = ["Content-Type: application/json", f"Authorization: Bearer {key}"]
         resp = http_post(url, headers, reqbody)
         _save = file_write(f"{workspace}/result.json", resp)
-        send(orch, {'run_done', run_id, issue_id, 'succeeded', 0})
+        send(orch, {'run_done', run_id, issue_id, 'succeeded', 0, ""})
     }
 }
 
@@ -290,7 +342,7 @@ fun run_native(orch, run_id, issue_id, prompt, workspace) {
 # fake cost so the budget hard-stop can be exercised without agents.
 fun run_sim(orch, run_id, issue_id, outcome) {
     sleep(1000)
-    send(orch, {'run_done', run_id, issue_id, outcome, sim_cost()})
+    send(orch, {'run_done', run_id, issue_id, outcome, sim_cost(), ""})
 }
 
 # attempt 1 of an even-sort_order issue crashes (then retries clean);
@@ -303,14 +355,27 @@ fun decide_outcome(issue, attempt) {
     }
 }
 
+# Persist the agent's runtime session id once a run reports one, so
+# the next issue resumes the same conversation. Runs even on a failed
+# attempt — a crashed run may still have opened a session worth keeping.
+fun persist_session(db, info, session_id) {
+    if (string_length(session_id) > 0) {
+        _u = Store.agent_set_session(db, map_get(info, "agent_id"), session_id)
+        ""
+    } else {
+        ""
+    }
+}
+
 # ---- run completion ------------------------------------------
-fun handle_done(db, running, retry, run_id, issue_id, outcome, cost) {
+fun handle_done(db, running, retry, run_id, issue_id, outcome, cost, session_id) {
     info = map_get(running, issue_id)
     if (info == nil) {
         %{running: running, retry: retry}
     } else {
         now = timestamp()
         company_id = map_get(info, "company_id")
+        _ps = persist_session(db, info, session_id)
         if (outcome == 'succeeded') {
             _m = Store.run_finish(db, run_id, "Succeeded", cost)
             _s = Store.issue_set_status(db, issue_id, "Done")
