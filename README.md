@@ -11,16 +11,19 @@ This is **v4** — the swarmrt rebuild, succeeding the O-v3 Python studio.
 
 > Design: see [`PRD-SWARM-ORCHESTRATOR.md`](../PRD-SWARM-ORCHESTRATOR.md).
 
-## Status — P2 (the agent layer)
+## Status — P3 (governance)
 
 - **P0 — spine:** SQLite control-plane (8 tables) · `swarmd` daemon · HTTP server · REST CRUD.
 - **P1 — engine:** single-authority orchestrator · Symphony-style tick loop · bounded
   concurrency · crash retry with exponential backoff · stall detection.
 - **P2 — agents:** runtime-pluggable workers — `claude-code` (real headless `claude -p` in a
-  per-issue workspace), `native` (single-shot LLM over HTTP), `sim` (deterministic stub) ·
-  agent CRUD · the orchestrator assigns an agent to every issue.
+  per-issue workspace), `native` (single-shot LLM over HTTP), `sim` (deterministic stub).
+- **P3 — governance:** per-company budgets with a **hard-stop** (a company at its cap is
+  paused — dispatch and in-flight retries both freeze) · **cost hook** (real `claude-code`
+  spend parsed per run and accumulated) · **approval gates** (governed actions queue for
+  operator sign-off when `O_REQUIRE_APPROVALS` is set; off by default).
 
-Next: P3 — governance: budgets + hard-stop, approval gates, cost hooks.
+Next: P4 — the O-Docs UI (graph + kanban + dashboard over this daemon).
 
 ## Build & run
 
@@ -48,9 +51,16 @@ curl -X POST http://127.0.0.1:4100/api/companies/<id>/agents \
   -H 'Content-Type: application/json' \
   -d '{"name":"Ada","role":"engineer","runtime":"claude-code"}'
 
+curl -X POST http://127.0.0.1:4100/api/companies/<id> \
+  -d '{"budget_monthly_cents":5000,"status":"active"}'   # set budget / un-pause
+
 curl http://127.0.0.1:4100/api/orchestrator   # live scheduler snapshot
 curl http://127.0.0.1:4100/api/runs           # run history
+curl http://127.0.0.1:4100/api/approvals      # pending governance approvals
 ```
+
+A company created with `budget_monthly_cents` is hard-stopped when its spend reaches the cap.
+Set `O_REQUIRE_APPROVALS=1` to make agent hiring queue for approval via `/api/approvals`.
 
 An issue is only dispatched once its company has at least one active agent. The agent's
 `runtime` (`claude-code` \| `native` \| `sim`) decides how the work actually runs.

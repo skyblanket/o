@@ -7,14 +7,21 @@
 # and dispatches them. Every response is JSON, with permissive
 # CORS so the O-Docs UI (Tauri) can call the daemon directly.
 #
-# P0 routes:
+# Routes:
 #   GET  /                                  banner
 #   GET  /api/health                        liveness
+#   GET  /api/runs                          run history
+#   GET  /api/orchestrator                  live scheduler snapshot
+#   GET  /api/approvals                     pending approvals
+#   POST /api/approvals/:id                 decide an approval
 #   GET  /api/companies                     list companies
-#   POST /api/companies                     create company
+#   POST /api/companies                     create company (+ budget)
 #   GET  /api/companies/:id                 get one company
+#   POST /api/companies/:id                 update budget / status
 #   GET  /api/companies/:id/issues          list a company's issues
 #   POST /api/companies/:id/issues          create an issue
+#   GET  /api/companies/:id/agents          list a company's agents
+#   POST /api/companies/:id/agents          hire an agent (approval-gated)
 
 module Router
 
@@ -48,6 +55,15 @@ fun default_str(v, d) {
     if (v == nil) { d } else { v }
 }
 
+fun default_num(v, d) {
+    if (v == nil) { d } else { v }
+}
+
+# Approval gate is off unless O_REQUIRE_APPROVALS is set.
+fun approvals_required() {
+    if (getenv("O_REQUIRE_APPROVALS") == nil) { 'false' } else { 'true' }
+}
+
 # Ask the orchestrator process for a live scheduling snapshot.
 fun orch_snapshot(conn) {
     send(whereis('orchestrator'), {'snapshot', self()})
@@ -72,8 +88,10 @@ fun route(db, conn, method, path, body) {
         "/api/health" -> respond(conn, 200, json_encode(%{status: "ok", service: "o-v4", version: "v4"}))
         "/api/runs" -> respond(conn, 200, json_encode(Store.runs_all(db)))
         "/api/orchestrator" -> orch_snapshot(conn)
+        "/api/approvals" -> route_approvals(db, conn, method)
         "/api/companies" -> route_companies(db, conn, method, body)
         p when string_starts_with(p, "/api/companies/") == 'true' -> route_company(db, conn, method, p, body)
+        p when string_starts_with(p, "/api/approvals/") == 'true' -> decide_approval(db, conn, method, p, body)
         _ -> respond(conn, 404, err_json("no route for that path"))
     }
 }
@@ -103,14 +121,15 @@ fun create_company(db, conn, body) {
         } else {
             mission = default_str(map_get(data, "mission"), "")
             prefix = default_str(map_get(data, "issue_prefix"), "TASK")
-            id = Store.company_create(db, name, mission, prefix)
-            _log = Store.log_activity(db, id, "operator", "company.create", id)
+            budget = default_num(map_get(data, "budget_monthly_cents"), 0)
+            id = Store.company_create(db, name, mission, prefix, budget)
+            _l = Store.log_activity(db, id, "operator", "company.create", id)
             respond(conn, 201, json_encode(Store.company_row(db, id)))
         }
     }
 }
 
-# ---- /api/companies/:id  and  /api/companies/:id/issues ------
+# ---- /api/companies/:id  (+ /issues, /agents) ----------------
 
 fun route_company(db, conn, method, p, body) {
     rest = string_sub(p, 15, string_length(p) - 15)
@@ -130,42 +149,32 @@ fun route_company(db, conn, method, p, body) {
                     respond(conn, 200, json_encode(row))
                 }
             } else {
-                respond(conn, 405, err_json("method not allowed"))
+                if (method == 'POST') {
+                    update_company(db, conn, rest, body)
+                } else {
+                    respond(conn, 405, err_json("method not allowed"))
+                }
             }
         }
     }
 }
 
-fun route_agents(db, conn, method, cid, body) {
-    if (method == 'GET') {
-        respond(conn, 200, json_encode(Store.agents_for(db, cid)))
+# Update a company's budget and/or status (e.g. un-pause after a
+# budget hard-stop). Only the fields present in the body change.
+fun update_company(db, conn, id, body) {
+    cur = Store.company_row(db, id)
+    if (cur == nil) {
+        respond(conn, 404, err_json("company not found"))
     } else {
-        if (method == 'POST') {
-            create_agent(db, conn, cid, body)
-        } else {
-            respond(conn, 405, err_json("method not allowed"))
-        }
+        data = json_decode(body)
+        budget = default_num(map_get(data, "budget_monthly_cents"), map_get(cur, "budget_monthly_cents"))
+        status = default_str(map_get(data, "status"), map_get(cur, "status"))
+        _u = Store.company_update(db, id, budget, status)
+        respond(conn, 200, json_encode(Store.company_row(db, id)))
     }
 }
 
-fun create_agent(db, conn, cid, body) {
-    if (string_length(body) == 0) {
-        respond(conn, 400, err_json("request body required"))
-    } else {
-        data = json_decode(body)
-        name = map_get(data, "name")
-        if (name == nil) {
-            respond(conn, 400, err_json("field 'name' is required"))
-        } else {
-            role = default_str(map_get(data, "role"), "generalist")
-            runtime = default_str(map_get(data, "runtime"), "claude-code")
-            model = default_str(map_get(data, "model"), "")
-            id = Store.agent_create(db, cid, name, role, runtime, model)
-            _l = Store.log_activity(db, cid, "operator", "agent.hire", id)
-            respond(conn, 201, json_encode(Store.agent_row(db, id)))
-        }
-    }
-}
+# ---- issues --------------------------------------------------
 
 fun route_issues(db, conn, method, cid, body) {
     if (method == 'GET') {
@@ -194,9 +203,94 @@ fun create_issue(db, conn, cid, body) {
             if (id == nil) {
                 respond(conn, 404, err_json("company not found"))
             } else {
-                _log = Store.log_activity(db, cid, "operator", "issue.create", id)
+                _l = Store.log_activity(db, cid, "operator", "issue.create", id)
                 respond(conn, 201, json_encode(Store.issue_row(db, id)))
             }
         }
+    }
+}
+
+# ---- agents (hiring is approval-gated) -----------------------
+
+fun route_agents(db, conn, method, cid, body) {
+    if (method == 'GET') {
+        respond(conn, 200, json_encode(Store.agents_for(db, cid)))
+    } else {
+        if (method == 'POST') {
+            create_agent(db, conn, cid, body)
+        } else {
+            respond(conn, 405, err_json("method not allowed"))
+        }
+    }
+}
+
+fun create_agent(db, conn, cid, body) {
+    if (string_length(body) == 0) {
+        respond(conn, 400, err_json("request body required"))
+    } else {
+        data = json_decode(body)
+        name = map_get(data, "name")
+        if (name == nil) {
+            respond(conn, 400, err_json("field 'name' is required"))
+        } else {
+            role = default_str(map_get(data, "role"), "generalist")
+            runtime = default_str(map_get(data, "runtime"), "claude-code")
+            model = default_str(map_get(data, "model"), "")
+            if (approvals_required() == 'true') {
+                payload = json_encode(%{company_id: cid, name: name, role: role, runtime: runtime, model: model})
+                aid = Store.approval_create(db, cid, "agent.hire", payload)
+                _l = Store.log_activity(db, cid, "operator", "approval.requested", aid)
+                respond(conn, 202, json_encode(%{status: "pending_approval", action: "agent.hire", approval_id: aid}))
+            } else {
+                id = Store.agent_create(db, cid, name, role, runtime, model)
+                _l = Store.log_activity(db, cid, "operator", "agent.hire", id)
+                respond(conn, 201, json_encode(Store.agent_row(db, id)))
+            }
+        }
+    }
+}
+
+# ---- approvals (governance gate) -----------------------------
+
+fun route_approvals(db, conn, method) {
+    if (method == 'GET') {
+        respond(conn, 200, json_encode(Store.approvals_pending(db)))
+    } else {
+        respond(conn, 405, err_json("method not allowed"))
+    }
+}
+
+fun decide_approval(db, conn, method, p, body) {
+    aid = string_sub(p, 15, string_length(p) - 15)
+    if (method == 'POST') {
+        appr = Store.approval_row(db, aid)
+        if (appr == nil) {
+            respond(conn, 404, err_json("approval not found"))
+        } else {
+            data = json_decode(body)
+            decision = default_str(map_get(data, "decision"), "")
+            if (decision == "approve") {
+                _x = execute_approval(db, appr)
+                _s = Store.approval_set(db, aid, "approved")
+                _l = Store.log_activity(db, map_get(appr, "company_id"), "operator", "approval.approved", aid)
+                respond(conn, 200, json_encode(%{id: aid, status: "approved"}))
+            } else {
+                _s = Store.approval_set(db, aid, "rejected")
+                _l = Store.log_activity(db, map_get(appr, "company_id"), "operator", "approval.rejected", aid)
+                respond(conn, 200, json_encode(%{id: aid, status: "rejected"}))
+            }
+        }
+    } else {
+        respond(conn, 405, err_json("method not allowed"))
+    }
+}
+
+# Carry out the governed action once approved.
+fun execute_approval(db, appr) {
+    if (map_get(appr, "action") == "agent.hire") {
+        pl = json_decode(map_get(appr, "payload"))
+        Store.agent_create(db, map_get(pl, "company_id"), map_get(pl, "name"), map_get(pl, "role"), map_get(pl, "runtime"), map_get(pl, "model"))
+    } else {
+        ""
     }
 }
