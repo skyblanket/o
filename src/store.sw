@@ -13,7 +13,7 @@ export [next_id, companies, company_row, company_create, company_update,
         company_add_spend, enforce_budget,
         issues_for, issue_row, issue_create, issue_set_status, issue_assign,
         log_activity, activity_recent, candidate_issues,
-        run_create, run_finish, runs_all,
+        run_create, run_finish, runs_all, run_row,
         agents_for, agent_row, agent_first_active, agent_create,
         approval_create, approvals_pending, approval_row, approval_set]
 
@@ -162,6 +162,11 @@ fun run_finish(db, run_id, state, cost_cents) {
 
 fun runs_all(db) {
     db_query(db, "SELECT id, issue_id, agent_id, attempt, state, workspace_path, started_at, ended_at, cost_cents FROM run ORDER BY started_at DESC LIMIT 100", [])
+}
+
+fun run_row(db, id) {
+    rows = db_query(db, "SELECT id, issue_id, agent_id, attempt, state, workspace_path, started_at, ended_at, cost_cents FROM run WHERE id = ?", [id])
+    if (length(rows) == 0) { nil } else { hd(rows) }
 }
 
 # ---- approvals (governance gate) -----------------------------

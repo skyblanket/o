@@ -120,6 +120,7 @@ fun route(db, conn, method, path, body) {
         "/api/companies" -> route_companies(db, conn, method, body)
         p when string_starts_with(p, "/api/companies/") == 'true' -> route_company(db, conn, method, p, body)
         p when string_starts_with(p, "/api/approvals/") == 'true' -> decide_approval(db, conn, method, p, body)
+        p when string_starts_with(p, "/api/runs/") == 'true' -> run_result(db, conn, p)
         _ -> respond(conn, 404, err_json("no route for that path"))
     }
 }
@@ -310,6 +311,29 @@ fun decide_approval(db, conn, method, p, body) {
         }
     } else {
         respond(conn, 405, err_json("method not allowed"))
+    }
+}
+
+# GET /api/runs/:id/result — the raw result.json a run produced in
+# its workspace (claude-code runs); lets the UI show what an agent did.
+fun run_result(db, conn, p) {
+    rest = string_sub(p, 10, string_length(p) - 10)
+    if (string_ends_with(rest, "/result") == 'true') {
+        rid = string_sub(rest, 0, string_length(rest) - 7)
+        run = Store.run_row(db, rid)
+        if (run == nil) {
+            respond(conn, 404, err_json("run not found"))
+        } else {
+            ws = map_get(run, "workspace_path")
+            rpath = f"{ws}/result.json"
+            if (file_exists(rpath) == 'true') {
+                respond(conn, 200, json_encode(%{workspace: ws, result: file_read(rpath)}))
+            } else {
+                respond(conn, 200, json_encode(%{workspace: ws, result: ""}))
+            }
+        }
+    } else {
+        respond(conn, 404, err_json("not found"))
     }
 }
 
