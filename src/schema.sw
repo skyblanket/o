@@ -33,14 +33,20 @@ fun migrate(db) {
 
     _skill = db_exec(db, "CREATE TABLE IF NOT EXISTS skill (id TEXT PRIMARY KEY, name TEXT NOT NULL, frontmatter TEXT, body TEXT, scope TEXT, created_at INTEGER)")
 
+    # Operator <-> agent chat. role is 'operator' or 'agent'. A chat
+    # turn runs against the agent's persistent session, so chatting
+    # with an agent shares context with the issues it has worked.
+    _message = db_exec(db, "CREATE TABLE IF NOT EXISTS message (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, role TEXT, content TEXT, created_at INTEGER)")
+
     _ix1 = db_exec(db, "CREATE INDEX IF NOT EXISTS ix_issue_company ON issue (company_id)")
     _ix2 = db_exec(db, "CREATE INDEX IF NOT EXISTS ix_agent_company ON agent (company_id)")
     _ix3 = db_exec(db, "CREATE INDEX IF NOT EXISTS ix_run_issue ON run (issue_id)")
     _ix4 = db_exec(db, "CREATE INDEX IF NOT EXISTS ix_activity_company ON activity (company_id)")
+    _ix5 = db_exec(db, "CREATE INDEX IF NOT EXISTS ix_message_agent ON message (agent_id)")
 
     # additive columns for older databases (error harmlessly if present)
     _alt = db_exec(db, "ALTER TABLE agent ADD COLUMN repo TEXT DEFAULT ''")
     _alt_ses = db_exec(db, "ALTER TABLE agent ADD COLUMN session_id TEXT DEFAULT ''")
 
-    print("  schema     migrated (8 tables)")
+    print("  schema     migrated (9 tables)")
 }

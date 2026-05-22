@@ -26,14 +26,18 @@
 module Router
 
 import Store
+import Orchestrator
 
 export [serve]
 
-fun serve(db) {
+# dbpath is threaded alongside db so the chat endpoint can hand a
+# spawned chat_worker its own connection string (sqlite handles must
+# not be shared across processes).
+fun serve(db, dbpath) {
     receive {
         {'http_request', conn, method, path, _hdrs, body} ->
-            dispatch(db, conn, method, path, body)
-            serve(db)
+            dispatch(db, dbpath, conn, method, path, body)
+            serve(db, dbpath)
     }
 }
 
@@ -101,15 +105,15 @@ fun orch_snapshot(conn) {
 
 # ---- dispatch ------------------------------------------------
 
-fun dispatch(db, conn, method, path, body) {
+fun dispatch(db, dbpath, conn, method, path, body) {
     if (method == 'OPTIONS') {
         http_respond(conn, 204, json_headers(), "")
     } else {
-        route(db, conn, method, path, body)
+        route(db, dbpath, conn, method, path, body)
     }
 }
 
-fun route(db, conn, method, path, body) {
+fun route(db, dbpath, conn, method, path, body) {
     case path {
         "/" -> serve_dashboard(conn)
         "/api/health" -> respond(conn, 200, json_encode(%{status: "ok", service: "o-v4", version: "v4"}))
@@ -122,7 +126,69 @@ fun route(db, conn, method, path, body) {
         p when string_starts_with(p, "/api/approvals/") == 'true' -> decide_approval(db, conn, method, p, body)
         p when string_starts_with(p, "/api/runs/") == 'true' -> run_result(db, conn, p)
         p when string_starts_with(p, "/api/issues/") == 'true' -> route_issue(db, conn, method, p, body)
+        p when string_starts_with(p, "/api/agents/") == 'true' -> route_agent(db, dbpath, conn, method, p, body)
         _ -> respond(conn, 404, err_json("no route for that path"))
+    }
+}
+
+# Local wrapper so `spawn` targets a same-module function — sw codegen
+# can't spawn a module-qualified call. The cross-module hop into
+# Orchestrator is a plain call inside the spawned process.
+fun spawn_chat(dbpath, aid, msg) {
+    Orchestrator.chat_worker(dbpath, aid, msg)
+}
+
+# ---- /api/agents/:id/{chat,messages} — operator <-> agent chat ----
+#
+#   POST /api/agents/:id/chat       send the agent a message
+#   GET  /api/agents/:id/messages   the chat transcript
+
+fun route_agent(db, dbpath, conn, method, p, body) {
+    rest = string_sub(p, 12, string_length(p) - 12)
+    if (string_ends_with(rest, "/chat") == 'true') {
+        aid = string_sub(rest, 0, string_length(rest) - 5)
+        agent_chat(db, dbpath, conn, method, aid, body)
+    } else {
+        if (string_ends_with(rest, "/messages") == 'true') {
+            aid = string_sub(rest, 0, string_length(rest) - 9)
+            if (method == 'GET') {
+                respond(conn, 200, json_encode(Store.messages_for(db, aid)))
+            } else {
+                respond(conn, 405, err_json("method not allowed"))
+            }
+        } else {
+            respond(conn, 404, err_json("no route for that path"))
+        }
+    }
+}
+
+# POST a chat message: persist the operator turn, then spawn a
+# chat_worker (so the slow LLM turn never blocks this loop). The
+# agent's reply lands in the message table asynchronously; the
+# dashboard's GET /messages poll surfaces it.
+fun agent_chat(db, dbpath, conn, method, aid, body) {
+    if (method != 'POST') {
+        respond(conn, 405, err_json("method not allowed"))
+    } else {
+        if (string_length(body) == 0) {
+            respond(conn, 400, err_json("request body required"))
+        } else {
+            data = json_decode(body)
+            msg = map_get(data, "message")
+            if (msg == nil) {
+                respond(conn, 400, err_json("field 'message' is required"))
+            } else {
+                agent = Store.agent_row(db, aid)
+                if (agent == nil) {
+                    respond(conn, 404, err_json("agent not found"))
+                } else {
+                    _m = Store.message_create(db, aid, "operator", msg)
+                    _w = spawn(spawn_chat(dbpath, aid, msg))
+                    _l = Store.log_activity(db, map_get(agent, "company_id"), "operator", "agent.chat", aid)
+                    respond(conn, 202, json_encode(%{status: "sent", agent_id: aid}))
+                }
+            }
+        }
     }
 }
 

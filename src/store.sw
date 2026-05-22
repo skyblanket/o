@@ -15,6 +15,7 @@ export [next_id, companies, company_row, company_create, company_update,
         log_activity, activity_recent, candidate_issues,
         run_create, run_finish, runs_all, run_row,
         agents_for, agent_row, agent_first_active, agent_create, agent_set_session,
+        message_create, messages_for,
         approval_create, approvals_pending, approval_row, approval_set]
 
 # Ask the registered `idgen` process for a fresh unique id.
@@ -159,6 +160,19 @@ fun agent_create(db, company_id, name, role, runtime, model, repo) {
 fun agent_set_session(db, agent_id, session_id) {
     _u = db_query(db, "UPDATE agent SET session_id = ? WHERE id = ?", [session_id, agent_id])
     agent_id
+}
+
+# ---- chat messages -------------------------------------------
+# Operator <-> agent conversation. role is 'operator' or 'agent'.
+
+fun message_create(db, agent_id, role, content) {
+    id = next_id("msg")
+    _i = db_query(db, "INSERT INTO message (id, agent_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)", [id, agent_id, role, content, timestamp()])
+    id
+}
+
+fun messages_for(db, agent_id) {
+    db_query(db, "SELECT id, agent_id, role, content, created_at FROM message WHERE agent_id = ? ORDER BY created_at ASC", [agent_id])
 }
 
 # ---- runs -----------------------------------------------------

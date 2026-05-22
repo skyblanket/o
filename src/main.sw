@@ -59,6 +59,6 @@ fun main() {
         print("  ready.")
         print("")
 
-        Router.serve(db)
+        Router.serve(db, dbpath)
     }
 }

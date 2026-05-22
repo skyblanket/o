@@ -26,7 +26,7 @@ module Orchestrator
 
 import Store
 
-export [start]
+export [start, chat_worker]
 
 # ---- tunables ------------------------------------------------
 fun max_concurrent() { 3 }        # PRD: configurable, default 10
@@ -292,22 +292,126 @@ fun parse_session(path) {
     }
 }
 
-# swarm-code runtime — the swarmrt-native coding agent. The code path
-# is wired and structured, but swarm-code is interactive-only today:
-# piped a prompt it does the work, then sits at its REPL prompt and
-# never exits — so O cannot drive it one-shot. It DOES already persist
-# + auto-resume its own per-cwd session (its continuity is built in).
+# swarm-code runtime — the swarmrt-native coding agent. Driven through
+# swarm-code's headless mode: the prompt is piped on stdin to
+# `swarm-code -p --json`, which runs the agent to task-completion,
+# emits a final {"status","summary"} line, and exits 0 / nonzero.
 #
-# The single missing piece is a headless mode — `swarm -p "<prompt>"`
-# that runs the agent to task-completion and exits 0. Once swarm-code
-# ships that, the body below becomes a one-line `shell(...)` swap and
-# swarm-code is a first-class runtime. Until then this fails fast with
-# a clear reason rather than hanging the orchestrator for minutes.
+# swarm-code persists + auto-resumes its own per-cwd session journal,
+# so an agent's context carries across the issues it works — the
+# swarm-code-native equivalent of the claude-code session resume. No
+# cost or session id flows back: swarm-code reports neither, and its
+# continuity is the journal, not an id O has to thread.
 fun run_swarm_code(orch, run_id, issue_id, prompt, workspace, repo) {
-    _mk = shell(f"mkdir -p {workspace}")
+    if (string_length(repo) > 0) {
+        prepare_worktree(repo, workspace, issue_id)
+    } else {
+        _mk = shell(f"mkdir -p {workspace}")
+    }
     _w = file_write(f"{workspace}/PROMPT.txt", prompt)
-    _e = file_write(f"{workspace}/err.log", "swarm-code runtime not yet drivable: swarm-code is interactive-only and never exits after a task. It needs a headless `swarm -p` mode. Use the claude-code runtime until then.")
-    send(orch, {'run_done', run_id, issue_id, 'crashed', 0, ""})
+    bin = swarm_bin()
+    cmd = f"cd {workspace} && cat PROMPT.txt | SWARM_CODE_CWD={workspace} {bin} -p --json > result.json 2> err.log"
+    result = shell(cmd)
+    code = elem(result, 0)
+    if (code == 0) {
+        send(orch, {'run_done', run_id, issue_id, 'succeeded', 0, ""})
+    } else {
+        send(orch, {'run_done', run_id, issue_id, 'crashed', 0, ""})
+    }
+}
+
+# ============================================================
+# Chat — operator <-> agent conversation
+# ============================================================
+#
+# A chat turn runs ONE operator message against the agent's runtime,
+# resuming the agent's persistent session — so the agent you chat
+# with is the same one that works the issues: chat sees the issue
+# history, issues see the chat. Spawned as its own process by the
+# router so a slow LLM turn never blocks the HTTP request loop; the
+# agent's reply lands in the `message` table and the dashboard's
+# poll picks it up.
+fun chat_worker(dbpath, agent_id, message) {
+    db = db_open(dbpath)
+    _bt = db_exec(db, "PRAGMA busy_timeout=5000")
+    agent = Store.agent_row(db, agent_id)
+    if (agent == nil) {
+        ""
+    } else {
+        runtime = map_get(agent, "runtime")
+        rawses = map_get(agent, "session_id")
+        session_id = if (rawses == nil) { "" } else { rawses }
+        home = getenv("HOME")
+        workspace = f"{home}/.o/chat/{agent_id}"
+        _mk = shell(f"mkdir -p {workspace}")
+        _w = file_write(f"{workspace}/CHAT.txt", message)
+        outcome = chat_invoke(runtime, workspace, session_id)
+        new_session = map_get(outcome, "session")
+        if (string_length(new_session) > 0) {
+            _ss = Store.agent_set_session(db, agent_id, new_session)
+        } else {
+            ""
+        }
+        _m = Store.message_create(db, agent_id, "agent", map_get(outcome, "reply"))
+        ""
+    }
+}
+
+# Run one chat turn through the agent's runtime. Returns
+# %{reply, session} — reply is the agent's text, session the
+# (possibly new) session id to persist.
+fun chat_invoke(runtime, workspace, session_id) {
+    if (runtime == "swarm-code") {
+        bin = swarm_bin()
+        _r = shell(f"cd {workspace} && cat CHAT.txt | SWARM_CODE_CWD={workspace} {bin} -p --json > reply.json 2> err.log")
+        %{reply: chat_reply_swarm(f"{workspace}/reply.json"), session: ""}
+    } else {
+        bin = claude_bin()
+        resume = if (string_length(session_id) > 0) { f" --resume {session_id}" } else { "" }
+        _r = shell(f"cd {workspace} && cat CHAT.txt | {bin} -p{resume} --dangerously-skip-permissions --output-format json > reply.json 2> err.log")
+        %{reply: chat_reply_claude(f"{workspace}/reply.json"), session: parse_session(f"{workspace}/reply.json")}
+    }
+}
+
+# claude-code --output-format json: the `result` field is the reply.
+fun chat_reply_claude(path) {
+    if (file_exists(path) == 'true') {
+        raw = file_read(path)
+        if (string_length(raw) == 0) {
+            "(no reply)"
+        } else {
+            d = json_decode(raw)
+            r = if (d == nil) { nil } else { map_get(d, "result") }
+            if (r == nil) { "(no reply)" } else { to_string(r) }
+        }
+    } else {
+        "(no reply)"
+    }
+}
+
+# swarm-code -p --json streams the work, then a final {"summary"}
+# line — take the last line, fall back to the raw text.
+fun chat_reply_swarm(path) {
+    if (file_exists(path) == 'true') {
+        raw = string_trim(file_read(path))
+        if (string_length(raw) == 0) {
+            "(no reply)"
+        } else {
+            lines = string_split(raw, "\n")
+            last = last_line(lines)
+            d = json_decode(last)
+            s = if (d == nil) { nil } else { map_get(d, "summary") }
+            if (s == nil) { raw } else { to_string(s) }
+        }
+    } else {
+        "(no reply)"
+    }
+}
+
+fun last_line(lines) {
+    if (length(lines) == 0) { "" }
+    else { if (length(lines) == 1) { hd(lines) }
+    else { last_line(tl(lines)) }}
 }
 
 # Create an isolated git worktree of `repo` for this issue, on a fresh

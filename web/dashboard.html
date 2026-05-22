@@ -237,6 +237,7 @@ const LANES = ['Backlog','In Progress','Done'];
 
 let S = { companies:[], sel:null, issues:[], agents:[], runs:[], activity:[], orch:{} };
 let modalOpen = false;
+let chatAgent = null;
 const cache = {};
 function paint(id,html){ const e=$('#'+id); if(e && cache[id]!==html){ e.innerHTML=html; cache[id]=html; } }
 
@@ -329,8 +330,8 @@ function renderMain(){
       </div>
     </div>
     <div id="agents">${
-      S.agents.map(a=>`<span class="chip"><span class="av">${initials(a.name)}</span>
-        ${esc(a.name)}<span class="rtag ${a.runtime==='claude-code'?'cc':a.runtime}">${a.runtime}</span></span>`).join('')
+      S.agents.map(a=>`<span class="chip" onclick="mChat('${a.id}')" style="cursor:pointer" title="Chat with ${esc(a.name)}"><span class="av">${initials(a.name)}</span>
+        ${esc(a.name)}<span class="rtag ${a.runtime==='claude-code'?'cc':a.runtime}">${a.runtime}</span> 💬</span>`).join('')
       || `<span style="color:var(--faint);font-size:12px">No agents yet — issues won't run until you hire one.</span>`
     }</div>
     <div id="board">${lanes}</div>`);
@@ -341,8 +342,45 @@ function sel(id){ S.sel=id; poll(); }
 //--- modals (live in #mroot, untouched by render) --------------------
 function openM(html){ $('#mroot').innerHTML='<div class="modal'+(html.wide?' wide':'')+'">'+html.body+'</div>';
   $('#mroot').classList.add('on'); modalOpen=true; }
-function closeM(){ $('#mroot').classList.remove('on'); $('#mroot').innerHTML=''; modalOpen=false; }
+function closeM(){ $('#mroot').classList.remove('on'); $('#mroot').innerHTML=''; modalOpen=false; chatAgent=null; }
 document.addEventListener('keydown',e=>{ if(e.key==='Escape')closeM(); });
+
+//--- chat with an agent ----------------------------------------------
+function mChat(id){
+  const a=S.agents.find(x=>x.id===id); if(!a) return;
+  chatAgent=id;
+  openM({ wide:true, body:F({ title:'Chat — '+esc(a.name)+' · '+esc(a.runtime),
+    body:`<div id="chatlog" style="height:330px;overflow-y:auto;display:flex;
+        flex-direction:column;gap:7px;padding:4px 2px"></div>
+      <div style="display:flex;gap:8px;margin-top:11px">
+        <input id="chatmsg" placeholder="Message the agent…" style="flex:1" autofocus
+          onkeydown="if(event.key==='Enter'){event.preventDefault();doChat();}">
+        <button class="primary" onclick="doChat()">Send</button></div>
+      <p style="color:var(--faint);font-size:11px;margin-top:7px">Runs against the
+        agent's persistent session — it remembers the issues it has worked.</p>`,
+    foot:`` })});
+  loadChat();
+}
+async function loadChat(){
+  if(!chatAgent) return;
+  const msgs=await api('/agents/'+chatAgent+'/messages').catch(()=>[]);
+  const box=$('#chatlog'); if(!box) return;
+  box.innerHTML=(msgs&&msgs.length?msgs:[]).map(m=>{
+    const mine=m.role==='operator';
+    return `<div style="align-self:${mine?'flex-end':'flex-start'};max-width:80%;
+      background:${mine?'var(--accent,#3b6ef0)':'var(--surface2,#1c2230)'};
+      color:${mine?'#fff':'var(--text,#e6e6e6)'};padding:7px 11px;border-radius:11px;
+      font-size:12.5px;white-space:pre-wrap;word-break:break-word;line-height:1.45">${esc(m.content)}</div>`;
+  }).join('') || `<div style="color:var(--faint);font-size:12px">No messages yet — say hello.</div>`;
+  box.scrollTop=box.scrollHeight;
+}
+async function doChat(){
+  const inp=$('#chatmsg'); if(!inp||!chatAgent) return;
+  const msg=inp.value.trim(); if(!msg) return;
+  inp.value='';
+  await post('/agents/'+chatAgent+'/chat',{message:msg});
+  loadChat();
+}
 const F = (h)=>`<header><span class="h">${h.title}</span>
   <button class="ghost icon" onclick="closeM()">✕</button></header>
   <div class="mbody">${h.body}</div>
@@ -460,6 +498,9 @@ async function saveIssue(id){
 
 poll();
 setInterval(()=>{ if(!modalOpen) poll(); }, 3000);
+// While the chat modal is open, poll the transcript so the agent's
+// async reply appears without the operator refreshing.
+setInterval(()=>{ if(modalOpen && chatAgent) loadChat(); }, 3000);
 </script>
 </body>
 </html>
