@@ -37,7 +37,10 @@ fun main() {
     home = getenv("HOME")
     dir = f"{home}/.o"
     _mk = shell(f"mkdir -p {dir}/workspaces")
-    dbpath = f"{dir}/o.db"
+    # O_DB env override lets a second instance run on its own
+    # control plane instead of sharing ~/.o/o.db.
+    db_env = getenv("O_DB")
+    dbpath = if (db_env == nil) { f"{dir}/o.db" } else { db_env }
 
     db = db_open(dbpath)
     if (db < 0) {
@@ -47,7 +50,7 @@ fun main() {
         Schema.migrate(db)
         Orchestrator.start(dbpath)
 
-        port = 4100
+        port = resolve_port()
         http_listen(port)
         print("")
         print("  O v4 - agent-company orchestrator")
@@ -60,5 +63,32 @@ fun main() {
         print("")
 
         Router.serve(db, dbpath)
+    }
+}
+
+# HTTP port — O_PORT env override, default 4100. Lets a second
+# instance run alongside one already holding the default port.
+fun resolve_port() {
+    p = getenv("O_PORT")
+    if (p == nil) {
+        4100
+    } else {
+        n = parse_port_digits(p, 0, 0)
+        if (n < 1) { 4100 } else { n }
+    }
+}
+
+fun parse_port_digits(s, i, acc) {
+    if (i >= string_length(s)) {
+        acc
+    } else {
+        ch = string_sub(s, i, 1)
+        d = if (ch == "0") { 0 } else { if (ch == "1") { 1 }
+            else { if (ch == "2") { 2 } else { if (ch == "3") { 3 }
+            else { if (ch == "4") { 4 } else { if (ch == "5") { 5 }
+            else { if (ch == "6") { 6 } else { if (ch == "7") { 7 }
+            else { if (ch == "8") { 8 } else { if (ch == "9") { 9 }
+            else { 0 - 1 }}}}}}}}}}
+        if (d < 0) { acc } else { parse_port_digits(s, i + 1, acc * 10 + d) }
     }
 }

@@ -43,8 +43,10 @@ fun serve(db, dbpath) {
 
 # ---- response helpers ----------------------------------------
 
+# swarmrt's http_respond takes headers as ONE string — each line
+# CRLF-terminated; the runtime appends the final blank line.
 fun json_headers() {
-    ["Content-Type: application/json", "Access-Control-Allow-Origin: *", "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS", "Access-Control-Allow-Headers: Content-Type, Authorization"]
+    "Content-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\n"
 }
 
 fun respond(conn, status, body) {
@@ -89,7 +91,7 @@ fun dashboard_path() {
 fun serve_dashboard(conn) {
     path = dashboard_path()
     if (file_exists(path) == 'true') {
-        http_respond(conn, 200, ["Content-Type: text/html; charset=utf-8", "Access-Control-Allow-Origin: *"], file_read(path))
+        http_respond(conn, 200, "Content-Type: text/html; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\n", file_read(path))
     } else {
         respond(conn, 200, json_encode(%{name: "O", version: "v4", service: "swarmd", dashboard: "not found - set O_WEB"}))
     }
