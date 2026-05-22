@@ -11,12 +11,13 @@ This is **v4** — the swarmrt rebuild, succeeding the O-v3 Python studio.
 
 > Design: see [`PRD-SWARM-ORCHESTRATOR.md`](../PRD-SWARM-ORCHESTRATOR.md).
 
-## Status — P0 (the spine)
+## Status — P1 (the orchestration engine)
 
-Implemented: SQLite control-plane schema · `swarmd` daemon · HTTP server · REST CRUD for
-companies and issues · activity log.
+- **P0 — spine:** SQLite control-plane (8 tables) · `swarmd` daemon · HTTP server · REST CRUD.
+- **P1 — engine:** single-authority orchestrator process · Symphony-style tick loop ·
+  bounded concurrency · crash retry with exponential backoff · stall detection.
 
-Next: P1 — the orchestration tick loop (Symphony-style: poll, dispatch, retry, stall-detect).
+Next: P2 — the agent layer (real `claude-code` / `native` runtimes replacing the worker stub).
 
 ## Build & run
 
@@ -39,7 +40,13 @@ curl http://127.0.0.1:4100/api/companies/<id>/issues
 curl -X POST http://127.0.0.1:4100/api/companies/<id>/issues \
   -H 'Content-Type: application/json' \
   -d '{"title":"first task","priority":"high"}'
+
+curl http://127.0.0.1:4100/api/orchestrator   # live scheduler snapshot
+curl http://127.0.0.1:4100/api/runs           # run history
 ```
+
+Seeded issues are picked up automatically by the orchestrator — it dispatches workers,
+retries failures, and kills stalled runs, with no further input.
 
 ## License
 

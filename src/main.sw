@@ -15,6 +15,7 @@
 module Main
 
 import Schema
+import Orchestrator
 import Router
 
 export [main]
@@ -44,6 +45,7 @@ fun main() {
     } else {
         register('idgen', spawn(idgen_loop(1)))
         Schema.migrate(db)
+        Orchestrator.start(dbpath)
 
         port = 4100
         http_listen(port)

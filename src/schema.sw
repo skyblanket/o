@@ -15,6 +15,7 @@ export [migrate]
 fun migrate(db) {
     _wal = db_exec(db, "PRAGMA journal_mode=WAL")
     _fk  = db_exec(db, "PRAGMA foreign_keys=ON")
+    _bt  = db_exec(db, "PRAGMA busy_timeout=5000")
 
     _company = db_exec(db, "CREATE TABLE IF NOT EXISTS company (id TEXT PRIMARY KEY, name TEXT NOT NULL, mission TEXT, issue_prefix TEXT, status TEXT, budget_monthly_cents INTEGER DEFAULT 0, spent_cents INTEGER DEFAULT 0, issue_counter INTEGER DEFAULT 0, created_at INTEGER, updated_at INTEGER)")
 

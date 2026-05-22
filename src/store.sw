@@ -9,7 +9,8 @@
 module Store
 
 export [next_id, companies, company_row, company_create,
-        issues_for, issue_row, issue_create, log_activity]
+        issues_for, issue_row, issue_create, log_activity,
+        candidate_issues, issue_set_status, run_create, run_mark, runs_all]
 
 # Ask the registered `idgen` process for a fresh unique id.
 fun next_id(prefix) {
@@ -71,4 +72,31 @@ fun log_activity(db, company_id, actor, verb, target) {
     id = next_id("act")
     _ins = db_query(db, "INSERT INTO activity (id, company_id, actor, verb, target, ts) VALUES (?, ?, ?, ?, ?, ?)", [id, company_id, actor, verb, target, timestamp()])
     id
+}
+
+# ---- runs & scheduling (used by the orchestrator) ------------
+
+# Non-terminal issues, highest priority first, then oldest first.
+fun candidate_issues(db) {
+    db_query(db, "SELECT id, identifier, title, status, priority, sort_order FROM issue WHERE status NOT IN ('Done', 'Canceled') ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, created_at ASC", [])
+}
+
+fun issue_set_status(db, id, status) {
+    _u = db_query(db, "UPDATE issue SET status = ?, updated_at = ? WHERE id = ?", [status, timestamp(), id])
+    id
+}
+
+fun run_create(db, issue_id, attempt, state) {
+    id = next_id("run")
+    _i = db_query(db, "INSERT INTO run (id, issue_id, attempt, state, started_at) VALUES (?, ?, ?, ?, ?)", [id, issue_id, attempt, state, timestamp()])
+    id
+}
+
+fun run_mark(db, run_id, state) {
+    _u = db_query(db, "UPDATE run SET state = ?, ended_at = ? WHERE id = ?", [state, timestamp(), run_id])
+    run_id
+}
+
+fun runs_all(db) {
+    db_query(db, "SELECT id, issue_id, agent_id, attempt, state, started_at, ended_at, tokens_in, tokens_out, cost_cents FROM run ORDER BY started_at DESC LIMIT 100", [])
 }

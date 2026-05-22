@@ -48,6 +48,14 @@ fun default_str(v, d) {
     if (v == nil) { d } else { v }
 }
 
+# Ask the orchestrator process for a live scheduling snapshot.
+fun orch_snapshot(conn) {
+    send(whereis('orchestrator'), {'snapshot', self()})
+    receive {
+        {'snapshot_reply', d} -> respond(conn, 200, json_encode(d))
+    }
+}
+
 # ---- dispatch ------------------------------------------------
 
 fun dispatch(db, conn, method, path, body) {
@@ -62,6 +70,8 @@ fun route(db, conn, method, path, body) {
     case path {
         "/" -> respond(conn, 200, json_encode(%{name: "O", version: "v4", service: "swarmd"}))
         "/api/health" -> respond(conn, 200, json_encode(%{status: "ok", service: "o-v4", version: "v4"}))
+        "/api/runs" -> respond(conn, 200, json_encode(Store.runs_all(db)))
+        "/api/orchestrator" -> orch_snapshot(conn)
         "/api/companies" -> route_companies(db, conn, method, body)
         p when string_starts_with(p, "/api/companies/") == 'true' -> route_company(db, conn, method, p, body)
         _ -> respond(conn, 404, err_json("no route for that path"))
