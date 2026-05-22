@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef, type ReactNode } from "react";
 import {
   api, money, ago, dur, initials,
-  type Company, type Issue, type Agent, type Run, type Activity, type Orchestrator,
+  type Company, type Issue, type Agent, type Run, type Activity, type Orchestrator, type Message,
 } from "./api";
 
 const LANES = ["Backlog", "In Progress", "Done"];
@@ -253,6 +253,50 @@ function IssueModal({ issue, agents, runs, onClose, done }: {
   );
 }
 
+// ---- chat with a hired agent --------------------------------------
+function AgentChat({ agent, onClose }: { agent: Agent; onClose: () => void }) {
+  const [msgs, setMsgs] = useState<Message[]>([]);
+  const [text, setText] = useState("");
+  const [sending, setSending] = useState(false);
+  const endRef = useRef<HTMLDivElement>(null);
+  const load = () => api.agentMessages(agent.id).then(setMsgs).catch(() => {});
+  useEffect(() => {
+    load();
+    const t = setInterval(load, 2000);
+    return () => clearInterval(t);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { endRef.current?.scrollIntoView({ behavior: "smooth" }); }, [msgs.length]);
+  const send = async () => {
+    const m = text.trim();
+    if (!m || sending) return;
+    setText(""); setSending(true);
+    await api.agentChat(agent.id, m).catch(() => {});
+    setSending(false);
+    load();
+  };
+  const thinking = msgs.length > 0 && msgs[msgs.length - 1].role === "operator";
+  return (
+    <Modal title={"Chat · " + agent.name} wide onClose={onClose}>
+      <div className="chat">
+        {msgs.length === 0 &&
+          <div className="hint" style={{ margin: "auto", textAlign: "center" }}>
+            Say something to {agent.name} — it answers from its own persistent session.</div>}
+        {msgs.map(m => (
+          <div key={m.id} className={"msg " + (m.role === "operator" ? "me" : "them")}>{m.content}</div>
+        ))}
+        {thinking && <div className="msg them think">{agent.name} is working…</div>}
+        <div ref={endRef} />
+      </div>
+      <div className="chatbar">
+        <textarea value={text} onChange={e => setText(e.target.value)} rows={2}
+          placeholder={"Message " + agent.name + "…  (Enter to send)"}
+          onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }} />
+        <button className="primary" onClick={send} disabled={sending}>Send</button>
+      </div>
+    </Modal>
+  );
+}
+
 // ---- panels --------------------------------------------------------
 function TopBar({ orch, offline }: { orch: Orchestrator | null; offline: boolean }) {
   return (
@@ -331,9 +375,10 @@ function Rail({ runs, activity }: { runs: Run[]; activity: Activity[] }) {
   );
 }
 
-function CompanyView({ company, issues, agents, onIssue, onNewIssue, onHire, onManage }: {
+function CompanyView({ company, issues, agents, onIssue, onNewIssue, onHire, onManage, onAgentChat }: {
   company: Company; issues: Issue[]; agents: Agent[];
   onIssue: (id: string) => void; onNewIssue: () => void; onHire: () => void; onManage: () => void;
+  onAgentChat: (id: string) => void;
 }) {
   const over = company.budget_monthly_cents > 0 && company.spent_cents >= company.budget_monthly_cents;
   return (
@@ -363,9 +408,11 @@ function CompanyView({ company, issues, agents, onIssue, onNewIssue, onHire, onM
         {agents.length === 0
           ? <span style={{ color: "var(--faint)", fontSize: 12 }}>No agents yet — issues won't run until you hire one.</span>
           : agents.map(a => (
-            <span className="chip" key={a.id}>
+            <span className="chip" key={a.id} onClick={() => onAgentChat(a.id)}
+              style={{ cursor: "pointer" }} title={"Chat with " + a.name}>
               <span className="av">{initials(a.name)}</span>{a.name}
               <span className={"rtag " + (a.runtime === "claude-code" ? "cc" : a.runtime)}>{a.runtime}</span>
+              <span style={{ color: "var(--faint)", fontSize: 12 }}>💬</span>
             </span>
           ))}
       </div>
@@ -401,7 +448,7 @@ function CompanyView({ company, issues, agents, onIssue, onNewIssue, onHire, onM
 // ---- app -----------------------------------------------------------
 type ModalState =
   | { kind: "newCompany" } | { kind: "newIssue" } | { kind: "hireAgent" }
-  | { kind: "manage" } | { kind: "issue"; id: string } | null;
+  | { kind: "manage" } | { kind: "issue"; id: string } | { kind: "chat"; id: string } | null;
 
 export default function App() {
   const [companies, setCompanies] = useState<Company[]>([]);
@@ -456,7 +503,8 @@ export default function App() {
               onIssue={(id) => setModal({ kind: "issue", id })}
               onNewIssue={() => setModal({ kind: "newIssue" })}
               onHire={() => setModal({ kind: "hireAgent" })}
-              onManage={() => setModal({ kind: "manage" })} />
+              onManage={() => setModal({ kind: "manage" })}
+              onAgentChat={(id) => setModal({ kind: "chat", id })} />
           : <div className="main"><div className="empty">
               <div className="big">Welcome to O v4</div>
               <div>Create a company, hire an agent, file issues —<br />then watch them get done.</div>
@@ -473,6 +521,10 @@ export default function App() {
         const iss = issues.find(i => i.id === modal.id);
         return iss ? <IssueModal issue={iss} agents={agents} runs={runs}
           onClose={() => setModal(null)} done={afterChange} /> : null;
+      })()}
+      {modal?.kind === "chat" && (() => {
+        const ag = agents.find(a => a.id === modal.id);
+        return ag ? <AgentChat agent={ag} onClose={() => setModal(null)} /> : null;
       })()}
     </div>
   );

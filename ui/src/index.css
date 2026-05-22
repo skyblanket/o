@@ -183,3 +183,16 @@ h4.sec { font-size:11px; font-weight:600; letter-spacing:.7px; text-transform:up
   border-bottom:1px solid var(--border); font-size:12.5px; }
 .fsrow:last-child { border-bottom:0; }
 .fsrow:hover { background:var(--hover); }
+
+/* chat with a hired agent */
+.chat { height:360px; overflow-y:auto; display:flex; flex-direction:column; gap:10px; padding:6px 2px; }
+.msg { max-width:80%; padding:9px 13px; border-radius:14px; font-size:13px; line-height:1.55;
+  white-space:pre-wrap; word-break:break-word; box-shadow:var(--sh-sm); }
+.msg.me { align-self:flex-end; background:var(--accent); color:#fff; border-bottom-right-radius:4px; }
+.msg.them { align-self:flex-start; background:var(--surface2); border:1px solid var(--border);
+  border-bottom-left-radius:4px; }
+.msg.think { color:var(--dim); font-style:italic; box-shadow:none; }
+.chatbar { display:flex; gap:9px; align-items:flex-end; margin-top:13px;
+  border-top:1px solid var(--border); padding-top:13px; }
+.chatbar textarea { flex:1; min-height:44px; max-height:140px; }
+.chatbar button { flex:none; height:38px; }

@@ -29,6 +29,9 @@ export interface Orchestrator {
   tick: number; running: number; retrying: number;
   tick_interval_ms: number; max_concurrent: number;
 }
+export interface Message {
+  id: string; agent_id: string; role: string; content: string; created_at: number;
+}
 
 async function req<T>(path: string, opts?: RequestInit): Promise<T> {
   const r = await fetch(BASE + path, {
@@ -60,6 +63,8 @@ export const api = {
   runResult: (id: string) => req<{ workspace: string; result: string }>(`/runs/${id}/result`),
   fs: (path: string) =>
     post("/fs", { path }) as Promise<{ path: string; parent: string; listing: string; gits: string }>,
+  agentMessages: (id: string) => req<Message[]>(`/agents/${id}/messages`),
+  agentChat: (id: string, message: string) => post(`/agents/${id}/chat`, { message }),
 };
 
 // ---- formatting helpers --------------------------------------
