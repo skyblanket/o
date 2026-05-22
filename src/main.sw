@@ -53,6 +53,7 @@ fun main() {
         print("  O v4 - agent-company orchestrator")
         print("  ---------------------------------")
         print(f"  daemon     swarmd, listening on 127.0.0.1:{port}")
+        print(f"  dashboard  http://127.0.0.1:{port}")
         print(f"  api        http://127.0.0.1:{port}/api/health")
         print(f"  database   {dbpath}")
         print("  ready.")

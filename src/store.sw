@@ -49,7 +49,7 @@ fun company_update(db, id, budget, status) {
 }
 
 fun company_add_spend(db, id, cents) {
-    _u = db_query(db, "UPDATE company SET spent_cents = spent_cents + ?, updated_at = ? WHERE id = ?", [cents, timestamp(), id])
+    _u = db_query(db, "UPDATE company SET spent_cents = spent_cents + CAST(ROUND(?) AS INTEGER), updated_at = ? WHERE id = ?", [cents, timestamp(), id])
     id
 }
 
@@ -156,7 +156,7 @@ fun run_create(db, issue_id, agent_id, attempt, state, workspace_path) {
 }
 
 fun run_finish(db, run_id, state, cost_cents) {
-    _u = db_query(db, "UPDATE run SET state = ?, ended_at = ?, cost_cents = ? WHERE id = ?", [state, timestamp(), cost_cents, run_id])
+    _u = db_query(db, "UPDATE run SET state = ?, ended_at = ?, cost_cents = CAST(ROUND(?) AS INTEGER) WHERE id = ?", [state, timestamp(), cost_cents, run_id])
     run_id
 }
 

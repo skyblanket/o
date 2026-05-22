@@ -64,13 +64,28 @@ fun approvals_required() {
     if (getenv("O_REQUIRE_APPROVALS") == nil) { 'false' } else { 'true' }
 }
 
-# Serve the operator dashboard (single HTML file). O_WEB overrides
-# the path; default is cwd-relative web/dashboard.html.
+# Serve the operator dashboard (single HTML file). Resolution order:
+# $O_WEB, then the installed ~/.o/web/dashboard.html, then the
+# cwd-relative web/dashboard.html (running from the repo).
+fun dashboard_path() {
+    env = getenv("O_WEB")
+    if (env == nil) {
+        home = getenv("HOME")
+        installed = f"{home}/.o/web/dashboard.html"
+        if (file_exists(installed) == 'true') {
+            installed
+        } else {
+            "web/dashboard.html"
+        }
+    } else {
+        env
+    }
+}
+
 fun serve_dashboard(conn) {
-    path = default_str(getenv("O_WEB"), "web/dashboard.html")
+    path = dashboard_path()
     if (file_exists(path) == 'true') {
-        html = file_read(path)
-        http_respond(conn, 200, ["Content-Type: text/html; charset=utf-8", "Access-Control-Allow-Origin: *"], html)
+        http_respond(conn, 200, ["Content-Type: text/html; charset=utf-8", "Access-Control-Allow-Origin: *"], file_read(path))
     } else {
         respond(conn, 200, json_encode(%{name: "O", version: "v4", service: "swarmd", dashboard: "not found - set O_WEB"}))
     }
