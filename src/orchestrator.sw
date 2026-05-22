@@ -218,15 +218,10 @@ fun run_worker(orch, run_id, issue_id, runtime, prompt, workspace, repo, session
     if (runtime == "sim") {
         run_sim(orch, run_id, issue_id, sim_outcome)
     } else {
-        if (runtime == "native") {
-            _mk = shell(f"mkdir -p {workspace}")
-            run_native(orch, run_id, issue_id, prompt, workspace)
+        if (runtime == "swarm-code") {
+            run_swarm_code(orch, run_id, issue_id, prompt, workspace, repo)
         } else {
-            if (runtime == "swarm-code") {
-                run_swarm_code(orch, run_id, issue_id, prompt, workspace, repo)
-            } else {
-                run_claude_code(orch, run_id, issue_id, prompt, workspace, repo, session_id)
-            }
+            run_claude_code(orch, run_id, issue_id, prompt, workspace, repo, session_id)
         }
     }
 }
@@ -432,21 +427,6 @@ fun prepare_worktree(repo, workspace, issue_id) {
         branch = f"o/{issue_id}"
         _wt = shell(f"git -C {repo} worktree add {workspace} -b {branch}")
         ""
-    }
-}
-
-# native runtime — single-shot LLM call. Needs O_LLM_URL/O_LLM_KEY.
-fun run_native(orch, run_id, issue_id, prompt, workspace) {
-    url = getenv("O_LLM_URL")
-    if (url == nil) {
-        send(orch, {'run_done', run_id, issue_id, 'crashed', 0, ""})
-    } else {
-        key = getenv("O_LLM_KEY")
-        reqbody = json_encode(%{messages: [%{role: "user", content: prompt}]})
-        headers = ["Content-Type: application/json", f"Authorization: Bearer {key}"]
-        resp = http_post(url, headers, reqbody)
-        _save = file_write(f"{workspace}/result.json", resp)
-        send(orch, {'run_done', run_id, issue_id, 'succeeded', 0, ""})
     }
 }
 

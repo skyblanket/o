@@ -70,33 +70,6 @@ fun approvals_required() {
     if (getenv("O_REQUIRE_APPROVALS") == nil) { 'false' } else { 'true' }
 }
 
-# Serve the operator dashboard (single HTML file). Resolution order:
-# $O_WEB, then the installed ~/.o/web/dashboard.html, then the
-# cwd-relative web/dashboard.html (running from the repo).
-fun dashboard_path() {
-    env = getenv("O_WEB")
-    if (env == nil) {
-        home = getenv("HOME")
-        installed = f"{home}/.o/web/dashboard.html"
-        if (file_exists(installed) == 'true') {
-            installed
-        } else {
-            "web/dashboard.html"
-        }
-    } else {
-        env
-    }
-}
-
-fun serve_dashboard(conn) {
-    path = dashboard_path()
-    if (file_exists(path) == 'true') {
-        http_respond(conn, 200, "Content-Type: text/html; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\n", file_read(path))
-    } else {
-        respond(conn, 200, json_encode(%{name: "O", version: "v4", service: "swarmd", dashboard: "not found - set O_WEB"}))
-    }
-}
-
 # Ask the orchestrator process for a live scheduling snapshot.
 fun orch_snapshot(conn) {
     send(whereis('orchestrator'), {'snapshot', self()})
@@ -134,7 +107,7 @@ fun route_fs(conn, method, body) {
 
 fun route(db, dbpath, conn, method, path, body) {
     case path {
-        "/" -> serve_dashboard(conn)
+        "/" -> respond(conn, 200, json_encode(%{name: "O", version: "v4", service: "swarmd", ui: "the React app — cd ui && npm run dev"}))
         "/api/health" -> respond(conn, 200, json_encode(%{status: "ok", service: "o-v4", version: "v4"}))
         "/api/runs" -> respond(conn, 200, json_encode(Store.runs_all(db)))
         "/api/activity" -> respond(conn, 200, json_encode(Store.activity_recent(db)))

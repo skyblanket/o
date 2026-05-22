@@ -145,7 +145,6 @@ function HireAgent({ cid, onClose, done }: { cid: string; onClose: () => void; d
           <select value={runtime} onChange={e => setRuntime(e.target.value)}>
             <option value="claude-code">claude-code — real headless Claude</option>
             <option value="sim">sim — deterministic stub (no spend)</option>
-            <option value="native">native — LLM over HTTP</option>
           </select>
         </Field>
         <Field label="Repo (optional — for claude-code dev agents)">
