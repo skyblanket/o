@@ -1,0 +1,11 @@
+{
+  "name": "o-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for O v4 — drive the agent-company orchestrator from any MCP client (Claude Code).",
+  "type": "module",
+  "bin": "./server.js",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "zod": "^3.23.0"
+  }
+}
