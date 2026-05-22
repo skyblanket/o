@@ -171,3 +171,8 @@ h4.sec { font-size:11px; font-weight:600; letter-spacing:.6px; text-transform:up
 .hint { color:var(--faint); font-size:11.5px; margin-top:4px; }
 .row3 { display:flex; gap:9px; }
 .row3 > .field { flex:1; margin:0; }
+.fslist { border:1px solid var(--border); border-radius:8px; max-height:300px; overflow-y:auto; }
+.fsrow { display:flex; align-items:center; gap:8px; padding:8px 11px; cursor:pointer;
+  border-bottom:1px solid var(--border); font-size:12.5px; }
+.fsrow:last-child { border-bottom:0; }
+.fsrow:hover { background:var(--surface2); }

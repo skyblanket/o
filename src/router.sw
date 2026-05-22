@@ -115,6 +115,23 @@ fun dispatch(db, dbpath, conn, method, path, body) {
     }
 }
 
+# POST /api/fs {path} — list the sub-folders of a directory so the
+# UI can offer a folder picker (no more mistyped repo paths).
+fun route_fs(conn, method, body) {
+    if (method == 'POST') {
+        data = json_decode(body)
+        raw = map_get(data, "path")
+        home = getenv("HOME")
+        path = if (raw == nil) { home } else { if (string_length(raw) == 0) { home } else { raw } }
+        listing = elem(shell(f"ls -1 -Ap '{path}' 2>/dev/null"), 1)
+        gits = elem(shell(f"find '{path}' -mindepth 2 -maxdepth 2 -name .git 2>/dev/null"), 1)
+        parent = string_trim(elem(shell(f"dirname '{path}'"), 1))
+        respond(conn, 200, json_encode(%{path: path, parent: parent, listing: listing, gits: gits}))
+    } else {
+        respond(conn, 405, err_json("method not allowed"))
+    }
+}
+
 fun route(db, dbpath, conn, method, path, body) {
     case path {
         "/" -> serve_dashboard(conn)
@@ -122,6 +139,7 @@ fun route(db, dbpath, conn, method, path, body) {
         "/api/runs" -> respond(conn, 200, json_encode(Store.runs_all(db)))
         "/api/activity" -> respond(conn, 200, json_encode(Store.activity_recent(db)))
         "/api/orchestrator" -> orch_snapshot(conn)
+        "/api/fs" -> route_fs(conn, method, body)
         "/api/approvals" -> route_approvals(db, conn, method)
         "/api/companies" -> route_companies(db, conn, method, body)
         p when string_starts_with(p, "/api/companies/") == 'true' -> route_company(db, conn, method, p, body)

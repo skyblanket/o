@@ -83,32 +83,82 @@ function NewIssue({ cid, onClose, done }: { cid: string; onClose: () => void; do
   );
 }
 
+// pick a folder by browsing the daemon's filesystem — no typed paths
+function FolderPicker({ onPick, onClose }: { onPick: (p: string) => void; onClose: () => void }) {
+  const [cwd, setCwd] = useState("");
+  const [parent, setParent] = useState("");
+  const [dirs, setDirs] = useState<string[]>([]);
+  const [gits, setGits] = useState<Set<string>>(new Set());
+  const load = (p: string) => {
+    api.fs(p).then(r => {
+      setCwd(r.path); setParent(r.parent);
+      setDirs((r.listing || "").split("\n").filter(l => l.endsWith("/")).map(l => l.slice(0, -1)).sort());
+      const g = new Set<string>();
+      (r.gits || "").split("\n").filter(Boolean).forEach(line => {
+        const parts = line.split("/");
+        if (parts.length >= 2) g.add(parts[parts.length - 2]);
+      });
+      setGits(g);
+    }).catch(() => {});
+  };
+  useEffect(() => { load(""); }, []);
+  const into = (d: string) => load((cwd.endsWith("/") ? cwd : cwd + "/") + d);
+  return (
+    <Modal title="Pick a folder" onClose={onClose}
+      footer={<><button className="ghost" onClick={onClose}>Cancel</button>
+        <button className="primary" onClick={() => onPick(cwd)}>Use this folder</button></>}>
+      <div className="box mono" style={{ marginBottom: 10 }}>{cwd || "…"}</div>
+      <div className="fslist">
+        {parent && parent !== cwd &&
+          <div className="fsrow" onClick={() => load(parent)}><span style={{ color: "var(--dim)" }}>↑ ..</span></div>}
+        {dirs.length === 0 && <div className="hint" style={{ padding: "12px 4px" }}>No sub-folders here.</div>}
+        {dirs.map(d => (
+          <div className="fsrow" key={d} onClick={() => into(d)}>
+            <span>📁 {d}</span>
+            {gits.has(d) && <span className="rtag cc" style={{ marginLeft: "auto" }}>git repo</span>}
+          </div>
+        ))}
+      </div>
+    </Modal>
+  );
+}
+
 function HireAgent({ cid, onClose, done }: { cid: string; onClose: () => void; done: () => void }) {
   const [name, setName] = useState(""), [role, setRole] = useState("engineer");
   const [runtime, setRuntime] = useState("claude-code"), [repo, setRepo] = useState("");
+  const [picking, setPicking] = useState(false);
   const save = async () => {
     if (!name.trim()) return;
     await api.hireAgent(cid, { name: name.trim(), role: role.trim() || "generalist", runtime, repo: repo.trim() });
     done();
   };
   return (
-    <Modal title="Hire an agent" onClose={onClose}
-      footer={<><button className="ghost" onClick={onClose}>Cancel</button>
-        <button className="primary" onClick={save}>Hire</button></>}>
-      <div className="row3">
-        <Field label="Name"><input autoFocus value={name} onChange={e => setName(e.target.value)} placeholder="Ada" /></Field>
-        <Field label="Role"><input value={role} onChange={e => setRole(e.target.value)} /></Field>
-      </div>
-      <Field label="Runtime">
-        <select value={runtime} onChange={e => setRuntime(e.target.value)}>
-          <option value="claude-code">claude-code — real headless Claude</option>
-          <option value="sim">sim — deterministic stub (no spend)</option>
-          <option value="native">native — LLM over HTTP</option>
-        </select>
-      </Field>
-      <Field label="Repo path (optional)"><input value={repo} onChange={e => setRepo(e.target.value)} placeholder="/Users/sky/o — a git repo for dev agents" /></Field>
-      <p className="hint">A claude-code agent with a repo works each issue in an isolated git worktree on branch <code>o/&lt;issue&gt;</code> and commits there.</p>
-    </Modal>
+    <>
+      <Modal title="Hire an agent" onClose={onClose}
+        footer={<><button className="ghost" onClick={onClose}>Cancel</button>
+          <button className="primary" onClick={save}>Hire</button></>}>
+        <div className="row3">
+          <Field label="Name"><input autoFocus value={name} onChange={e => setName(e.target.value)} placeholder="Ada" /></Field>
+          <Field label="Role"><input value={role} onChange={e => setRole(e.target.value)} /></Field>
+        </div>
+        <Field label="Runtime">
+          <select value={runtime} onChange={e => setRuntime(e.target.value)}>
+            <option value="claude-code">claude-code — real headless Claude</option>
+            <option value="sim">sim — deterministic stub (no spend)</option>
+            <option value="native">native — LLM over HTTP</option>
+          </select>
+        </Field>
+        <Field label="Repo (optional — for claude-code dev agents)">
+          <div style={{ display: "flex", gap: 8 }}>
+            <input value={repo} readOnly placeholder="(none) — empty workspace per issue" />
+            <button type="button" onClick={() => setPicking(true)}>Browse…</button>
+            {repo && <button type="button" className="ghost" onClick={() => setRepo("")}>clear</button>}
+          </div>
+        </Field>
+        <p className="hint">Pick the folder — no typing, no typos. A claude-code agent with a repo works each issue in an isolated git worktree on branch <code>o/&lt;issue&gt;</code>.</p>
+      </Modal>
+      {picking && <FolderPicker onClose={() => setPicking(false)} onPick={p => { setRepo(p); setPicking(false); }} />}
+    </>
   );
 }
 

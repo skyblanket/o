@@ -58,6 +58,8 @@ export const api = {
   activity: () => req<Activity[]>("/activity"),
   orchestrator: () => req<Orchestrator>("/orchestrator"),
   runResult: (id: string) => req<{ workspace: string; result: string }>(`/runs/${id}/result`),
+  fs: (path: string) =>
+    post("/fs", { path }) as Promise<{ path: string; parent: string; listing: string; gits: string }>,
 };
 
 // ---- formatting helpers --------------------------------------
