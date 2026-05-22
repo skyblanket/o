@@ -383,12 +383,14 @@ function mAgent(){ openM({ body:F({ title:'Hire an agent',
      <option value="claude-code">claude-code — real headless Claude</option>
      <option value="sim">sim — deterministic stub (no spend)</option>
      <option value="native">native — LLM over HTTP</option></select></label>
-   <p style="color:var(--faint);font-size:11.5px">claude-code agents run real <code>claude -p</code> sessions in an isolated workspace per issue.</p>`,
+   <label class="fld"><span>Repo path (optional)</span>
+     <input id="a-repo" placeholder="/Users/sky/o — a git repo for dev agents"></label>
+   <p style="color:var(--faint);font-size:11.5px">A claude-code agent with a repo works inside a fresh git worktree per issue (branch <code>o/&lt;issue&gt;</code>) and commits there — review and merge what you like. No repo: it works in an empty scratch dir.</p>`,
   foot:`<button class="primary" onclick="doAgent()">Hire</button>` })}); }
 async function doAgent(){
   const name=$('#a-name').value.trim(); if(!name)return $('#a-name').focus();
   const r=await post('/companies/'+S.sel+'/agents',{ name, role:$('#a-role').value.trim()||'generalist',
-    runtime:$('#a-rt').value });
+    runtime:$('#a-rt').value, repo:$('#a-repo').value.trim() });
   closeM();
   if(r&&r.status==='pending_approval') alert('Approval required — queued in /api/approvals');
   poll();

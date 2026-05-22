@@ -21,7 +21,7 @@ fun migrate(db) {
 
     _goal = db_exec(db, "CREATE TABLE IF NOT EXISTS goal (id TEXT PRIMARY KEY, company_id TEXT NOT NULL, parent_goal_id TEXT, title TEXT NOT NULL, status TEXT, created_at INTEGER)")
 
-    _agent = db_exec(db, "CREATE TABLE IF NOT EXISTS agent (id TEXT PRIMARY KEY, company_id TEXT NOT NULL, name TEXT NOT NULL, role TEXT, department TEXT, manager_id TEXT, model TEXT, runtime TEXT, budget_cents INTEGER DEFAULT 0, status TEXT, created_at INTEGER)")
+    _agent = db_exec(db, "CREATE TABLE IF NOT EXISTS agent (id TEXT PRIMARY KEY, company_id TEXT NOT NULL, name TEXT NOT NULL, role TEXT, department TEXT, manager_id TEXT, model TEXT, runtime TEXT, repo TEXT DEFAULT '', budget_cents INTEGER DEFAULT 0, status TEXT, created_at INTEGER)")
 
     _issue = db_exec(db, "CREATE TABLE IF NOT EXISTS issue (id TEXT PRIMARY KEY, company_id TEXT NOT NULL, identifier TEXT, title TEXT NOT NULL, body TEXT, status TEXT, priority TEXT, assignee_agent_id TEXT, goal_id TEXT, blocked_by TEXT, sort_order INTEGER, created_at INTEGER, updated_at INTEGER)")
 
@@ -37,6 +37,9 @@ fun migrate(db) {
     _ix2 = db_exec(db, "CREATE INDEX IF NOT EXISTS ix_agent_company ON agent (company_id)")
     _ix3 = db_exec(db, "CREATE INDEX IF NOT EXISTS ix_run_issue ON run (issue_id)")
     _ix4 = db_exec(db, "CREATE INDEX IF NOT EXISTS ix_activity_company ON activity (company_id)")
+
+    # additive column for older databases (errors harmlessly if present)
+    _alt = db_exec(db, "ALTER TABLE agent ADD COLUMN repo TEXT DEFAULT ''")
 
     print("  schema     migrated (8 tables)")
 }

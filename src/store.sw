@@ -134,22 +134,22 @@ fun issue_update(db, id, status, priority, assignee) {
 # ---- agents ---------------------------------------------------
 
 fun agents_for(db, company_id) {
-    db_query(db, "SELECT id, company_id, name, role, department, model, runtime, status, created_at FROM agent WHERE company_id = ? ORDER BY created_at ASC", [company_id])
+    db_query(db, "SELECT id, company_id, name, role, department, model, runtime, repo, status, created_at FROM agent WHERE company_id = ? ORDER BY created_at ASC", [company_id])
 }
 
 fun agent_row(db, id) {
-    rows = db_query(db, "SELECT id, company_id, name, role, department, model, runtime, status, created_at FROM agent WHERE id = ?", [id])
+    rows = db_query(db, "SELECT id, company_id, name, role, department, model, runtime, repo, status, created_at FROM agent WHERE id = ?", [id])
     if (length(rows) == 0) { nil } else { hd(rows) }
 }
 
 fun agent_first_active(db, company_id) {
-    rows = db_query(db, "SELECT id, company_id, name, role, runtime, status FROM agent WHERE company_id = ? AND status = 'active' ORDER BY created_at ASC LIMIT 1", [company_id])
+    rows = db_query(db, "SELECT id, company_id, name, role, runtime, repo, status FROM agent WHERE company_id = ? AND status = 'active' ORDER BY created_at ASC LIMIT 1", [company_id])
     if (length(rows) == 0) { nil } else { hd(rows) }
 }
 
-fun agent_create(db, company_id, name, role, runtime, model) {
+fun agent_create(db, company_id, name, role, runtime, model, repo) {
     id = next_id("ag")
-    _ins = db_query(db, "INSERT INTO agent (id, company_id, name, role, runtime, model, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", [id, company_id, name, role, runtime, model, "active", timestamp()])
+    _ins = db_query(db, "INSERT INTO agent (id, company_id, name, role, runtime, model, repo, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", [id, company_id, name, role, runtime, model, repo, "active", timestamp()])
     id
 }
 

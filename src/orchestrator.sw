@@ -53,8 +53,12 @@ fun default_body(v) {
     if (v == nil) { "" } else { v }
 }
 
-fun build_prompt(title, body) {
-    "You are an autonomous agent in a fresh working directory. Complete the task below, creating whatever files are needed. Be concise.\n\nTask: " ++ title ++ "\n\n" ++ body
+fun build_prompt(title, body, repo) {
+    if (string_length(repo) > 0) {
+        "You are an autonomous engineer working in a git checkout of a real project. Make the code changes this task needs, then run `git add -A` and `git commit -m` with a clear message. Do NOT commit PROMPT.txt, result.json or err.log. Be focused and correct.\n\nTask: " ++ title ++ "\n\n" ++ body
+    } else {
+        "You are an autonomous agent in a fresh working directory. Complete the task below, creating whatever files are needed. Be concise.\n\nTask: " ++ title ++ "\n\n" ++ body
+    }
 }
 
 # sim runtime reports a fixed fake cost so budget enforcement can be
@@ -185,6 +189,8 @@ fun dispatch_one(db, issue, iid, attempt, running, now) {
     } else {
         agent_id = map_get(agent, "id")
         runtime = map_get(agent, "runtime")
+        rawrepo = map_get(agent, "repo")
+        repo = if (rawrepo == nil) { "" } else { rawrepo }
         home = getenv("HOME")
         workspace = f"{home}/.o/workspaces/{iid}"
         run_id = Store.run_create(db, iid, agent_id, attempt, "Running", workspace)
@@ -193,24 +199,24 @@ fun dispatch_one(db, issue, iid, attempt, running, now) {
         _a = Store.log_activity(db, company_id, "orchestrator", "run.dispatch", iid)
         ident = map_get(issue, "identifier")
         print(f"[orch] dispatch {ident} via {runtime} (attempt {attempt})")
-        prompt = build_prompt(map_get(issue, "title"), default_body(map_get(issue, "body")))
+        prompt = build_prompt(map_get(issue, "title"), default_body(map_get(issue, "body")), repo)
         sim_outcome = if (runtime == "sim") { decide_outcome(issue, attempt) } else { 'none' }
-        wpid = spawn(run_worker(self(), run_id, iid, runtime, prompt, workspace, sim_outcome))
+        wpid = spawn(run_worker(self(), run_id, iid, runtime, prompt, workspace, repo, sim_outcome))
         map_put(running, iid, %{run_id: run_id, worker_pid: wpid, started_at: now, attempt: attempt, company_id: company_id})
     }
 }
 
 # ---- workers: real agent runtimes ----------------------------
 
-fun run_worker(orch, run_id, issue_id, runtime, prompt, workspace, sim_outcome) {
-    _mk = shell(f"mkdir -p {workspace}")
+fun run_worker(orch, run_id, issue_id, runtime, prompt, workspace, repo, sim_outcome) {
     if (runtime == "sim") {
         run_sim(orch, run_id, issue_id, sim_outcome)
     } else {
         if (runtime == "native") {
+            _mk = shell(f"mkdir -p {workspace}")
             run_native(orch, run_id, issue_id, prompt, workspace)
         } else {
-            run_claude_code(orch, run_id, issue_id, prompt, workspace)
+            run_claude_code(orch, run_id, issue_id, prompt, workspace, repo)
         }
     }
 }
@@ -218,7 +224,12 @@ fun run_worker(orch, run_id, issue_id, runtime, prompt, workspace, sim_outcome) 
 # claude-code runtime — a real headless `claude -p` run in the
 # per-issue workspace. Exit 0 = succeeded; anything else = retry.
 # Real cost is parsed from result.json (total_cost_usd).
-fun run_claude_code(orch, run_id, issue_id, prompt, workspace) {
+fun run_claude_code(orch, run_id, issue_id, prompt, workspace, repo) {
+    if (string_length(repo) > 0) {
+        prepare_worktree(repo, workspace, issue_id)
+    } else {
+        _mk = shell(f"mkdir -p {workspace}")
+    }
     _w = file_write(f"{workspace}/PROMPT.txt", prompt)
     bin = claude_bin()
     cmd = f"cd {workspace} && cat PROMPT.txt | {bin} -p --dangerously-skip-permissions --output-format json > result.json 2> err.log"
@@ -244,6 +255,19 @@ fun parse_cost(path) {
         }
     } else {
         0
+    }
+}
+
+# Create an isolated git worktree of `repo` for this issue, on a fresh
+# branch o/<issue_id>. Reused as-is if it already exists (e.g. retry),
+# so concurrent issues never touch each other's checkout.
+fun prepare_worktree(repo, workspace, issue_id) {
+    if (file_exists(workspace) == 'true') {
+        ""
+    } else {
+        branch = f"o/{issue_id}"
+        _wt = shell(f"git -C {repo} worktree add {workspace} -b {branch}")
+        ""
     }
 }
 

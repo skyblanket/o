@@ -266,13 +266,14 @@ fun create_agent(db, conn, cid, body) {
             role = default_str(map_get(data, "role"), "generalist")
             runtime = default_str(map_get(data, "runtime"), "claude-code")
             model = default_str(map_get(data, "model"), "")
+            repo = default_str(map_get(data, "repo"), "")
             if (approvals_required() == 'true') {
-                payload = json_encode(%{company_id: cid, name: name, role: role, runtime: runtime, model: model})
+                payload = json_encode(%{company_id: cid, name: name, role: role, runtime: runtime, model: model, repo: repo})
                 aid = Store.approval_create(db, cid, "agent.hire", payload)
                 _l = Store.log_activity(db, cid, "operator", "approval.requested", aid)
                 respond(conn, 202, json_encode(%{status: "pending_approval", action: "agent.hire", approval_id: aid}))
             } else {
-                id = Store.agent_create(db, cid, name, role, runtime, model)
+                id = Store.agent_create(db, cid, name, role, runtime, model, repo)
                 _l = Store.log_activity(db, cid, "operator", "agent.hire", id)
                 respond(conn, 201, json_encode(Store.agent_row(db, id)))
             }
@@ -368,7 +369,7 @@ fun run_result(db, conn, p) {
 fun execute_approval(db, appr) {
     if (map_get(appr, "action") == "agent.hire") {
         pl = json_decode(map_get(appr, "payload"))
-        Store.agent_create(db, map_get(pl, "company_id"), map_get(pl, "name"), map_get(pl, "role"), map_get(pl, "runtime"), map_get(pl, "model"))
+        Store.agent_create(db, map_get(pl, "company_id"), map_get(pl, "name"), map_get(pl, "role"), map_get(pl, "runtime"), map_get(pl, "model"), default_str(map_get(pl, "repo"), ""))
     } else {
         ""
     }

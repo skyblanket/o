@@ -36,7 +36,7 @@ fun idgen_loop(n) {
 fun main() {
     home = getenv("HOME")
     dir = f"{home}/.o"
-    _mk = shell(f"mkdir -p {dir}")
+    _mk = shell(f"mkdir -p {dir}/workspaces")
     dbpath = f"{dir}/o.db"
 
     db = db_open(dbpath)
