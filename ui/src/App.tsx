@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef, type ReactNode } from "react";
+import { useState, useEffect, useCallback, useRef, useMemo, type ReactNode } from "react";
 import {
   api, money, ago, dur, initials,
   type Company, type Issue, type Agent, type Run, type Activity, type Orchestrator, type Message,
@@ -144,6 +144,7 @@ function HireAgent({ cid, onClose, done }: { cid: string; onClose: () => void; d
         <Field label="Runtime">
           <select value={runtime} onChange={e => setRuntime(e.target.value)}>
             <option value="claude-code">claude-code — real headless Claude</option>
+            <option value="swarm-code">swarm-code — Kimi/sw coding agent</option>
             <option value="sim">sim — deterministic stub (no spend)</option>
           </select>
         </Field>
@@ -185,27 +186,87 @@ function Manage({ company, onClose, done }: { company: Company; onClose: () => v
   );
 }
 
-// ---- issue detail (editable) --------------------------------------
+// ---- live agent activity (claude-code stream-json events) ----------
+type AnyEvent = Record<string, unknown> & { type?: string };
+
+function parseStream(raw: string): AnyEvent[] {
+  if (!raw) return [];
+  const out: AnyEvent[] = [];
+  for (const line of raw.split("\n")) {
+    if (!line) continue;
+    try { out.push(JSON.parse(line) as AnyEvent); } catch { /* partial / malformed line — skip */ }
+  }
+  return out;
+}
+
+function Activity({ e }: { e: AnyEvent }) {
+  const t = e.type;
+  if (t === "system") {
+    if (e.subtype === "init") return <div className="evt sys">▶ started · {String(e.model || "")}</div>;
+    return null;
+  }
+  if (t === "assistant") {
+    const blocks: any[] = ((e.message as any) || {}).content || [];
+    return <>{blocks.map((b, i) => {
+      if (b.type === "text") return <div key={i} className="evt text">{b.text}</div>;
+      if (b.type === "tool_use") {
+        const args = typeof b.input === "object" ? JSON.stringify(b.input) : String(b.input || "");
+        return <div key={i} className="evt tool">🔧 <b>{b.name}</b> <span className="mono">{args.slice(0, 200)}{args.length > 200 ? "…" : ""}</span></div>;
+      }
+      if (b.type === "thinking") return <div key={i} className="evt sys">💭 thinking…</div>;
+      return null;
+    })}</>;
+  }
+  if (t === "user") {
+    const blocks: any[] = ((e.message as any) || {}).content || [];
+    return <>{blocks.map((b, i) => {
+      if (b.type === "tool_result") {
+        const txt = typeof b.content === "string" ? b.content
+          : Array.isArray(b.content) ? b.content.map((c: any) => c.text || "").join("")
+          : JSON.stringify(b.content);
+        return <div key={i} className="evt tres">↳ <span className="mono">{txt.slice(0, 240)}{txt.length > 240 ? "…" : ""}</span></div>;
+      }
+      return null;
+    })}</>;
+  }
+  if (t === "result") {
+    const usd = (e.total_cost_usd as number) || 0;
+    return <div className="evt done">✓ done · ${usd.toFixed(4)}</div>;
+  }
+  return null;
+}
+
+// ---- issue detail (editable + live agent activity) ----------------
 function IssueModal({ issue, agents, runs, onClose, done }: {
   issue: Issue; agents: Agent[]; runs: Run[]; onClose: () => void; done: () => void;
 }) {
   const [status, setStatus] = useState(issue.status);
   const [assignee, setAssignee] = useState(issue.assignee_agent_id || "");
   const [prio, setPrio] = useState(issue.priority || "medium");
-  const [result, setResult] = useState<string | null>(null);
+  const [streamRaw, setStreamRaw] = useState<string>("");
   const [errlog, setErrlog] = useState<string>("");
   const mine = runs.filter(r => r.issue_id === issue.id);
+  const last = mine[0];
 
   useEffect(() => {
-    const last = mine[0];
     if (!last) return;
-    api.runResult(last.id).then(r => {
-      let summary = "";
-      try { summary = JSON.parse(r.result).result || ""; } catch { /* not json */ }
-      setResult(summary || r.result || "");
+    let cancelled = false;
+    const fetchOnce = () => api.runResult(last.id).then(r => {
+      if (cancelled) return;
+      setStreamRaw(r.stream || r.result || "");
       setErrlog(r.error || "");
     }).catch(() => {});
-  }, [issue.id]); // eslint-disable-line react-hooks/exhaustive-deps
+    fetchOnce();
+    if (last.state === "Running") {
+      const t = setInterval(fetchOnce, 1500);
+      return () => { cancelled = true; clearInterval(t); };
+    }
+    return () => { cancelled = true; };
+  }, [last?.id, last?.state]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const events = useMemo(() => parseStream(streamRaw), [streamRaw]);
+  const finalEvent = events.find(e => e.type === "result") as any;
+  const summary: string = (finalEvent && finalEvent.result) || "";
 
   const save = async () => {
     await api.updateIssue(issue.id, { status, priority: prio, assignee_agent_id: assignee });
@@ -246,9 +307,16 @@ function IssueModal({ issue, agents, runs, onClose, done }: {
           <span style={{ marginLeft: "auto", color: "var(--dim)" }}>{r.cost_cents ? money(r.cost_cents) : ""}</span>
         </div>
       )) : <div className="hint">Not run yet — the orchestrator will pick it up.</div>}
-      {result !== null && result.length > 0 && <>
-        <h4 className="sec">Agent result</h4>
-        <div className="box">{result}</div>
+
+      {events.length > 0 && <>
+        <h4 className="sec">Agent activity {last?.state === "Running" && <span style={{ color: "var(--green)", marginLeft: 6 }}>· live</span>}</h4>
+        <div className="activity">
+          {events.map((e, i) => <Activity key={i} e={e} />)}
+        </div>
+      </>}
+      {summary.length > 0 && <>
+        <h4 className="sec">Final result</h4>
+        <div className="box">{summary}</div>
       </>}
       {errlog.length > 0 && <>
         <h4 className="sec" style={{ color: "var(--red)" }}>Error log</h4>

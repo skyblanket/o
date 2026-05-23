@@ -245,11 +245,14 @@ fun run_claude_code(orch, run_id, issue_id, prompt, workspace, repo, session_id)
     _w = file_write(f"{workspace}/PROMPT.txt", prompt)
     bin = claude_bin()
     resume = if (string_length(session_id) > 0) { f" --resume {session_id}" } else { "" }
-    cmd = f"cd {workspace} && cat PROMPT.txt | {bin} -p{resume} --dangerously-skip-permissions --output-format json > result.json 2> err.log"
+    # stream-json: one JSON event per turn so the UI can watch the
+    # agent work live. The final {type:"result"} event carries cost
+    # and session — parse_stream_* find it after the run.
+    cmd = f"cd {workspace} && cat PROMPT.txt | {bin} -p{resume} --dangerously-skip-permissions --verbose --output-format stream-json > stream.jsonl 2> err.log"
     result = shell(cmd)
     code = elem(result, 0)
-    cost = parse_cost(f"{workspace}/result.json")
-    new_session = parse_session(f"{workspace}/result.json")
+    cost = parse_stream_cost(f"{workspace}/stream.jsonl")
+    new_session = parse_stream_session(f"{workspace}/stream.jsonl")
     if (code == 0) {
         send(orch, {'run_done', run_id, issue_id, 'succeeded', cost, new_session})
     } else {
@@ -286,6 +289,53 @@ fun parse_session(path) {
     } else {
         ""
     }
+}
+
+# ---- stream-json parsers ----------------------------------------
+# Issue runs use --output-format stream-json (line-delimited events)
+# so the UI can show live activity. The final {type:"result"} event
+# carries cost/session/summary. These helpers walk the file after
+# the run completes and pull what we need.
+
+fun find_result_event(lines) {
+    if (length(lines) == 0) {
+        %{}
+    } else {
+        line = hd(lines)
+        if (string_length(line) == 0) {
+            find_result_event(tl(lines))
+        } else {
+            data = json_decode(line)
+            if (data == nil) {
+                find_result_event(tl(lines))
+            } else {
+                if (map_get(data, "type") == "result") { data }
+                else { find_result_event(tl(lines)) }
+            }
+        }
+    }
+}
+
+fun parse_stream_result(path) {
+    if (file_exists(path) == 'true') {
+        raw = file_read(path)
+        if (string_length(raw) == 0) { %{} }
+        else { find_result_event(string_split(raw, "\n")) }
+    } else {
+        %{}
+    }
+}
+
+fun parse_stream_cost(path) {
+    d = parse_stream_result(path)
+    usd = map_get(d, "total_cost_usd")
+    if (usd == nil) { 0 } else { usd * 100 }
+}
+
+fun parse_stream_session(path) {
+    d = parse_stream_result(path)
+    s = map_get(d, "session_id")
+    if (s == nil) { "" } else { s }
 }
 
 # swarm-code runtime — the swarmrt-native coding agent. Driven through

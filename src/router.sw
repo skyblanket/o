@@ -437,10 +437,12 @@ fun run_result(db, conn, p) {
         } else {
             ws = map_get(run, "workspace_path")
             rpath = f"{ws}/result.json"
+            spath = f"{ws}/stream.jsonl"
             epath = f"{ws}/err.log"
             res = if (file_exists(rpath) == 'true') { file_read(rpath) } else { "" }
+            stream = if (file_exists(spath) == 'true') { file_read(spath) } else { "" }
             errlog = if (file_exists(epath) == 'true') { file_read(epath) } else { "" }
-            respond(conn, 200, json_encode(%{workspace: ws, result: res, error: errlog}))
+            respond(conn, 200, json_encode(%{workspace: ws, result: res, stream: stream, error: errlog}))
         }
     } else {
         respond(conn, 404, err_json("not found"))
