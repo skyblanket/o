@@ -1,4 +1,4 @@
-# O v4 — build the swarmd daemon
+# O v4 — build, install, run
 SWARMRT ?= /Users/sky/swarmrt
 SWC     := $(SWARMRT)/bin/swc
 
@@ -9,7 +9,7 @@ SOURCES := $(wildcard $(SRC_DIR)/*.sw)
 PREFIX  ?= $(HOME)/.local
 DATADIR := $(HOME)/.o
 
-.PHONY: all clean run install seed
+.PHONY: all clean run install seed dev stop-dev logs
 
 all: $(BIN)
 
@@ -21,16 +21,29 @@ $(BIN): $(SOURCES)
 clean:
 	rm -rf bin
 
+# Foreground run — for development of the daemon itself.
 run: $(BIN)
 	./$(BIN)
 
-# Install the daemon onto PATH and the dashboard into ~/.o/web.
+# Install the daemon binary onto PATH.
 install: $(BIN)
-	@mkdir -p $(PREFIX)/bin $(DATADIR)/web
+	@mkdir -p $(PREFIX)/bin
 	cp $(BIN) $(PREFIX)/bin/swarmd
-	cp web/dashboard.html $(DATADIR)/web/dashboard.html
 	@echo "installed: $(PREFIX)/bin/swarmd"
-	@echo "run 'swarmd', then open http://localhost:4100"
+	@echo "run 'make dev' to start daemon + UI together."
+
+# Bring up swarmd + Vite as managed background processes with
+# auto-restart on crash. Survive shell cleanup. Run once and forget.
+dev:
+	@./scripts/dev.sh
+
+stop-dev:
+	@./scripts/stop.sh
+
+logs:
+	@echo "=== daemon (tail 25) ==="; tail -25 $(DATADIR)/daemon.log 2>/dev/null || echo "(no daemon.log — run make dev)"
+	@echo
+	@echo "=== ui (tail 25) ==="; tail -25 $(DATADIR)/ui.log 2>/dev/null || echo "(no ui.log — run make dev)"
 
 # Seed an example company so there is something to watch.
 seed:
