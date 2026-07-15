@@ -10,7 +10,10 @@
 #   make logs
 set -e
 
-O_ROOT="${O_ROOT:-/Users/sky/o}"
+# Repo root defaults to this script's parent dir (scripts/..), so the
+# dev environment works from any checkout. Override with O_ROOT.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+O_ROOT="${O_ROOT:-$(dirname "$SCRIPT_DIR")}"
 SWARMD="${SWARMD:-$HOME/.local/bin/swarmd}"
 DIR="$HOME/.o"
 mkdir -p "$DIR"

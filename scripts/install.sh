@@ -53,6 +53,6 @@ echo
 echo "  swarmd installed to $PREFIX/bin/swarmd"
 echo "  make sure $PREFIX/bin is on your PATH, then:"
 echo
-echo "    swarmd                       # start the daemon"
-echo "    open http://localhost:4100   # the operator dashboard"
+echo "    swarmd                       # start the daemon (HTTP API on :4100)"
+echo "    make dev                     # daemon + web UI (http://localhost:5173)"
 echo

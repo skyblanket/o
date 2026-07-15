@@ -1,5 +1,10 @@
 # O v4 — build, install, run
-SWARMRT ?= /Users/sky/swarmrt
+#
+# SWARMRT points at a swarmrt checkout. The default assumes the
+# sibling-checkout convention: clone github.com/skyblanket/swarmrt
+# next to this repo so that ../swarmrt resolves from the repo root.
+# Override with `make SWARMRT=/path/to/swarmrt` if it lives elsewhere.
+SWARMRT ?= ../swarmrt
 SWC     := $(SWARMRT)/bin/swc
 
 SRC_DIR := src
@@ -19,6 +24,11 @@ check: $(BIN)
 	@./scripts/check.sh
 
 $(BIN): $(SOURCES)
+	@test -x "$(SWC)" || { \
+	  echo "error: swarmrt compiler not found at $(SWC)"; \
+	  echo "clone github.com/skyblanket/swarmrt as a sibling of this repo,"; \
+	  echo "or build with: make SWARMRT=/path/to/swarmrt"; \
+	  exit 1; }
 	@mkdir -p bin
 	$(SWC) build $(SRC_DIR)/main.sw -o $(BIN)
 	@echo "O v4: built $(BIN)"
