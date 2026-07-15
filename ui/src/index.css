@@ -145,6 +145,25 @@ input:focus,select:focus,textarea:focus {
 .st { font-size:10px; font-weight:700; letter-spacing:.4px; }
 .st.Succeeded { color:var(--green); } .st.Failed { color:var(--red); }
 .st.Running { color:var(--blue); } .st.Stalled { color:var(--amber); }
+.st.Verifying { color:var(--amber); } .st.Reverted { color:var(--red); }
+
+/* origin chip on issue cards (⚙ auto / 🪞 reflect / 🎯 feedback) + reverted */
+.ochip { font-size:9px; font-weight:600; padding:1px 6px; border-radius:5px;
+  background:var(--surface2); color:var(--dim); letter-spacing:.2px; vertical-align:1px; }
+.ochip.reverted { color:var(--red); background:rgba(191,70,60,.1); }
+
+/* verify_state chip in the issue detail Verification section */
+.vchip { font-size:10px; font-weight:700; letter-spacing:.3px; padding:2px 8px; border-radius:6px;
+  font-family:ui-monospace,Menlo,monospace; }
+.vchip.green { color:var(--green); background:rgba(63,140,92,.12); }
+.vchip.red { color:var(--red); background:rgba(191,70,60,.12); }
+.vchip.conflict { color:var(--amber); background:rgba(163,116,30,.12); }
+.vchip.reverted { color:var(--red); background:rgba(191,70,60,.12); }
+.vchip.none { color:var(--faint); background:var(--surface2); }
+.vout { background:var(--surface2); border:1px solid var(--border); border-radius:10px;
+  padding:12px 14px; font-family:ui-monospace,Menlo,monospace; font-size:11px; color:var(--dim);
+  line-height:1.55; max-height:260px; overflow:auto; white-space:pre-wrap; word-break:break-word;
+  margin-top:9px; }
 
 .empty { display:flex; flex-direction:column; align-items:center; justify-content:center;
   flex:1; gap:16px; color:var(--dim); text-align:center; padding:40px; }

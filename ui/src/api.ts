@@ -8,11 +8,17 @@ export interface Company {
   id: string; name: string; mission: string; issue_prefix: string; status: string;
   budget_monthly_cents: number; spent_cents: number; issue_counter: number;
   created_at: number; updated_at: number;
+  // phase 0-6: repo target + verify gate + daily budget ledger
+  repo: string; verify_cmd: string; protected_paths: string;
+  budget_daily_cents: number; spent_today_cents: number; budget_day: number;
+  pause_reason: string; greens_today: number; no_signal_days: number;
 }
 export interface Issue {
   id: string; company_id: string; identifier: string; title: string; body: string;
   status: string; priority: string; assignee_agent_id: string | null;
   sort_order: number; created_at: number; updated_at: number;
+  // where this issue came from: operator | auto | reflect | feedback
+  origin: string; fingerprint: string;
 }
 export interface Agent {
   id: string; company_id: string; name: string; role: string;
@@ -21,6 +27,9 @@ export interface Agent {
 export interface Run {
   id: string; issue_id: string; agent_id: string; attempt: number; state: string;
   workspace_path: string; started_at: number; ended_at: number | null; cost_cents: number;
+  // phase 2-3 verify gate: green | red_* | conflict | reverted (verify_output
+  // is only carried on the /result endpoint, not the runs list)
+  verify_state: string; merge_sha: string;
 }
 export interface Activity {
   id: string; company_id: string; actor: string; verb: string; target: string; ts: number;
@@ -60,7 +69,10 @@ export const api = {
   runs: () => req<Run[]>("/runs"),
   activity: () => req<Activity[]>("/activity"),
   orchestrator: () => req<Orchestrator>("/orchestrator"),
-  runResult: (id: string) => req<{ workspace: string; result: string; stream: string; error: string }>(`/runs/${id}/result`),
+  runResult: (id: string) => req<{
+    workspace: string; result: string; stream: string; error: string;
+    verify_state: string; verify_output: string; merge_sha: string;
+  }>(`/runs/${id}/result`),
   fs: (path: string) =>
     post("/fs", { path }) as Promise<{ path: string; parent: string; listing: string; gits: string }>,
   agentMessages: (id: string) => req<Message[]>(`/agents/${id}/messages`),

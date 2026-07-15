@@ -4,7 +4,25 @@ import {
   type Company, type Issue, type Agent, type Run, type Activity, type Orchestrator, type Message,
 } from "./api";
 
-const LANES = ["Backlog", "In Progress", "Done", "Failed"];
+const LANES = ["Backlog", "In Progress", "Verifying", "Done", "Failed"];
+
+// An issue lives in the Failed lane whether it truly Failed or was Reverted
+// off main; the "reverted" case gets its own chip on the card.
+const laneOf = (status: string) => (status === "Reverted" ? "Failed" : status);
+
+// where the loop got this issue from — operator issues show nothing.
+const ORIGIN_CHIP: Record<string, string> = {
+  auto: "⚙ auto", reflect: "🪞 reflect", feedback: "🎯 feedback",
+};
+
+// verify_state (STRING from the DB) → a semantic color class for a chip.
+// green | red_* | conflict | reverted | "".
+const verifyClass = (vs: string) =>
+  vs === "green" ? "green"
+  : vs === "conflict" ? "conflict"
+  : vs === "reverted" ? "reverted"
+  : vs.startsWith("red") ? "red"
+  : "none";
 
 // ---- generic modal -------------------------------------------------
 function Modal(props: {
@@ -38,26 +56,49 @@ function Field(props: { label: string; children: ReactNode }) {
 function NewCompany({ onClose, done }: { onClose: () => void; done: () => void }) {
   const [name, setName] = useState(""), [mission, setMission] = useState("");
   const [prefix, setPrefix] = useState("TASK"), [budget, setBudget] = useState("");
+  const [daily, setDaily] = useState("");
+  const [repo, setRepo] = useState(""), [verifyCmd, setVerifyCmd] = useState("");
+  const [protectedPaths, setProtectedPaths] = useState("");
+  const [picking, setPicking] = useState(false);
   const save = async () => {
     if (!name.trim()) return;
     await api.createCompany({
       name: name.trim(), mission: mission.trim(),
       issue_prefix: prefix.trim() || "TASK",
       budget_monthly_cents: Math.round((parseFloat(budget) || 0) * 100),
+      budget_daily_cents: Math.round((parseFloat(daily) || 0) * 100),
+      repo: repo.trim(), verify_cmd: verifyCmd.trim(),
+      protected_paths: protectedPaths.trim(),
     });
     done();
   };
   return (
-    <Modal title="New company" onClose={onClose}
-      footer={<><button className="ghost" onClick={onClose}>Cancel</button>
-        <button className="primary" onClick={save}>Create company</button></>}>
-      <Field label="Name"><input autoFocus value={name} onChange={e => setName(e.target.value)} placeholder="Acme Inc" /></Field>
-      <Field label="Mission"><input value={mission} onChange={e => setMission(e.target.value)} placeholder="what this company is for" /></Field>
-      <div className="row3">
-        <Field label="Issue prefix"><input value={prefix} onChange={e => setPrefix(e.target.value)} /></Field>
-        <Field label="Monthly budget (USD)"><input type="number" value={budget} onChange={e => setBudget(e.target.value)} placeholder="0 = unlimited" /></Field>
-      </div>
-    </Modal>
+    <>
+      <Modal title="New company" onClose={onClose}
+        footer={<><button className="ghost" onClick={onClose}>Cancel</button>
+          <button className="primary" onClick={save}>Create company</button></>}>
+        <Field label="Name"><input autoFocus value={name} onChange={e => setName(e.target.value)} placeholder="Acme Inc" /></Field>
+        <Field label="Mission"><input value={mission} onChange={e => setMission(e.target.value)} placeholder="what this company is for" /></Field>
+        <Field label="Repo (the codebase the loop maintains)">
+          <div style={{ display: "flex", gap: 8 }}>
+            <input value={repo} readOnly placeholder="(none) — empty workspace per issue" />
+            <button type="button" onClick={() => setPicking(true)}>Browse…</button>
+            {repo && <button type="button" className="ghost" onClick={() => setRepo("")}>clear</button>}
+          </div>
+        </Field>
+        <div className="row3">
+          <Field label="Verify command"><input value={verifyCmd} onChange={e => setVerifyCmd(e.target.value)} placeholder="make check" /></Field>
+          <Field label="Protected paths"><input value={protectedPaths} onChange={e => setProtectedPaths(e.target.value)} placeholder="comma-sep, e.g. .github/,deploy/" /></Field>
+        </div>
+        <div className="row3">
+          <Field label="Issue prefix"><input value={prefix} onChange={e => setPrefix(e.target.value)} /></Field>
+          <Field label="Daily budget (USD)"><input type="number" value={daily} onChange={e => setDaily(e.target.value)} placeholder="0 = no daily cap" /></Field>
+          <Field label="Monthly budget (USD)"><input type="number" value={budget} onChange={e => setBudget(e.target.value)} placeholder="0 = unlimited" /></Field>
+        </div>
+        <p className="hint">The verify command is the grounded gate — a change only merges when it exits 0. Protected paths can never be touched by an agent.</p>
+      </Modal>
+      {picking && <FolderPicker onClose={() => setPicking(false)} onPick={p => { setRepo(p); setPicking(false); }} />}
+    </>
   );
 }
 
@@ -164,25 +205,50 @@ function HireAgent({ cid, onClose, done }: { cid: string; onClose: () => void; d
 
 function Manage({ company, onClose, done }: { company: Company; onClose: () => void; done: () => void }) {
   const [budget, setBudget] = useState(String((company.budget_monthly_cents / 100) || 0));
+  const [daily, setDaily] = useState(String((company.budget_daily_cents / 100) || 0));
   const [status, setStatus] = useState(company.status);
+  const [repo, setRepo] = useState(company.repo || "");
+  const [verifyCmd, setVerifyCmd] = useState(company.verify_cmd || "");
+  const [protectedPaths, setProtectedPaths] = useState(company.protected_paths || "");
+  const [picking, setPicking] = useState(false);
   const save = async () => {
     await api.updateCompany(company.id, {
-      budget_monthly_cents: Math.round((parseFloat(budget) || 0) * 100), status,
+      budget_monthly_cents: Math.round((parseFloat(budget) || 0) * 100),
+      budget_daily_cents: Math.round((parseFloat(daily) || 0) * 100),
+      status, repo: repo.trim(), verify_cmd: verifyCmd.trim(),
+      protected_paths: protectedPaths.trim(),
     });
     done();
   };
   return (
-    <Modal title={"Manage " + company.name} onClose={onClose}
-      footer={<><button className="ghost" onClick={onClose}>Cancel</button>
-        <button className="primary" onClick={save}>Save</button></>}>
-      <Field label="Monthly budget (USD)"><input type="number" value={budget} onChange={e => setBudget(e.target.value)} /></Field>
-      <Field label="Status">
-        <select value={status} onChange={e => setStatus(e.target.value)}>
-          <option value="active">active</option><option value="paused">paused</option>
-        </select>
-      </Field>
-      <p className="hint">Set status to <b>active</b> to resume a company that was budget-paused.</p>
-    </Modal>
+    <>
+      <Modal title={"Manage " + company.name} onClose={onClose}
+        footer={<><button className="ghost" onClick={onClose}>Cancel</button>
+          <button className="primary" onClick={save}>Save</button></>}>
+        <Field label="Repo (the codebase the loop maintains)">
+          <div style={{ display: "flex", gap: 8 }}>
+            <input value={repo} readOnly placeholder="(none) — empty workspace per issue" />
+            <button type="button" onClick={() => setPicking(true)}>Browse…</button>
+            {repo && <button type="button" className="ghost" onClick={() => setRepo("")}>clear</button>}
+          </div>
+        </Field>
+        <div className="row3">
+          <Field label="Verify command"><input value={verifyCmd} onChange={e => setVerifyCmd(e.target.value)} placeholder="make check" /></Field>
+          <Field label="Protected paths"><input value={protectedPaths} onChange={e => setProtectedPaths(e.target.value)} placeholder="comma-sep, e.g. .github/,deploy/" /></Field>
+        </div>
+        <div className="row3">
+          <Field label="Daily budget (USD)"><input type="number" value={daily} onChange={e => setDaily(e.target.value)} /></Field>
+          <Field label="Monthly budget (USD)"><input type="number" value={budget} onChange={e => setBudget(e.target.value)} /></Field>
+          <Field label="Status">
+            <select value={status} onChange={e => setStatus(e.target.value)}>
+              <option value="active">active</option><option value="paused">paused</option>
+            </select>
+          </Field>
+        </div>
+        <p className="hint">Set status to <b>active</b> to resume a company that was budget- or no-signal-paused.</p>
+      </Modal>
+      {picking && <FolderPicker onClose={() => setPicking(false)} onPick={p => { setRepo(p); setPicking(false); }} />}
+    </>
   );
 }
 
@@ -245,6 +311,9 @@ function IssueModal({ issue, agents, runs, onClose, done }: {
   const [prio, setPrio] = useState(issue.priority || "medium");
   const [streamRaw, setStreamRaw] = useState<string>("");
   const [errlog, setErrlog] = useState<string>("");
+  const [vstate, setVstate] = useState<string>("");
+  const [voutput, setVoutput] = useState<string>("");
+  const [mergeSha, setMergeSha] = useState<string>("");
   const mine = runs.filter(r => r.issue_id === issue.id);
   const last = mine[0];
 
@@ -255,9 +324,12 @@ function IssueModal({ issue, agents, runs, onClose, done }: {
       if (cancelled) return;
       setStreamRaw(r.stream || r.result || "");
       setErrlog(r.error || "");
+      setVstate(r.verify_state || "");
+      setVoutput(r.verify_output || "");
+      setMergeSha(r.merge_sha || "");
     }).catch(() => {});
     fetchOnce();
-    if (last.state === "Running") {
+    if (last.state === "Running" || last.state === "Verifying") {
       const t = setInterval(fetchOnce, 1500);
       return () => { cancelled = true; clearInterval(t); };
     }
@@ -280,7 +352,7 @@ function IssueModal({ issue, agents, runs, onClose, done }: {
       <div className="row3">
         <Field label="Status">
           <select value={status} onChange={e => setStatus(e.target.value)}>
-            {["Backlog", "In Progress", "Done", "Failed", "Canceled"].map(s => <option key={s}>{s}</option>)}
+            {["Backlog", "In Progress", "Verifying", "Done", "Failed", "Reverted", "Canceled"].map(s => <option key={s}>{s}</option>)}
           </select>
         </Field>
         <Field label="Assignee">
@@ -308,8 +380,28 @@ function IssueModal({ issue, agents, runs, onClose, done }: {
         </div>
       )) : <div className="hint">Not run yet — the orchestrator will pick it up.</div>}
 
+      {(() => {
+        const evs = vstate || (last?.verify_state || "");
+        const sha = mergeSha || (last?.merge_sha || "");
+        if (!evs) return null;
+        const merged = evs === "green" && sha.length > 0;
+        return <>
+          <h4 className="sec">Verification</h4>
+          <div className="runrow">
+            <span className={"vchip " + verifyClass(evs)}>{evs}</span>
+            {merged
+              ? <span style={{ color: "var(--green)" }}>merged as <code>{sha.slice(0, 8)}</code></span>
+              : evs === "reverted"
+                ? <span style={{ color: "var(--red)" }}>reverted — branch kept</span>
+                : null}
+          </div>
+          {voutput.length > 0 &&
+            <pre className="vout">{voutput.slice(-4000)}</pre>}
+        </>;
+      })()}
+
       {events.length > 0 && <>
-        <h4 className="sec">Agent activity {last?.state === "Running" && <span style={{ color: "var(--green)", marginLeft: 6 }}>· live</span>}</h4>
+        <h4 className="sec">Agent activity {(last?.state === "Running" || last?.state === "Verifying") && <span style={{ color: "var(--green)", marginLeft: 6 }}>· live</span>}</h4>
         <div className="activity">
           {events.map((e, i) => <Activity key={i} e={e} />)}
         </div>
@@ -454,6 +546,12 @@ function CompanyView({ company, issues, agents, onIssue, onNewIssue, onHire, onM
   onAgentChat: (id: string) => void;
 }) {
   const over = company.budget_monthly_cents > 0 && company.spent_cents >= company.budget_monthly_cents;
+  const hasDaily = company.budget_daily_cents > 0;
+  const paused = company.status === "paused";
+  const PAUSE_LABEL: Record<string, string> = {
+    "budget-daily": "budget · daily", "budget-monthly": "budget · monthly", "no-signal": "no signal",
+  };
+  const pauseLabel = PAUSE_LABEL[company.pause_reason] || company.pause_reason;
   return (
     <div className="main">
       <div className="cohead">
@@ -463,6 +561,10 @@ function CompanyView({ company, issues, agents, onIssue, onNewIssue, onHire, onM
             <div className="mission">{company.mission || "no mission set"}</div>
           </div>
           <span className={"badge " + company.status}>{company.status}</span>
+          {paused && company.pause_reason &&
+            <span className="badge paused" title="why this company is paused">⏸ {pauseLabel}</span>}
+          {company.greens_today > 0 &&
+            <span className="badge done" title="green (merged) verifications today">✓ {company.greens_today} today</span>}
           <div className="acts">
             <button className="primary sm" onClick={onNewIssue}>+ Issue</button>
             <button className="sm" onClick={onHire}>Hire agent</button>
@@ -470,8 +572,10 @@ function CompanyView({ company, issues, agents, onIssue, onNewIssue, onHire, onM
           </div>
         </div>
         <div className="money">
-          <div><div className="k">Spent</div><div className="vv">{money(company.spent_cents)}</div></div>
-          <div><div className="k">Budget</div><div className="vv">{company.budget_monthly_cents > 0 ? money(company.budget_monthly_cents) : "—"}</div></div>
+          {hasDaily &&
+            <div><div className="k">Today</div><div className="vv">{money(company.spent_today_cents)} <span style={{ color: "var(--faint)", fontWeight: 400 }}>/ {money(company.budget_daily_cents)}</span></div></div>}
+          <div><div className="k">Spent{hasDaily ? " (mo)" : ""}</div><div className="vv">{money(company.spent_cents)}</div></div>
+          <div><div className="k">Budget{hasDaily ? " (mo)" : ""}</div><div className="vv">{company.budget_monthly_cents > 0 ? money(company.budget_monthly_cents) : "—"}</div></div>
           <div><div className="k">Issues</div><div className="vv">{issues.length}</div></div>
           <div><div className="k">Agents</div><div className="vv">{agents.length}</div></div>
           {over && <div className="warn">⚠ budget cap reached — paused</div>}
@@ -491,16 +595,21 @@ function CompanyView({ company, issues, agents, onIssue, onNewIssue, onHire, onM
       </div>
       <div className="board">
         {LANES.map(lane => {
-          const items = issues.filter(i => i.status === lane);
+          const items = issues.filter(i => laneOf(i.status) === lane);
           return (
             <div className="lane" key={lane}>
               <h3>{lane}<span className="ct">{items.length}</span></h3>
               <div className="cards">
                 {items.map(i => {
                   const ag = agents.find(a => a.id === i.assignee_agent_id);
+                  const origin = ORIGIN_CHIP[i.origin];
                   return (
                     <div key={i.id} className={"icard " + (i.priority || "medium")} onClick={() => onIssue(i.id)}>
-                      <div className="id">{i.identifier}</div>
+                      <div className="id">
+                        {i.identifier}
+                        {i.status === "Reverted" && <span className="ochip reverted" style={{ marginLeft: 6 }}>reverted</span>}
+                        {origin && <span className="ochip" style={{ marginLeft: 6 }}>{origin}</span>}
+                      </div>
                       <div className="ti">{i.title}</div>
                       <div className="ft">
                         <span className="pri">{i.priority || "medium"}</span>
