@@ -186,6 +186,12 @@ fun start(dbpath) {
     _bt = db_exec(db, "PRAGMA busy_timeout=5000")
     orch = spawn(tick_loop(db, 0, %{}, %{}))
     register('orchestrator', orch)
+    # The merger is a SINGLE process, so every company's merges are serialized
+    # through it: only one `git checkout main && merge` touches a repo at a
+    # time, and two green issues can never race a merge. It never touches the
+    # DB (gotcha 12) — it runs the git sequence and messages the verdict back.
+    merger = spawn(merger_loop())
+    register('merger', merger)
     _ticker = spawn(ticker_loop(orch, tick_interval()))
     interval = tick_interval()
     cap = max_concurrent()
@@ -215,6 +221,9 @@ fun tick_loop(db, tick_n, running, retry) {
             tick_loop(db, tick_n, map_get(r, "running"), map_get(r, "retry"))
         {'verify_done', run_id, issue_id, verdict, tail} ->
             r = handle_verify_done(db, running, retry, run_id, issue_id, verdict, tail)
+            tick_loop(db, tick_n, map_get(r, "running"), map_get(r, "retry"))
+        {'merge_done', run_id, issue_id, outcome, merge_sha, tail} ->
+            r = handle_merge_done(db, running, retry, run_id, issue_id, outcome, merge_sha, tail)
             tick_loop(db, tick_n, map_get(r, "running"), map_get(r, "retry"))
         {'snapshot', from} ->
             send(from, {'snapshot_reply', %{tick: tick_n, running: map_size(running), retrying: map_size(retry), tick_interval_ms: tick_interval(), max_concurrent: max_concurrent()}})
@@ -299,7 +308,11 @@ fun sweep_stalls(db, ids, running, retry, now) {
         phase = default_phase(map_get(info, "phase"))
         age = now - map_get(info, "started_at")
         if (age > phase_timeout(phase)) {
-            _k = exit_proc(map_get(info, "worker_pid"), 'stalled')
+            # A merge-phase entry's worker is the shared, registered `merger`
+            # (worker_pid nil) — never kill it on a stall, that would take down
+            # every company's merges. Only per-issue agent/verify workers die.
+            wpid = map_get(info, "worker_pid")
+            _k = if (wpid == nil) { "" } else { exit_proc(wpid, 'stalled') }
             ws = map_get(info, "workspace")
             _pk = if (ws == nil) { "" } else { elem(shell(f"pkill -f {ws}"), 1) }
             _m = Store.run_finish(db, map_get(info, "run_id"), "Stalled", 0)
@@ -841,6 +854,7 @@ fun handle_done(db, running, retry, run_id, issue_id, outcome, cost, session_id)
             if (attempt >= max_attempts()) {
                 # exhausted retries — mark the issue Failed (terminal), don't loop
                 _s = Store.issue_set_status(db, issue_id, "Failed")
+                _fc = final_fail_cleanup(db, company_id, map_get(info, "workspace"), run_id)
                 _a = Store.log_activity(db, company_id, "orchestrator", "run.failed_final", issue_id)
                 %{running: map_remove(running, issue_id), retry: map_remove(retry, issue_id)}
             } else {
@@ -910,7 +924,14 @@ fun detect_base(repo) {
 # SIGALRM after `secs` terminates the exec'd shell, surfacing as exit 142
 # (128+14). Single-quoting keeps a multi-word verify_cmd intact as one arg.
 fun timeout_cmd(secs, verify_cmd, ws, logpath) {
-    f"cd {ws} && perl -e 'alarm shift; exec @ARGV' {secs} sh -c '{verify_cmd}' > {logpath} 2>&1"
+    timeout_cmd_in(ws, secs, verify_cmd, logpath)
+}
+
+# Same alarm-wrapped verify, but run in an explicit working directory — the
+# phase-3 merger re-verifies on the repo's MAIN checkout (cwd = repo), writing
+# its log outside the repo (inside the issue worktree).
+fun timeout_cmd_in(dir, secs, verify_cmd, logpath) {
+    f"cd {dir} && perl -e 'alarm shift; exec @ARGV' {secs} sh -c '{verify_cmd}' > {logpath} 2>&1"
 }
 
 # Last ~4KB of the verify log — the tail the retry prompt (and the run row)
@@ -987,12 +1008,25 @@ fun handle_verify_done(db, running, retry, run_id, issue_id, verdict, tail) {
         now = timestamp()
         company_id = map_get(info, "company_id")
         if (verdict == "green") {
+            # Verify passed in the isolated worktree — but "green in a worktree"
+            # is not "green on main". Hand the branch to the serialized merger,
+            # which merges + RE-verifies on main (phase 3). The run stays open:
+            # its running-map entry is UPDATED to phase 'merge' with a fresh
+            # clock; the issue stays "Verifying" until the merge verdict lands.
             _a = Store.log_activity(db, company_id, "orchestrator", "verify.pass", issue_id)
-            _st = Store.run_set_state(db, run_id, "Succeeded")
-            _is = Store.issue_set_status(db, issue_id, "Done")
-            _g = Store.company_mark_green(db, company_id)
-            _a2 = Store.log_activity(db, company_id, "orchestrator", "run.succeeded", issue_id)
-            %{running: map_remove(running, issue_id), retry: map_remove(retry, issue_id)}
+            company = Store.company_row(db, company_id)
+            repo = str_or(map_get(company, "repo"), "")
+            verify_cmd = str_or(map_get(company, "verify_cmd"), "")
+            ws = map_get(info, "workspace")
+            base = detect_base(repo)
+            branch = f"o/{issue_id}"
+            job = %{run_id: run_id, issue_id: issue_id, ws: ws, repo: repo, base: base, branch: branch, verify_cmd: verify_cmd, timeout_s: verify_timeout_s()}
+            _q = Store.log_activity(db, company_id, "orchestrator", "merge.queued", issue_id)
+            _snd = send(whereis('merger'), {'merge', self(), job})
+            # worker_pid nil: the worker is the shared merger, not a per-issue
+            # process the stall sweep may kill.
+            info2 = %{run_id: run_id, worker_pid: nil, started_at: now, attempt: map_get(info, "attempt"), company_id: company_id, agent_id: map_get(info, "agent_id"), phase: 'merge', workspace: ws}
+            %{running: map_put(running, issue_id, info2), retry: map_remove(retry, issue_id)}
         } else {
             _v = Store.run_set_verify(db, run_id, verdict, tail)
             _st = Store.run_set_state(db, run_id, "VerifyFailed")
@@ -1000,6 +1034,7 @@ fun handle_verify_done(db, running, retry, run_id, issue_id, verdict, tail) {
             attempt = map_get(info, "attempt")
             if (attempt >= max_attempts()) {
                 _is = Store.issue_set_status(db, issue_id, "Failed")
+                _fc = final_fail_cleanup(db, company_id, map_get(info, "workspace"), run_id)
                 _a2 = Store.log_activity(db, company_id, "orchestrator", "run.failed_final", issue_id)
                 %{running: map_remove(running, issue_id), retry: map_remove(retry, issue_id)}
             } else {
@@ -1008,6 +1043,178 @@ fun handle_verify_done(db, running, retry, run_id, issue_id, verdict, tail) {
             }
         }
     }
+}
+
+# ============================================================
+# Merge gate (phase 3) — auto-merge on green, auto-revert on regress
+# ============================================================
+#
+# ONE merger process serializes every company's merges. It NEVER touches the
+# DB (gotcha 12): it runs the git sequence, then messages the outcome back to
+# the sole DB writer (the orchestrator tick loop), and recurses.
+#
+# The job map carries everything the git sequence needs:
+#   run_id, issue_id, ws, repo, base, branch, verify_cmd, timeout_s
+# outcomes (STRINGS): merged | conflict | reverted | dirty
+fun merger_loop() {
+    receive {
+        {'merge', orch, job} ->
+            r = do_merge(job)
+            send(orch, {'merge_done', map_get(job, "run_id"), map_get(job, "issue_id"), map_get(r, "outcome"), map_get(r, "sha"), map_get(r, "tail")})
+            merger_loop()
+    }
+}
+
+# The git merge sequence. Each failing step short-circuits.
+#   (a) repo working tree dirty (tracked changes) -> "dirty" (do NOT touch it)
+#   (b) checkout base
+#   (c) merge --no-ff --no-edit branch  -> nonzero: capture unmerged files,
+#       abort, -> "conflict"
+#   (d) merge_sha = rev-parse HEAD
+#   (e) re-verify on main -> exit 0: "merged"; nonzero: revert -m 1 -> "reverted"
+fun do_merge(job) {
+    repo = map_get(job, "repo")
+    base = map_get(job, "base")
+    branch = map_get(job, "branch")
+    ws = map_get(job, "ws")
+    verify_cmd = map_get(job, "verify_cmd")
+    timeout_s = map_get(job, "timeout_s")
+    st = shell(f"git -C {repo} status --porcelain --untracked-files=no")
+    dirty = string_trim(elem(st, 1))
+    if (string_length(dirty) > 0) {
+        # Repo mid-operation / dirty tracked tree — leave it entirely untouched
+        # and re-queue this SAME merge next cycle (no attempt consumed). Sleep
+        # so a persistently dirty repo is a slow re-queue, not a tight spin;
+        # while dirty no merge could proceed anyway, so blocking the (serialized)
+        # merger here is correct.
+        _s = sleep(1500)
+        %{outcome: "dirty", sha: "", tail: ""}
+    } else {
+        co = shell(f"git -C {repo} checkout {base}")
+        if (elem(co, 0) != 0) {
+            _s = sleep(1500)
+            %{outcome: "dirty", sha: "", tail: string_trim(elem(co, 1))}
+        } else {
+            mg = shell(f"git -C {repo} merge --no-ff --no-edit {branch}")
+            if (elem(mg, 0) != 0) {
+                uf = shell(f"git -C {repo} diff --name-only --diff-filter=U")
+                files = string_trim(elem(uf, 1))
+                _ab = shell(f"git -C {repo} merge --abort")
+                %{outcome: "conflict", sha: "", tail: files}
+            } else {
+                sha = string_trim(elem(shell(f"git -C {repo} rev-parse HEAD"), 1))
+                logpath = f"{ws}/merge-verify.log"
+                vr = shell(timeout_cmd_in(repo, timeout_s, verify_cmd, logpath))
+                if (elem(vr, 0) == 0) {
+                    %{outcome: "merged", sha: sha, tail: ""}
+                } else {
+                    # green in the worktree but RED on main — regression. Undo the
+                    # merge commit (-m 1 keeps main's first parent) and report it.
+                    _rv = shell(f"git -C {repo} revert -m 1 --no-edit {sha}")
+                    %{outcome: "reverted", sha: sha, tail: tail_log(logpath)}
+                }
+            }
+        }
+    }
+}
+
+# ---- merge completion (sole DB writer) -----------------------
+fun handle_merge_done(db, running, retry, run_id, issue_id, outcome, merge_sha, tail) {
+    info = map_get(running, issue_id)
+    if (info == nil) {
+        %{running: running, retry: retry}
+    } else {
+        now = timestamp()
+        company_id = map_get(info, "company_id")
+        ws = map_get(info, "workspace")
+        company = Store.company_row(db, company_id)
+        repo = str_or(map_get(company, "repo"), "")
+        branch = f"o/{issue_id}"
+        if (outcome == "merged") {
+            _arch = archive_run(db, run_id, ws)
+            _wr = shell(f"git -C {repo} worktree remove {ws} --force")
+            _bd = shell(f"git -C {repo} branch -d {branch}")
+            _st = Store.run_set_state(db, run_id, "Succeeded")
+            _ms = Store.run_set_merge(db, run_id, merge_sha)
+            _is = Store.issue_set_status(db, issue_id, "Done")
+            _g = Store.company_mark_green(db, company_id)
+            _a = Store.log_activity(db, company_id, "orchestrator", "merge.done", issue_id)
+            %{running: map_remove(running, issue_id), retry: map_remove(retry, issue_id)}
+        } else {
+            if (outcome == "conflict") {
+                # A merge conflict consumes an attempt, exactly like a verify red
+                # (build_retry_prompt already folds "conflict" into the next
+                # attempt's rebase instruction). KEEP the worktree — the retry
+                # rebases in it — unless retries are exhausted (final-fail cleanup).
+                _v = Store.run_set_verify(db, run_id, "conflict", tail)
+                _st = Store.run_set_state(db, run_id, "VerifyFailed")
+                _a = Store.log_activity(db, company_id, "orchestrator", "merge.conflict", issue_id)
+                attempt = map_get(info, "attempt")
+                if (attempt >= max_attempts()) {
+                    _is = Store.issue_set_status(db, issue_id, "Failed")
+                    _fc = final_fail_cleanup(db, company_id, ws, run_id)
+                    _a2 = Store.log_activity(db, company_id, "orchestrator", "run.failed_final", issue_id)
+                    %{running: map_remove(running, issue_id), retry: map_remove(retry, issue_id)}
+                } else {
+                    retry2 = schedule_retry(retry, issue_id, attempt, now)
+                    %{running: map_remove(running, issue_id), retry: retry2}
+                }
+            } else {
+                if (outcome == "reverted") {
+                    # Merged clean but regressed main — reverted on main. Terminal
+                    # (issue "Reverted"): archive + drop the worktree, but KEEP the
+                    # branch for forensics.
+                    _v = Store.run_set_verify(db, run_id, "reverted", tail)
+                    _ms = Store.run_set_merge(db, run_id, merge_sha)
+                    _st = Store.run_set_state(db, run_id, "Reverted")
+                    _is = Store.issue_set_status(db, issue_id, "Reverted")
+                    _arch = archive_run(db, run_id, ws)
+                    _wr = shell(f"git -C {repo} worktree remove {ws} --force")
+                    # TODO(phase4): auto-file a "fix the regression" issue here,
+                    # fingerprinted off merge_sha, pointing at the kept branch.
+                    _a = Store.log_activity(db, company_id, "orchestrator", "merge.revert", issue_id)
+                    %{running: map_remove(running, issue_id), retry: map_remove(retry, issue_id)}
+                } else {
+                    # "dirty" — repo was untouched. Re-queue the SAME merge job
+                    # (attempt NOT consumed); the entry stays phase 'merge' with a
+                    # fresh clock so the stall sweep's 20-min merge budget restarts.
+                    _a = Store.log_activity(db, company_id, "orchestrator", "merge.dirty", issue_id)
+                    verify_cmd = str_or(map_get(company, "verify_cmd"), "")
+                    base = detect_base(repo)
+                    job = %{run_id: run_id, issue_id: issue_id, ws: ws, repo: repo, base: base, branch: branch, verify_cmd: verify_cmd, timeout_s: verify_timeout_s()}
+                    _snd = send(whereis('merger'), {'merge', self(), job})
+                    info2 = map_put(info, "started_at", now)
+                    %{running: map_put(running, issue_id, info2), retry: map_remove(retry, issue_id)}
+                }
+            }
+        }
+    }
+}
+
+# Archive a run's artifacts before its worktree is destroyed, so
+# GET /api/runs/:id/result still works post-cleanup. Best-effort: each cp
+# ignores a missing source (a sim run has only PROMPT.txt, etc.).
+fun archive_run(db, run_id, ws) {
+    home = getenv("HOME")
+    arc = f"{home}/.o/archive/{run_id}"
+    _mk = shell(f"mkdir -p {arc}")
+    _cp = shell(f"for f in stream.jsonl err.log verify.log merge-verify.log PROMPT.txt result.json; do cp {ws}/$f {arc}/ 2>/dev/null || true; done")
+    ""
+}
+
+# Terminal-failure cleanup: archive artifacts, then drop the worktree
+# (--force) but KEEP the branch for forensics. Used everywhere an issue goes
+# Failed with attempts exhausted (agent crash, verify red, merge conflict).
+fun final_fail_cleanup(db, company_id, ws, run_id) {
+    _arch = archive_run(db, run_id, ws)
+    company = Store.company_row(db, company_id)
+    repo = str_or(map_get(company, "repo"), "")
+    _wr = if (string_length(repo) > 0) {
+        shell(f"git -C {repo} worktree remove {ws} --force")
+    } else {
+        shell(f"rm -rf {ws}")
+    }
+    ""
 }
 
 # ---- retry bookkeeping ---------------------------------------

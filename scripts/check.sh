@@ -305,12 +305,35 @@ last_verify_state() {
   sqlite3 "$TMP/o.db" "SELECT verify_state FROM run WHERE issue_id='$1' ORDER BY started_at DESC LIMIT 1"
 }
 
-# [sim:good] — a real commit that passes verify.sh -> Done
+# [sim:good] — a real commit that passes verify.sh -> auto-merged to main -> Done
 if wait_status "$IID_GOOD" "Done" 90; then
   pass "verify-gate: [sim:good] reached Done"
 else
   cat "$TMP/daemon.log" || true; fail "[sim:good] never reached Done"
 fi
+
+# phase3: green auto-merged into main (a --no-ff merge commit naming the branch),
+# and the worktree + branch were cleaned up.
+# NB: plain `grep` (not `grep -q`) reads the stream to EOF, so `git log` never
+# takes a SIGPIPE that `set -o pipefail` would turn into a false failure.
+git -C "$SCRATCH" log --oneline main | grep "o/$IID_GOOD" >/dev/null \
+  || { git -C "$SCRATCH" log --oneline main; fail "[sim:good] no merge commit for o/$IID_GOOD on main"; }
+[ ! -d "$TMP/.o/workspaces/$IID_GOOD" ] || fail "[sim:good] worktree dir not removed"
+[ -z "$(git -C "$SCRATCH" branch --list "o/$IID_GOOD")" ] || fail "[sim:good] branch o/$IID_GOOD not deleted"
+pass "verify-gate: [sim:good] merged to main (merge commit), worktree + branch cleaned up"
+
+# the merged run carries its merge_sha, and GET /api/runs/:id/result serves the
+# archived artifacts even though the worktree is gone.
+RID_GOOD="$(sqlite3 "$TMP/o.db" "SELECT id FROM run WHERE issue_id='$IID_GOOD' ORDER BY started_at DESC LIMIT 1")"
+MSHA="$(sqlite3 "$TMP/o.db" "SELECT merge_sha FROM run WHERE id='$RID_GOOD'")"
+[ -n "$MSHA" ] || fail "[sim:good] run has empty merge_sha"
+rr="$(curl -s "$BASE/api/runs/$RID_GOOD/result")"
+python3 - "$rr" "$MSHA" <<'PY' || fail "run result missing merge_sha / archived stream"
+import sys, json
+d = json.loads(sys.argv[1])
+assert d["merge_sha"] == sys.argv[2], (d.get("merge_sha"), sys.argv[2])
+PY
+pass "verify-gate: run result exposes merge_sha ($MSHA) from archive"
 
 # [sim:no-commit] — 3 attempts, each red_no_commit, then Failed
 if wait_status "$IID_NC" "Failed" 120; then
@@ -339,15 +362,159 @@ else
   cat "$TMP/daemon.log" || true; fail "[sim:bad-verify] never reached Failed"
 fi
 
-# activity records both a pass and a fail
+# activity records a pass, a fail, and a completed merge
 body="$(curl -s "$BASE/api/activity")"
-python3 - "$body" <<'PY' || fail "verify-gate activity missing verify.pass / verify.fail"
+python3 - "$body" <<'PY' || fail "verify-gate activity missing verify.pass / verify.fail / merge.done"
 import sys, json
 verbs = [r.get("verb") for r in json.loads(sys.argv[1])]
 assert "verify.pass" in verbs, verbs
 assert "verify.fail" in verbs, verbs
+assert "merge.done" in verbs, verbs
 PY
-pass "GET /api/activity contains verify.pass and verify.fail"
+pass "GET /api/activity contains verify.pass, verify.fail and merge.done"
+
+# ---- stage h: AUTO-REVERT on regression -----------------------
+# A [sim:regress] issue commits `boom` (green in the worktree because PROMPT.txt
+# sits untracked beside it) but regresses main after merge (boom without
+# PROMPT.txt fails verify.sh). The merger must revert the merge on main and mark
+# the issue Reverted, keeping the branch for forensics. A fresh repo isolates it.
+SCRATCH2="$TMP/proj2"
+mkdir -p "$SCRATCH2"
+git -C "$SCRATCH2" init -q -b main
+git -C "$SCRATCH2" config user.email "o@example.com"
+git -C "$SCRATCH2" config user.name "O Test"
+cp "$SCRATCH/verify.sh" "$SCRATCH2/verify.sh"
+echo "regress project" > "$SCRATCH2/README.md"
+git -C "$SCRATCH2" add -A
+git -C "$SCRATCH2" commit -q -m "seed regress project"
+
+resp="$(curl -s -w $'\n%{http_code}' -X POST "$BASE/api/companies" \
+  -H 'Content-Type: application/json' \
+  -d "{\"name\":\"Regress Co\",\"issue_prefix\":\"REG\",\"budget_monthly_cents\":1000000,\"repo\":\"$SCRATCH2\",\"verify_cmd\":\"sh verify.sh\",\"protected_paths\":\"protected/\"}")"
+sc="$(printf '%s' "$resp" | tail -n1)"; body="$(printf '%s' "$resp" | sed '$d')"
+[ "$sc" = "201" ] || { echo "$body"; fail "POST regress company expected 201, got $sc"; }
+CID4="$(jget "$body" 'd["id"]')"
+curl -s -X POST "$BASE/api/companies/$CID4/agents" \
+  -H 'Content-Type: application/json' -d '{"name":"Regsim","runtime":"sim"}' >/dev/null
+curl -s -X POST "$BASE/api/companies/$CID4/issues" \
+  -H 'Content-Type: application/json' -d '{"title":"[sim:regress] boom"}' >/dev/null
+IID_REG="$(jget "$(curl -s "$BASE/api/companies/$CID4/issues")" 'd[0]["id"]')"
+[ -n "$IID_REG" ] || fail "regress issue id missing"
+
+if wait_status "$IID_REG" "Reverted" 120; then
+  git -C "$SCRATCH2" log --oneline main | grep -i "revert" >/dev/null \
+    || { git -C "$SCRATCH2" log --oneline main; fail "regress: no Revert commit on main"; }
+  ( cd "$SCRATCH2" && sh verify.sh ) >/dev/null 2>&1 \
+    || fail "regress: verify.sh not green on main after revert"
+  [ -n "$(git -C "$SCRATCH2" branch --list "o/$IID_REG")" ] \
+    || fail "regress: branch o/$IID_REG should be kept for forensics"
+  vs="$(last_verify_state "$IID_REG")"
+  [ "$vs" = "reverted" ] || fail "regress: last verify_state expected reverted, got '$vs'"
+  pass "auto-revert: [sim:regress] Reverted; main reverted + green again; branch kept"
+else
+  cat "$TMP/daemon.log" || true; fail "[sim:regress] never reached Reverted"
+fi
+
+body="$(curl -s "$BASE/api/activity")"
+python3 - "$body" <<'PY' || fail "activity missing merge.revert"
+import sys, json
+verbs = [r.get("verb") for r in json.loads(sys.argv[1])]
+assert "merge.revert" in verbs, verbs
+PY
+pass "GET /api/activity contains merge.revert"
+
+# ---- stage i: SERIALIZED merges -------------------------------
+# Two [sim:good] issues filed together must BOTH reach Done, leaving TWO merge
+# commits on main — proving the single merger serializes across concurrent greens.
+SCRATCH3="$TMP/proj3"
+mkdir -p "$SCRATCH3"
+git -C "$SCRATCH3" init -q -b main
+git -C "$SCRATCH3" config user.email "o@example.com"
+git -C "$SCRATCH3" config user.name "O Test"
+cp "$SCRATCH/verify.sh" "$SCRATCH3/verify.sh"
+echo "serialize project" > "$SCRATCH3/README.md"
+git -C "$SCRATCH3" add -A
+git -C "$SCRATCH3" commit -q -m "seed serialize project"
+
+resp="$(curl -s -w $'\n%{http_code}' -X POST "$BASE/api/companies" \
+  -H 'Content-Type: application/json' \
+  -d "{\"name\":\"Serial Co\",\"issue_prefix\":\"SER\",\"budget_monthly_cents\":1000000,\"repo\":\"$SCRATCH3\",\"verify_cmd\":\"sh verify.sh\",\"protected_paths\":\"protected/\"}")"
+sc="$(printf '%s' "$resp" | tail -n1)"; body="$(printf '%s' "$resp" | sed '$d')"
+[ "$sc" = "201" ] || { echo "$body"; fail "POST serial company expected 201, got $sc"; }
+CID5="$(jget "$body" 'd["id"]')"
+curl -s -X POST "$BASE/api/companies/$CID5/agents" \
+  -H 'Content-Type: application/json' -d '{"name":"Sersim","runtime":"sim"}' >/dev/null
+curl -s -X POST "$BASE/api/companies/$CID5/issues" \
+  -H 'Content-Type: application/json' -d '{"title":"[sim:good] first"}' >/dev/null
+curl -s -X POST "$BASE/api/companies/$CID5/issues" \
+  -H 'Content-Type: application/json' -d '{"title":"[sim:good] second"}' >/dev/null
+IID_S1="$(jget "$(curl -s "$BASE/api/companies/$CID5/issues")" 'd[0]["id"]')"
+IID_S2="$(jget "$(curl -s "$BASE/api/companies/$CID5/issues")" 'd[1]["id"]')"
+[ -n "$IID_S1" ] && [ -n "$IID_S2" ] || fail "serial issue ids missing"
+
+wait_status "$IID_S1" "Done" 120 || { cat "$TMP/daemon.log"; fail "serial issue 1 never Done"; }
+wait_status "$IID_S2" "Done" 120 || { cat "$TMP/daemon.log"; fail "serial issue 2 never Done"; }
+nmerge="$(git -C "$SCRATCH3" log --oneline main | grep -c "Merge branch" || true)"
+[ "$nmerge" = "2" ] || { git -C "$SCRATCH3" log --oneline main; fail "serial: expected 2 merge commits, got $nmerge"; }
+pass "serialization: two concurrent [sim:good] both Done, 2 merge commits on main"
+
+# ---- stage j: DIRTY repo re-queues (no attempt consumed) ------
+# Chosen "dirty" semantics: if the repo working tree has TRACKED changes when a
+# merge is attempted, the merger touches nothing and reports "dirty"; the
+# orchestrator logs merge.dirty and re-queues the SAME merge job (no attempt
+# consumed), leaving the issue in "Verifying". Once the tree is clean the merge
+# proceeds to Done. Proven here: a persistently-dirty tracked file blocks the
+# merge (merge.dirty logged, issue stays Verifying), and cleaning it recovers.
+SCRATCH4="$TMP/proj4"
+mkdir -p "$SCRATCH4"
+git -C "$SCRATCH4" init -q -b main
+git -C "$SCRATCH4" config user.email "o@example.com"
+git -C "$SCRATCH4" config user.name "O Test"
+cp "$SCRATCH/verify.sh" "$SCRATCH4/verify.sh"
+echo "dirty project" > "$SCRATCH4/README.md"
+git -C "$SCRATCH4" add -A
+git -C "$SCRATCH4" commit -q -m "seed dirty project"
+# dirty a TRACKED file (uncommitted) — merge cannot proceed until reverted
+echo "uncommitted local edit" >> "$SCRATCH4/README.md"
+
+resp="$(curl -s -w $'\n%{http_code}' -X POST "$BASE/api/companies" \
+  -H 'Content-Type: application/json' \
+  -d "{\"name\":\"Dirty Co\",\"issue_prefix\":\"DRT\",\"budget_monthly_cents\":1000000,\"repo\":\"$SCRATCH4\",\"verify_cmd\":\"sh verify.sh\",\"protected_paths\":\"protected/\"}")"
+sc="$(printf '%s' "$resp" | tail -n1)"; body="$(printf '%s' "$resp" | sed '$d')"
+[ "$sc" = "201" ] || { echo "$body"; fail "POST dirty company expected 201, got $sc"; }
+CID6="$(jget "$body" 'd["id"]')"
+curl -s -X POST "$BASE/api/companies/$CID6/agents" \
+  -H 'Content-Type: application/json' -d '{"name":"Drtsim","runtime":"sim"}' >/dev/null
+curl -s -X POST "$BASE/api/companies/$CID6/issues" \
+  -H 'Content-Type: application/json' -d '{"title":"[sim:good] blocked by dirty"}' >/dev/null
+IID_DRT="$(jget "$(curl -s "$BASE/api/companies/$CID6/issues")" 'd[0]["id"]')"
+[ -n "$IID_DRT" ] || fail "dirty issue id missing"
+
+# merge.dirty must appear for THIS issue while the repo stays dirty
+dirty_ok=""
+for _i in $(seq 1 60); do
+  n="$(sqlite3 "$TMP/o.db" "SELECT COUNT(*) FROM activity WHERE verb='merge.dirty' AND target='$IID_DRT'")"
+  if [ "${n:-0}" -ge 1 ]; then dirty_ok="1"; break; fi
+  sleep 1
+done
+[ -n "$dirty_ok" ] || { cat "$TMP/daemon.log" || true; fail "merge.dirty never logged for blocked issue"; }
+# while dirty the issue must NOT terminate — it stays in the merge/verify phase
+st="$(jget "$(curl -s "$BASE/api/issues/$IID_DRT")" 'd["status"]')"
+[ "$st" = "Verifying" ] || fail "dirty: issue expected to stay Verifying, got '$st'"
+# no attempt consumed: still on attempt 1
+at="$(sqlite3 "$TMP/o.db" "SELECT attempt FROM run WHERE issue_id='$IID_DRT' ORDER BY started_at DESC LIMIT 1")"
+[ "$at" = "1" ] || fail "dirty: expected attempt still 1 (no attempt consumed), got '$at'"
+pass "dirty: merge.dirty re-queues, issue stays Verifying on attempt 1"
+
+# clean the tree — the re-queued merge now proceeds to Done
+git -C "$SCRATCH4" checkout -- README.md
+if wait_status "$IID_DRT" "Done" 60; then
+  git -C "$SCRATCH4" log --oneline main | grep "o/$IID_DRT" >/dev/null \
+    || { git -C "$SCRATCH4" log --oneline main; fail "dirty: no merge commit after cleaning repo"; }
+  pass "dirty: cleaned repo lets the re-queued merge complete -> Done"
+else
+  cat "$TMP/daemon.log" || true; fail "dirty: issue never reached Done after cleaning repo"
+fi
 
 echo
 echo "ALL GREEN"

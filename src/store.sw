@@ -13,7 +13,7 @@ export [next_id, companies, company_row, company_create, company_update,
         company_add_spend, enforce_budget, rollover_day, company_mark_green, global_spent_today,
         issues_for, issue_row, issue_create, issue_set_status, issue_assign, issue_update,
         log_activity, activity_recent, candidate_issues,
-        run_create, run_finish, run_set_state, run_set_verify, last_run_for_issue, runs_all, run_row,
+        run_create, run_finish, run_set_state, run_set_verify, run_set_merge, last_run_for_issue, runs_all, run_row,
         agents_for, agent_row, agent_first_active, agent_create,
         agent_set_session, agent_set_chat_session,
         message_create, messages_for,
@@ -175,6 +175,13 @@ fun issue_assign(db, id, agent_id) {
 
 # Non-terminal issues belonging to ACTIVE companies (a paused company
 # — budget hard-stop — yields no candidates). Priority, then age.
+#
+# "Verifying" is deliberately NOT excluded: an issue mid-verify/mid-merge is a
+# candidate for CRASH RECOVERY — if the daemon restarts, the in-memory running
+# map is empty, so a stuck "Verifying" issue must be re-dispatchable. While the
+# daemon is alive the running map holds that issue, and dispatch_batch skips any
+# id already in running, so no double-dispatch occurs. Only "Reverted" (a phase-3
+# terminal state) joins Done/Canceled/Failed in the exclusion list.
 fun candidate_issues(db) {
     db_query(db, "SELECT id, company_id, identifier, title, body, status, priority, assignee_agent_id, sort_order, origin, fingerprint FROM issue WHERE status NOT IN ('Done', 'Canceled', 'Failed', 'Reverted') AND company_id IN (SELECT id FROM company WHERE status = 'active') ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, created_at ASC", [])
 }
@@ -260,6 +267,13 @@ fun run_set_state(db, run_id, state) {
 fun run_set_verify(db, run_id, state, output) {
     tail = string_truncate(output, 4096)
     _u = db_query(db, "UPDATE run SET verify_state = ?, verify_output = ? WHERE id = ?", [state, tail, run_id])
+    run_id
+}
+
+# Record the merge commit sha once a run merges (or reverts) on main. The
+# forensic pointer for a "Reverted" run and the success marker for a merged one.
+fun run_set_merge(db, run_id, sha) {
+    _u = db_query(db, "UPDATE run SET merge_sha = ? WHERE id = ?", [sha, run_id])
     run_id
 }
 

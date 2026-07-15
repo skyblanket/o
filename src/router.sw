@@ -454,16 +454,28 @@ fun run_result(db, conn, p) {
             respond(conn, 404, err_json("run not found"))
         } else {
             ws = map_get(run, "workspace_path")
-            rpath = f"{ws}/result.json"
-            spath = f"{ws}/stream.jsonl"
-            epath = f"{ws}/err.log"
-            res = if (file_exists(rpath) == 'true') { file_read(rpath) } else { "" }
-            stream = if (file_exists(spath) == 'true') { file_read(spath) } else { "" }
-            errlog = if (file_exists(epath) == 'true') { file_read(epath) } else { "" }
-            respond(conn, 200, json_encode(%{workspace: ws, result: res, stream: stream, error: errlog}))
+            # Once phase-3 cleanup removes the worktree, the artifacts live on in
+            # $HOME/.o/archive/<run_id>/ — fall back to there so a merged/reverted/
+            # failed run still surfaces its stream + logs.
+            home = getenv("HOME")
+            arc = f"{home}/.o/archive/{rid}"
+            res = read_first(f"{ws}/result.json", f"{arc}/result.json")
+            stream = read_first(f"{ws}/stream.jsonl", f"{arc}/stream.jsonl")
+            errlog = read_first(f"{ws}/err.log", f"{arc}/err.log")
+            respond(conn, 200, json_encode(%{workspace: ws, result: res, stream: stream, error: errlog, verify_state: default_str(map_get(run, "verify_state"), ""), verify_output: default_str(map_get(run, "verify_output"), ""), merge_sha: default_str(map_get(run, "merge_sha"), "")}))
         }
     } else {
         respond(conn, 404, err_json("not found"))
+    }
+}
+
+# Read the first of two paths that exists, else "". Lets a run's artifacts be
+# served from its live worktree, then from the post-cleanup archive.
+fun read_first(a, b) {
+    if (file_exists(a) == 'true') {
+        file_read(a)
+    } else {
+        if (file_exists(b) == 'true') { file_read(b) } else { "" }
     }
 }
 
