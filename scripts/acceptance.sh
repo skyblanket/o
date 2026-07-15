@@ -104,10 +104,18 @@ stage "stage 1: boot hermetic daemon"
 TMP="$(mktemp -d)"
 PORT=$((5600 + RANDOM % 300))
 BASE="http://127.0.0.1:${PORT}"
-# Real mode inherits the operator's O_CLAUDE_BIN / PATH so a genuine claude
-# is reachable; stub mode never spawns claude, so nothing extra is needed.
-HOME="$TMP" O_DB="$TMP/o.db" O_PORT="$PORT" O_NO_OPEN=1 \
-  ./bin/swarmd >"$TMP/daemon.log" 2>&1 &
+# Stub mode re-homes the daemon into $TMP so ~/.o side effects stay hermetic.
+# Real mode MUST keep the operator's HOME: the claude CLI reads its auth and
+# config from ~/.claude*, so HOME="$TMP" strands it logged-out and every run
+# crashes instantly. O_DB/O_PORT keep the control plane hermetic either way;
+# real mode leaves only throwaway ~/.o/workspaces + ~/.o/archive entries.
+if [ "$MODE" = "real" ]; then
+  O_DB="$TMP/o.db" O_PORT="$PORT" O_NO_OPEN=1 \
+    ./bin/swarmd >"$TMP/daemon.log" 2>&1 &
+else
+  HOME="$TMP" O_DB="$TMP/o.db" O_PORT="$PORT" O_NO_OPEN=1 \
+    ./bin/swarmd >"$TMP/daemon.log" 2>&1 &
+fi
 DAEMON_PID=$!
 wait_health "$BASE" "$DAEMON_PID" "$TMP/daemon" || die "daemon health never reached 200 (port $PORT)"
 ok "daemon up on port $PORT (mode=$MODE)"
