@@ -102,8 +102,13 @@ fun enforce_budget(db, company_id) {
 fun rollover_day(db, now_ms) {
     rows = db_query(db, "SELECT id FROM company WHERE budget_day != (? / 86400000)", [now_ms])
     ids = map_ids(rows)
+    # Un-pause the DAILY-capped companies FIRST, guarded by the same
+    # "rolled today" predicate — otherwise a company paused earlier the
+    # SAME day (budget_day already == today) would be reactivated every
+    # tick, turning the daily hard-stop into a 5-second pause. This must
+    # run BEFORE the reset below stamps budget_day, or the guard is moot.
+    _u = db_query(db, "UPDATE company SET status = 'active', pause_reason = '', updated_at = ? WHERE pause_reason = 'budget-daily' AND budget_day != (? / 86400000)", [timestamp(), now_ms])
     _r = db_query(db, "UPDATE company SET spent_today_cents = 0, greens_today = 0, budget_day = (? / 86400000), updated_at = ? WHERE budget_day != (? / 86400000)", [now_ms, timestamp(), now_ms])
-    _u = db_query(db, "UPDATE company SET status = 'active', pause_reason = '' WHERE pause_reason = 'budget-daily'", [])
     ids
 }
 
