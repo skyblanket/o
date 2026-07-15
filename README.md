@@ -1,66 +1,175 @@
 # O
 
-**An agent-company orchestrator — a stable, single-binary control plane that runs a company of AI agents.**
+An autonomous software loop. O watches its own issue board, dispatches coding
+agents into isolated git worktrees, verifies their work with your real test
+suite, auto-merges what passes, auto-reverts what regresses, budgets itself by
+the day, and files its own follow-up issues — from failures it catches and from
+a daily pass where it reflects on its own recent work. It runs as one native
+daemon (`swarmd`) built on [swarmrt](https://github.com/skyblanket/swarmrt).
+There is no queue, no Postgres, no container — an embedded SQLite file is the
+whole control plane.
 
-O is the open-source flagship for [swarmrt](https://github.com/skyblanket/swarmrt): a
-long-lived daemon (`swarmd`) whose supervision tree *is* the org chart. It runs a
-polling-orchestrator engine, staffs companies with role-based agents, enforces budgets and
-approval gates, and serves a live operator dashboard — all from one ~290 KB native binary.
-No Node, no Postgres, no containers.
-
-This is **v4** — the swarmrt rebuild, succeeding the O-v3 Python studio.
-
-> Design rationale: [`PRD-SWARM-ORCHESTRATOR.md`](../PRD-SWARM-ORCHESTRATOR.md).
-
-## Install
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/skyblanket/o/main/scripts/install.sh | sh
+```
+                 ┌──────────────────────────────────────────────┐
+                 │                   swarmd                      │
+                 │                                               │
+   issue board ──┼─▶ tick ─▶ dispatch ─▶ agent in git worktree  │
+        ▲        │             (claude-code / swarm-code / sim)  │
+        │        │                       │                       │
+        │        │                       ▼                       │
+        │        │            verify (your test suite)           │
+        │        │              │              │                 │
+        │        │         green│              │red              │
+        │        │              ▼              ▼                 │
+        │        │      --no-ff merge      retry ─▶ Failed        │
+        │        │              │                    │           │
+        │        │       post-merge verify           │           │
+        │        │          │         │              │           │
+        │        │      ok  │         │ regressed    │           │
+        │        │          ▼         ▼              ▼           │
+        │        │        Done     revert +      file follow-up  │
+        └────────┼──────────────── fix issue ◀──── issue (auto)  │
+                 │                                               │
+                 │   daily: rollover budgets · reflection pass   │
+                 └──────────────────────────────────────────────┘
 ```
 
-Or from source (needs the [swarmrt](https://github.com/skyblanket/swarmrt) toolchain):
+## Quick start
+
+O builds with the swarmrt toolchain. Clone swarmrt as a sibling of this repo
+(the default the Makefile expects), then build:
 
 ```sh
-git clone https://github.com/skyblanket/o && cd o
-make            # build bin/swarmd
-make install    # -> ~/.local/bin/swarmd, dashboard -> ~/.o/web/
+git clone https://github.com/skyblanket/swarmrt   # sibling of this repo
+git clone <this-repo> o
+cd o
+make                 # -> bin/swarmd   (or: make SWARMRT=/path/to/swarmrt)
+make check           # hermetic end-to-end test suite
 ```
 
-## Quickstart
+Run the daemon and the web UI together:
 
 ```sh
-swarmd                       # start the daemon
-make seed                    # seed an example company to watch
-open http://localhost:4100   # the operator dashboard
+make dev             # swarmd on :4100 + the React UI on :5173
+open http://localhost:5173
 ```
 
-An embedded SQLite control plane is created at `~/.o/o.db` — no database to set up.
+Point O at a repo it should maintain — including itself:
 
-## How it works
+```sh
+./scripts/seed-maintainer.sh          # a "O Core" company that maintains this repo
+./scripts/seed-example.sh             # a sim-runtime demo company, no tokens spent
+```
 
-A single **orchestrator** process polls the issue board on a fixed tick, assigns each open
-issue to an agent, and dispatches it up to a concurrency cap — retrying crashes with
-exponential backoff and killing stalled runs. Agents do real work through pluggable
-**runtimes**: `claude-code` spawns a headless `claude -p` in an isolated per-issue
-workspace; `native` calls an LLM over HTTP; `sim` is a deterministic stub. Every run's cost
-is metered onto the company **budget**; a company that hits its cap is hard-stopped — new
-dispatch and in-flight retries both freeze.
+The control plane lives at `~/.o/o.db`; per-issue worktrees live under
+`~/.o/workspaces/`. Nothing else is created.
 
-The supervision tree is the company. The task board is the orchestrator's self-model. You
-watch it from the dashboard; you don't drive it.
+## Safety model
 
-## Status
+O edits real repositories on its own. The guard rails are the point.
 
-All milestones complete:
+- **Grounded verifier.** A change is judged only by running the company's real
+  `verify_cmd` in the worktree — never by the agent's own claim of success. A run
+  that makes no commit, that touches a protected path, or whose verify command
+  fails does not merge. Verdicts are recorded per run: `red_no_commit`,
+  `red_protected`, `red_tests`, and so on.
+- **Protected paths.** Each company declares `protected_paths`. An agent may not
+  change them; a commit that does is rejected (`red_protected`) before it can
+  merge. The test harness and this loop's own invariants live behind this fence,
+  so an agent maintaining O cannot edit the checks that gate its merges.
+- **Everything on a branch.** Each issue runs on `o/<issue>` in its own worktree.
+  Green work lands with a `--no-ff` merge that names the branch. If the merge
+  regresses the base (post-merge verify goes red), O reverts the merge on the
+  base branch and **keeps the branch** for forensics.
+- **Budget circuit breakers.** Every run is metered onto the company's daily and
+  monthly budgets. Hitting a cap pauses the company (`budget-daily` /
+  `budget-monthly`). A separate **no-signal** breaker pauses a company that burns
+  budget across days without shipping a single verified-green merge.
+- **Bounded self-filing.** When O files its own follow-up work (a regression to
+  fix, a repeated stall, a no-signal diagnostic, a reflection idea) it is
+  guarded: **depth-1** (an auto-filed issue that itself fails files no child, so
+  a red loop can't fork-bomb), **fingerprint dedup** (one open issue per failure
+  fingerprint), and a **daily cap** per company.
 
-| | |
+## Feedback widget
+
+`feedback/o-feedback.js` is a dependency-free annotation layer for your dev app.
+Toggle it (Alt+Shift+A), click any element, type what should change, batch a few,
+send — O files a single `origin='feedback'` issue the loop picks up like any
+other work item.
+
+```html
+<script
+  src="/o-feedback.js"
+  data-endpoint="http://127.0.0.1:4100"
+  data-company="co_XXXXXXXX"></script>
+```
+
+Endpoint contract:
+
+```
+POST {endpoint}/api/companies/{company}/feedback
+{
+  "page_url": "http://localhost:3000/dashboard",   // required, 400 if missing
+  "annotations": [                                   // required, non-empty, 400 if empty
+    { "selector": "#hero > h1", "html": "<h1>…</h1>",
+      "styles": { "color": "rgb(0,0,0)" },
+      "instruction": "make the heading bigger" }
+  ]
+}
+```
+
+`201` returns the created issue (`origin: "feedback"`, one `### Annotation N`
+section per annotation in the body). Filed outside the self-file cap, so operator
+feedback is never dropped. Full docs: [`feedback/README.md`](feedback/README.md).
+
+## Runtimes
+
+An agent does real work through a pluggable runtime, chosen per agent:
+
+| runtime | what it is |
 |---|---|
-| **P0** spine | SQLite control-plane (8 tables) · `swarmd` daemon · HTTP + REST CRUD |
-| **P1** engine | single-authority orchestrator · tick loop · concurrency · backoff retry · stall detection |
-| **P2** agents | runtime-pluggable workers — `claude-code` / `native` / `sim` |
-| **P3** governance | per-company budgets + hard-stop · cost hook · approval gates |
-| **P4** dashboard | `swarmd` serves a single-file operator UI at `/` |
-| **P5** polish | installer · example company · docs |
+| `claude-code` | headless `claude -p` in the worktree (default). |
+| `swarm-code` | the swarm-code agent, run in the worktree. |
+| `sim` | a deterministic, no-token stub — drives the pipeline in tests. |
+
+## Issue lifecycle
+
+```
+Backlog ─▶ In Progress ─▶ Verifying ─▶ Done
+                │              │
+                │              ├─▶ Failed     (verify red, attempts exhausted)
+                │              └─▶ Reverted   (regressed the base after merge)
+                └──────────────── Canceled    (operator)
+```
+
+Every transition and decision is written to an append-only activity log
+(`GET /api/activity`). Verbs include: `run.dispatch`, `run.succeeded`,
+`run.failed`, `run.failed_final`, `run.stalled`, `verify.start`, `verify.pass`,
+`verify.fail`, `merge.queued`, `merge.done`, `merge.revert`, `merge.conflict`,
+`merge.dirty`, `selffile.created`, `selffile.duped`, `selffile.capped`,
+`selffile.skipped_depth`, `budget.reset`, `budget.exceeded`, `budget.no_signal`,
+`reflect.spawn`, `reflect.filed`, `reflect.done`, `feedback.filed`,
+`issue.create`, `issue.update`, `agent.hire`, `company.create`.
+
+## Environment
+
+The daemon reads its configuration from the environment. All are optional.
+
+| variable | default | meaning |
+|---|---|---|
+| `O_DB` | `~/.o/o.db` | control-plane SQLite path. |
+| `O_PORT` | `4100` | HTTP port. |
+| `O_CLAUDE_BIN` | `claude` on `PATH` | claude-code binary for the `claude-code` runtime. |
+| `O_SWARM_BIN` | `swarm-code` on `PATH` | binary for the `swarm-code` runtime. |
+| `O_MAX_TURNS` | `50` | per-run turn cap passed to claude-code. |
+| `O_VERIFY_TIMEOUT_S` | `600` | wall-clock cap on a single verify command. |
+| `O_GLOBAL_DAILY_CENTS` | unset | global daily spend ceiling across all companies; dispatch stops for the day when met. |
+| `O_SELF_FILE_CAP` | `10` | max auto/reflect issues one company may file per day. |
+| `O_NO_SIGNAL_DAYS` | `2` | consecutive no-signal days before the breaker pauses a company. |
+| `O_SWARM_FLAT_CENTS` | `25` | flat per-run cost charged for a swarm-code run (it reports no telemetry yet). |
+| `O_REFLECT` | unset | set `1` to enable the daily reflection pass. |
+| `O_REQUIRE_APPROVALS` | unset | set `1` to route agent hiring through `/api/approvals`. |
 
 ## API
 
@@ -68,23 +177,39 @@ All milestones complete:
 curl http://localhost:4100/api/health
 curl http://localhost:4100/api/companies
 curl -X POST http://localhost:4100/api/companies \
-  -d '{"name":"Otonomy","mission":"ship","issue_prefix":"OTO","budget_monthly_cents":50000}'
+  -d '{"name":"Core","issue_prefix":"COR","repo":"/path/to/repo",
+       "verify_cmd":"make test","protected_paths":"ci/,scripts/",
+       "budget_daily_cents":5000,"budget_monthly_cents":100000}'
 curl -X POST http://localhost:4100/api/companies/<id>/agents \
-  -d '{"name":"Ada","role":"engineer","runtime":"claude-code"}'
+  -d '{"name":"Maintainer","runtime":"claude-code","repo":"/path/to/repo"}'
 curl -X POST http://localhost:4100/api/companies/<id>/issues \
   -d '{"title":"first task","priority":"high"}'
-curl -X POST http://localhost:4100/api/companies/<id> \
-  -d '{"budget_monthly_cents":80000,"status":"active"}'   # set budget / un-pause
 
 curl http://localhost:4100/api/orchestrator   # live scheduler snapshot
 curl http://localhost:4100/api/runs           # run history
 curl http://localhost:4100/api/activity       # activity log
-curl http://localhost:4100/api/approvals      # pending governance approvals
 ```
 
-An issue is dispatched only once its company has an active agent. Set `O_REQUIRE_APPROVALS=1`
-to route agent hiring through `/api/approvals` for operator sign-off (off by default).
+## Known limitations
+
+- **Single-node.** One daemon, one SQLite control plane, one machine. There is no
+  clustering and no multi-writer coordination.
+- **The machine is the trust boundary.** Agents run with
+  `--dangerously-skip-permissions` inside their worktrees — they can run arbitrary
+  commands as your user. Protected paths and the verify gate constrain what
+  *merges*, not what an agent may *do* while working. Run O only against repos and
+  on machines where that is acceptable.
+- **No auth on the HTTP API.** Bind it to localhost. Anyone who can reach the port
+  can drive the loop.
+- **swarm-code cost is estimated.** swarm-code emits no usage telemetry yet, so
+  its runs are metered at a flat per-run estimate (`O_SWARM_FLAT_CENTS`) rather
+  than true token cost.
+
+## Built on swarmrt
+
+O is written in the `sw` language and runs on the swarmrt runtime —
+<https://github.com/skyblanket/swarmrt>.
 
 ## License
 
-MIT © 2026 Otonomy Labs
+MIT — see [LICENSE](LICENSE).
