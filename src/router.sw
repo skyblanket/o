@@ -235,6 +235,10 @@ fun route_company(db, conn, method, p, body) {
         cid = string_sub(rest, 0, string_length(rest) - 7)
         route_issues(db, conn, method, cid, body)
     } else {
+      if (string_ends_with(rest, "/feedback") == 'true') {
+        fcid = string_sub(rest, 0, string_length(rest) - 9)
+        route_feedback(db, conn, method, fcid, body)
+      } else {
         if (string_ends_with(rest, "/agents") == 'true') {
             acid = string_sub(rest, 0, string_length(rest) - 7)
             route_agents(db, conn, method, acid, body)
@@ -254,6 +258,7 @@ fun route_company(db, conn, method, p, body) {
                 }
             }
         }
+      }
     }
 }
 
@@ -335,6 +340,87 @@ fun create_issue(db, conn, cid, body) {
                 }
             }
         }
+    }
+}
+
+# ---- feedback (Vorflux-style visual annotation intake) -------
+#
+#   POST /api/companies/:id/feedback
+#   Body: {"page_url","title"(opt),"annotations":[{selector,html,styles,instruction}...]}
+#
+# The embeddable widget (feedback/o-feedback.js) POSTs a batch of on-page
+# annotations here. Each becomes a markdown section in ONE issue body, filed
+# with origin='feedback' via issue_create_with_origin — DELIBERATELY not the
+# capped auto/reflect path, so a human's feedback is never swallowed by the
+# loop's self-file daily cap.
+
+fun route_feedback(db, conn, method, cid, body) {
+    if (method == 'POST') {
+        create_feedback(db, conn, cid, body)
+    } else {
+        respond(conn, 405, err_json("method not allowed"))
+    }
+}
+
+fun create_feedback(db, conn, cid, body) {
+    if (string_length(body) == 0) {
+        respond(conn, 400, err_json("request body required"))
+    } else {
+        data = json_decode(body)
+        page_url = map_get(data, "page_url")
+        anns = map_get(data, "annotations")
+        if (page_url == nil) {
+            respond(conn, 400, err_json("field 'page_url' is required"))
+        } else {
+            if (anns == nil) {
+                respond(conn, 400, err_json("field 'annotations' must be a non-empty array"))
+            } else {
+                if (is_list(anns) == 'false') {
+                    respond(conn, 400, err_json("field 'annotations' must be a non-empty array"))
+                } else {
+                    if (length(anns) == 0) {
+                        respond(conn, 400, err_json("field 'annotations' must be a non-empty array"))
+                    } else {
+                        n = length(anns)
+                        raw_title = map_get(data, "title")
+                        title = if (raw_title == nil) { f"Feedback: {n} annotation(s) on {page_url}" } else { raw_title }
+                        title2 = string_truncate(title, 200)
+                        fbody = compose_feedback_body(page_url, n, anns)
+                        id = Store.issue_create_with_origin(db, cid, title2, fbody, "medium", "feedback")
+                        if (id == nil) {
+                            respond(conn, 404, err_json("company not found"))
+                        } else {
+                            _l = Store.log_activity(db, cid, "feedback-widget", "feedback.filed", id)
+                            respond(conn, 201, json_encode(Store.issue_row(db, id)))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+# One markdown body: a header line naming the page + annotation count, then a
+# section per annotation. Each html payload is truncated to ~2000 chars so a
+# giant DOM subtree can't bloat the control plane.
+fun compose_feedback_body(page_url, n, anns) {
+    header = f"Visual feedback captured on {page_url} — {n} annotation(s).\n\n"
+    header ++ fmt_annotations(anns, 1)
+}
+
+fun fmt_annotations(anns, idx) {
+    if (length(anns) == 0) {
+        ""
+    } else {
+        a = hd(anns)
+        instruction = default_str(map_get(a, "instruction"), "(no instruction)")
+        selector = default_str(map_get(a, "selector"), "(unknown selector)")
+        styles = map_get(a, "styles")
+        styles_str = if (styles == nil) { "{}" } else { json_encode(styles) }
+        html = default_str(map_get(a, "html"), "")
+        html_trunc = string_truncate(html, 2000)
+        sec = f"### Annotation {idx} — {instruction}\n\n" ++ f"- selector: `{selector}`\n\n" ++ "- styles:\n\n```json\n" ++ styles_str ++ "\n```\n\n" ++ "- html:\n\n```html\n" ++ html_trunc ++ "\n```\n\n"
+        sec ++ fmt_annotations(tl(anns), idx + 1)
     }
 }
 

@@ -187,6 +187,73 @@ assert "run.succeeded" in verbs, verbs
 PY
 pass "GET /api/activity contains run.succeeded"
 
+# ---- stage e2: FEEDBACK widget intake (Phase 6b) --------------
+# The widget's JS must at least parse. node is available on this box; if some
+# CI lacks it, skip gracefully rather than fail the suite.
+if command -v node >/dev/null 2>&1; then
+  node --check feedback/o-feedback.js || fail "feedback/o-feedback.js failed node --check"
+  pass "feedback/o-feedback.js passes node --check"
+else
+  echo "SKIP: node not found — cannot syntax-check feedback/o-feedback.js"
+fi
+
+# A dedicated company receives a 2-annotation feedback batch. The intake must
+# 201 and file ONE origin='feedback' issue whose body carries the selector and
+# both instructions, and log feedback.filed.
+resp="$(ocurl -s -w $'\n%{http_code}' -X POST "$BASE/api/companies" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"Feedback Co","issue_prefix":"FBK","budget_monthly_cents":100000}')"
+sc="$(printf '%s' "$resp" | tail -n1)"; body="$(printf '%s' "$resp" | sed '$d')"
+[ "$sc" = "201" ] || { echo "$body"; fail "POST feedback company expected 201, got $sc"; }
+CIDFB="$(jget "$body" 'd["id"]')"
+[ -n "$CIDFB" ] || fail "feedback company id missing"
+
+# missing page_url -> 400
+sc="$(ocurl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/companies/$CIDFB/feedback" \
+  -H 'Content-Type: application/json' -d '{"annotations":[{"selector":"a","instruction":"x"}]}')"
+[ "$sc" = "400" ] || fail "feedback missing page_url expected 400, got $sc"
+# empty annotations -> 400
+sc="$(ocurl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/companies/$CIDFB/feedback" \
+  -H 'Content-Type: application/json' -d '{"page_url":"http://x/","annotations":[]}')"
+[ "$sc" = "400" ] || fail "feedback empty annotations expected 400, got $sc"
+pass "feedback intake: missing page_url / empty annotations both 400"
+
+# valid 2-annotation batch -> 201
+FBSEL="div.hero>h1"
+resp="$(ocurl -s -w $'\n%{http_code}' -X POST "$BASE/api/companies/$CIDFB/feedback" \
+  -H 'Content-Type: application/json' \
+  -d '{"page_url":"http://localhost:3000/dashboard","annotations":[{"selector":"div.hero>h1","html":"<h1>Welcome</h1>","styles":{"color":"rgb(0,0,0)","font-size":"32px"},"instruction":"make the heading bigger"},{"selector":"button.cta","html":"<button>Buy</button>","styles":{"background-color":"blue"},"instruction":"change button color to green"}]}')"
+sc="$(printf '%s' "$resp" | tail -n1)"; body="$(printf '%s' "$resp" | sed '$d')"
+[ "$sc" = "201" ] || { echo "$body"; fail "POST feedback batch expected 201, got $sc"; }
+IIDFB="$(jget "$body" 'd["id"]')"
+[ -n "$IIDFB" ] || fail "feedback issue id missing"
+pass "POST /api/companies/:id/feedback (2 annotations) -> 201 (issue $IIDFB)"
+
+# GET the issue back: origin 'feedback', body carries selector + both instructions
+body="$(ocurl -s "$BASE/api/issues/$IIDFB")"
+python3 - "$body" "$FBSEL" <<'PY' || fail "feedback issue field/body assertions failed"
+import sys, json
+d = json.loads(sys.argv[1]); sel = sys.argv[2]
+assert d["origin"] == "feedback", d.get("origin")
+b = d.get("body", "")
+assert sel in b, "selector not in body"
+assert "make the heading bigger" in b, "instruction 1 not in body"
+assert "change button color to green" in b, "instruction 2 not in body"
+assert "2 annotation" in b, "annotation count not in body"
+PY
+pass "feedback issue: origin=feedback, body has selector + both instructions"
+
+# activity has feedback.filed for this issue
+body="$(ocurl -s "$BASE/api/activity")"
+python3 - "$body" "$IIDFB" <<'PY' || fail "activity missing feedback.filed"
+import sys, json
+rows = json.loads(sys.argv[1]); iid = sys.argv[2]
+hit = [r for r in rows if r.get("verb") == "feedback.filed" and r.get("target") == iid]
+assert hit, "no feedback.filed for issue"
+assert hit[0].get("actor") == "feedback-widget", hit[0].get("actor")
+PY
+pass "GET /api/activity contains feedback.filed (actor feedback-widget)"
+
 # ---- stage f: daily budget ledger — pause + rollover ---------
 # A company with budget_daily_cents=100 and a sim agent (each run
 # costs 300) must hard-stop on the DAILY cap after its first run,

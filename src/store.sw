@@ -12,7 +12,7 @@ module Store
 export [next_id, companies, company_row, company_create, company_update,
         company_add_spend, enforce_budget, rollover_day, company_mark_green, global_spent_today,
         company_touch_reflect, companies_to_reflect,
-        issues_for, issue_row, issue_create, issue_create_auto, issue_open_fp_count,
+        issues_for, issue_row, issue_create, issue_create_auto, issue_create_with_origin, issue_open_fp_count,
         issue_set_status, issue_assign, issue_update, open_issue_titles,
         log_activity, activity_recent, activity_since, candidate_issues,
         failed_runs_for,
@@ -262,6 +262,28 @@ fun issue_create_auto(db, company_id, title, body, priority, origin, fingerprint
                 id
             }
         }
+    }
+}
+
+# Create an issue with an explicit origin (e.g. 'feedback') and NO
+# fingerprint — deliberately NOT routed through the auto/reflect self-file
+# cap (issue_create_auto caps only origin IN ('auto','reflect')). Operator-
+# adjacent intake paths (the Phase-6b visual feedback widget) use this so a
+# human's feedback is never silently swallowed by the loop's own daily cap.
+# Returns the new issue id, or nil if the company does not exist.
+fun issue_create_with_origin(db, company_id, title, body, priority, origin) {
+    crow = company_row(db, company_id)
+    if (crow == nil) {
+        nil
+    } else {
+        prefix = map_get(crow, "issue_prefix")
+        n = map_get(crow, "issue_counter") + 1
+        identifier = f"{prefix}-{n}"
+        id = next_id("iss")
+        now = timestamp()
+        _upd = db_query(db, "UPDATE company SET issue_counter = ?, updated_at = ? WHERE id = ?", [n, now, company_id])
+        _ins = db_query(db, "INSERT INTO issue (id, company_id, identifier, title, body, status, priority, sort_order, created_at, updated_at, origin, fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [id, company_id, identifier, title, body, "Backlog", priority, now, now, now, origin, ""])
+        id
     }
 }
 
