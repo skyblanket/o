@@ -886,5 +886,20 @@ nsp2="$(sqlite3 "$TMP3/o.db" "SELECT COUNT(*) FROM activity WHERE company_id='$C
 [ "$nsp2" = "1" ] || fail "reflect: expected exactly 1 reflect.spawn (at-most-once/day), got ${nsp2}"
 pass "reflect: at-most-once per day (single reflect.spawn after extra ticks)"
 
+# ============================================================
+# Held-out invariant suite — the frozen core (tests/heldout/core.sh)
+# ============================================================
+# Run last. The full pipeline above has already exercised every worker;
+# the held-out suite re-asserts the minimal INVARIANTS a self-modifying
+# agent may never break, on its OWN throwaway daemon (temp DB + random
+# port in a non-overlapping range). Kept lean so this stays sane.
+echo
+echo "=== held-out invariant suite (tests/heldout/core.sh) ==="
+if ./tests/heldout/core.sh; then
+  pass "held-out invariant suite green"
+else
+  fail "held-out invariant suite FAILED"
+fi
+
 echo
 echo "ALL GREEN"
