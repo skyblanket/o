@@ -265,8 +265,13 @@ fun update_company(db, conn, id, body) {
         respond(conn, 404, err_json("company not found"))
     } else {
         data = json_decode(body)
-        repo = default_str(map_get(data, "repo"), map_get(cur, "repo"))
-        verr = validate_repo(repo)
+        # Only validate the repo when the payload actually carries a "repo"
+        # key. Otherwise a status/budget-only update would re-validate the
+        # stored repo and 400 if that dir was since deleted — an unrelated
+        # field must never be held hostage by a stale repo path.
+        raw_repo = map_get(data, "repo")
+        repo = if (raw_repo == nil) { map_get(cur, "repo") } else { raw_repo }
+        verr = if (raw_repo == nil) { "" } else { validate_repo(repo) }
         if (string_length(verr) > 0) {
             respond(conn, 400, err_json(verr))
         } else {

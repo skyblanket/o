@@ -17,20 +17,43 @@ cd "$ROOT"
 
 DAEMON_PID=""
 TMP=""
+DAEMON2_PID=""
+TMP2=""
 
 cleanup() {
   if [ -n "$DAEMON_PID" ]; then
     kill "$DAEMON_PID" 2>/dev/null || true
     wait "$DAEMON_PID" 2>/dev/null || true
   fi
+  if [ -n "$DAEMON2_PID" ]; then
+    kill "$DAEMON2_PID" 2>/dev/null || true
+    wait "$DAEMON2_PID" 2>/dev/null || true
+  fi
   if [ -n "$TMP" ]; then
     rm -rf "$TMP" 2>/dev/null || true
+  fi
+  if [ -n "$TMP2" ]; then
+    rm -rf "$TMP2" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
 
 pass() { echo "PASS: $1"; }
 fail() { echo "FAIL: $1"; exit 1; }
+
+# curl with a hard wall-clock cap so a wedged connection can never hang the
+# whole suite, plus ONE retry on exit 52 (swarmrt's http server occasionally
+# idle-closes a keep-alive socket mid-response — a single dropped connection
+# must not abort the run). All args pass straight through to curl.
+ocurl() {
+  local out rc
+  out="$(curl --max-time 10 "$@")"; rc=$?
+  if [ "$rc" = "52" ]; then
+    out="$(curl --max-time 10 "$@")"; rc=$?
+  fi
+  printf '%s' "$out"
+  return "$rc"
+}
 
 # jget <json> <python-expr-on-d>  — print a value from a JSON blob.
 jget() {
@@ -62,7 +85,7 @@ for _i in $(seq 1 30); do
     cat "$TMP/daemon.log" || true
     fail "daemon exited during boot"
   fi
-  code="$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/health" 2>/dev/null || true)"
+  code="$(ocurl -s -o /dev/null -w '%{http_code}' "$BASE/api/health" 2>/dev/null || true)"
   if [ "$code" = "200" ]; then up="1"; break; fi
   sleep 0.5
 done
@@ -71,7 +94,7 @@ pass "daemon up on port $PORT (health 200)"
 
 # ---- stage c: API smoke -------------------------------------
 # create company
-resp="$(curl -s -w $'\n%{http_code}' -X POST "$BASE/api/companies" \
+resp="$(ocurl -s -w $'\n%{http_code}' -X POST "$BASE/api/companies" \
   -H 'Content-Type: application/json' \
   -d '{"name":"Smoke Co","issue_prefix":"TST","budget_monthly_cents":100000}')"
 sc="$(printf '%s' "$resp" | tail -n1)"
@@ -82,7 +105,7 @@ CID="$(jget "$body" 'd["id"]')"
 pass "POST /api/companies -> 201 (id $CID)"
 
 # create agent (sim runtime)
-resp="$(curl -s -w $'\n%{http_code}' -X POST "$BASE/api/companies/$CID/agents" \
+resp="$(ocurl -s -w $'\n%{http_code}' -X POST "$BASE/api/companies/$CID/agents" \
   -H 'Content-Type: application/json' \
   -d '{"name":"Simmy","runtime":"sim"}')"
 sc="$(printf '%s' "$resp" | tail -n1)"
@@ -93,7 +116,7 @@ AID="$(jget "$body" 'd["id"]')"
 pass "POST /api/companies/:id/agents -> 201 (id $AID)"
 
 # create issue
-resp="$(curl -s -w $'\n%{http_code}' -X POST "$BASE/api/companies/$CID/issues" \
+resp="$(ocurl -s -w $'\n%{http_code}' -X POST "$BASE/api/companies/$CID/issues" \
   -H 'Content-Type: application/json' \
   -d '{"title":"smoke"}')"
 sc="$(printf '%s' "$resp" | tail -n1)"
@@ -104,7 +127,7 @@ IID="$(jget "$body" 'd["id"]')"
 pass "POST /api/companies/:id/issues -> 201 (id $IID)"
 
 # ---- read each back and assert fields -----------------------
-body="$(curl -s "$BASE/api/companies/$CID")"
+body="$(ocurl -s "$BASE/api/companies/$CID")"
 python3 - "$body" <<'PY' || fail "GET company field assertions failed"
 import sys, json
 d = json.loads(sys.argv[1])
@@ -114,7 +137,7 @@ assert d["budget_monthly_cents"] == 100000, d.get("budget_monthly_cents")
 PY
 pass "GET /api/companies/:id fields (name, issue_prefix=TST, budget)"
 
-body="$(curl -s "$BASE/api/companies/$CID/agents")"
+body="$(ocurl -s "$BASE/api/companies/$CID/agents")"
 python3 - "$body" "$AID" <<'PY' || fail "GET agents field assertions failed"
 import sys, json
 rows = json.loads(sys.argv[1]); aid = sys.argv[2]
@@ -124,7 +147,7 @@ assert a["runtime"] == "sim", a.get("runtime")
 PY
 pass "GET /api/companies/:id/agents fields (name, runtime=sim)"
 
-body="$(curl -s "$BASE/api/issues/$IID")"
+body="$(ocurl -s "$BASE/api/issues/$IID")"
 python3 - "$body" <<'PY' || fail "GET issue field assertions failed"
 import sys, json
 d = json.loads(sys.argv[1])
@@ -138,7 +161,7 @@ pass "GET /api/issues/:id fields (title=smoke)"
 # retry after ~2s backoff on 5s ticks, so allow up to 60s.
 done_ok=""
 for _i in $(seq 1 60); do
-  st="$(jget "$(curl -s "$BASE/api/issues/$IID")" 'd["status"]' 2>/dev/null || true)"
+  st="$(jget "$(ocurl -s "$BASE/api/issues/$IID")" 'd["status"]' 2>/dev/null || true)"
   if [ "$st" = "Done" ]; then done_ok="1"; break; fi
   sleep 1
 done
@@ -146,7 +169,7 @@ done
 pass "pipeline: issue $IID reached Done"
 
 # ---- stage e: activity log has run.succeeded ----------------
-body="$(curl -s "$BASE/api/activity")"
+body="$(ocurl -s "$BASE/api/activity")"
 python3 - "$body" <<'PY' || fail "activity log missing run.succeeded"
 import sys, json
 rows = json.loads(sys.argv[1])
@@ -160,7 +183,7 @@ pass "GET /api/activity contains run.succeeded"
 # costs 300) must hard-stop on the DAILY cap after its first run,
 # with pause_reason="budget-daily". Rewinding budget_day by one day
 # then makes the next tick's rollover reset spent_today and un-pause.
-resp="$(curl -s -w $'\n%{http_code}' -X POST "$BASE/api/companies" \
+resp="$(ocurl -s -w $'\n%{http_code}' -X POST "$BASE/api/companies" \
   -H 'Content-Type: application/json' \
   -d '{"name":"Daily Co","issue_prefix":"DAY","budget_daily_cents":100}')"
 sc="$(printf '%s' "$resp" | tail -n1)"
@@ -175,21 +198,21 @@ assert d["status"] == "active", d.get("status")
 PY
 pass "POST /api/companies daily budget -> 201 (id $CID2, budget_daily_cents=100)"
 
-curl -s -X POST "$BASE/api/companies/$CID2/agents" \
+ocurl -s -X POST "$BASE/api/companies/$CID2/agents" \
   -H 'Content-Type: application/json' -d '{"name":"Dailysim","runtime":"sim"}' >/dev/null
-curl -s -X POST "$BASE/api/companies/$CID2/issues" \
+ocurl -s -X POST "$BASE/api/companies/$CID2/issues" \
   -H 'Content-Type: application/json' -d '{"title":"burn"}' >/dev/null
 
 # Wait for the daily cap to hard-stop the company.
 paused_ok=""
 for _i in $(seq 1 60); do
-  body="$(curl -s "$BASE/api/companies/$CID2")"
+  body="$(ocurl -s "$BASE/api/companies/$CID2")"
   st="$(jget "$body" 'd["status"]' 2>/dev/null || true)"
   if [ "$st" = "paused" ]; then paused_ok="1"; break; fi
   sleep 1
 done
 [ -n "$paused_ok" ] || { cat "$TMP/daemon.log" || true; fail "daily-budget company never paused (last status: ${st:-none})"; }
-body="$(curl -s "$BASE/api/companies/$CID2")"
+body="$(ocurl -s "$BASE/api/companies/$CID2")"
 python3 - "$body" <<'PY' || fail "expected pause_reason=budget-daily"
 import sys, json
 d = json.loads(sys.argv[1])
@@ -202,8 +225,8 @@ pass "daily cap: company $CID2 paused with pause_reason=budget-daily"
 # Cancel the open issue so the rolled-over company has no candidate to
 # re-dispatch (which would re-charge 300 and re-pause) — we are
 # asserting the rollover reset, not the re-dispatch.
-IID2="$(jget "$(curl -s "$BASE/api/companies/$CID2/issues")" 'd[0]["id"]')"
-curl -s -X POST "$BASE/api/issues/$IID2" \
+IID2="$(jget "$(ocurl -s "$BASE/api/companies/$CID2/issues")" 'd[0]["id"]')"
+ocurl -s -X POST "$BASE/api/issues/$IID2" \
   -H 'Content-Type: application/json' -d '{"status":"Canceled"}' >/dev/null
 
 # Rewind the ledger day; the next tick's rollover must reset + un-pause.
@@ -211,7 +234,7 @@ sqlite3 "$TMP/o.db" "UPDATE company SET budget_day = budget_day - 1 WHERE id='$C
 
 rolled_ok=""
 for _i in $(seq 1 20); do
-  body="$(curl -s "$BASE/api/companies/$CID2")"
+  body="$(ocurl -s "$BASE/api/companies/$CID2")"
   st="$(jget "$body" 'd["status"]' 2>/dev/null || true)"
   sp="$(jget "$body" 'd["spent_today_cents"]' 2>/dev/null || true)"
   if [ "$st" = "active" ] && [ "$sp" = "0" ]; then rolled_ok="1"; break; fi
@@ -220,7 +243,7 @@ done
 [ -n "$rolled_ok" ] || { cat "$TMP/daemon.log" || true; fail "rollover never reset company $CID2 (status=${st:-none} spent_today=${sp:-none})"; }
 pass "rollover: company $CID2 active again, spent_today_cents=0"
 
-body="$(curl -s "$BASE/api/activity")"
+body="$(ocurl -s "$BASE/api/activity")"
 python3 - "$body" <<'PY' || fail "activity log missing budget.reset"
 import sys, json
 rows = json.loads(sys.argv[1])
@@ -252,7 +275,7 @@ git -C "$SCRATCH" add -A
 git -C "$SCRATCH" commit -q -m "seed verify project"
 
 # company wired to the scratch repo + verify command + a protected prefix
-resp="$(curl -s -w $'\n%{http_code}' -X POST "$BASE/api/companies" \
+resp="$(ocurl -s -w $'\n%{http_code}' -X POST "$BASE/api/companies" \
   -H 'Content-Type: application/json' \
   -d "{\"name\":\"Verify Co\",\"issue_prefix\":\"VER\",\"budget_monthly_cents\":1000000,\"repo\":\"$SCRATCH\",\"verify_cmd\":\"sh verify.sh\",\"protected_paths\":\"protected/\"}")"
 sc="$(printf '%s' "$resp" | tail -n1)"
@@ -268,14 +291,14 @@ assert d["protected_paths"] == "protected/", d.get("protected_paths")
 PY
 pass "POST /api/companies verify-gate -> 201 (id $CID3, repo wired)"
 
-curl -s -X POST "$BASE/api/companies/$CID3/agents" \
+ocurl -s -X POST "$BASE/api/companies/$CID3/agents" \
   -H 'Content-Type: application/json' -d '{"name":"Versim","runtime":"sim"}' >/dev/null
 pass "verify-gate sim agent hired"
 
 # fire all four marker issues up front so they process concurrently
 mk_issue() {
   local resp
-  resp="$(curl -s -X POST "$BASE/api/companies/$CID3/issues" \
+  resp="$(ocurl -s -X POST "$BASE/api/companies/$CID3/issues" \
     -H 'Content-Type: application/json' -d "{\"title\":\"$1\"}")"
   jget "$resp" 'd["id"]'
 }
@@ -292,11 +315,24 @@ pass "verify-gate issues created (good/no-commit/protected/bad-verify)"
 wait_status() {
   local st=""
   for _i in $(seq 1 "$3"); do
-    st="$(jget "$(curl -s "$BASE/api/issues/$1")" 'd["status"]' 2>/dev/null || true)"
+    st="$(jget "$(ocurl -s "$BASE/api/issues/$1")" 'd["status"]' 2>/dev/null || true)"
     if [ "$st" = "$2" ]; then return 0; fi
     sleep 1
   done
   echo "  last status of $1: ${st:-none}"
+  return 1
+}
+
+# wait_status_at <base> <iid> <want> <max-seconds> — like wait_status but
+# against an explicit daemon base URL (the phase-4 stages boot a 2nd daemon).
+wait_status_at() {
+  local st=""
+  for _i in $(seq 1 "$4"); do
+    st="$(jget "$(ocurl -s "$1/api/issues/$2")" 'd["status"]' 2>/dev/null || true)"
+    if [ "$st" = "$3" ]; then return 0; fi
+    sleep 1
+  done
+  echo "  last status of $2: ${st:-none}"
   return 1
 }
 
@@ -327,7 +363,7 @@ pass "verify-gate: [sim:good] merged to main (merge commit), worktree + branch c
 RID_GOOD="$(sqlite3 "$TMP/o.db" "SELECT id FROM run WHERE issue_id='$IID_GOOD' ORDER BY started_at DESC LIMIT 1")"
 MSHA="$(sqlite3 "$TMP/o.db" "SELECT merge_sha FROM run WHERE id='$RID_GOOD'")"
 [ -n "$MSHA" ] || fail "[sim:good] run has empty merge_sha"
-rr="$(curl -s "$BASE/api/runs/$RID_GOOD/result")"
+rr="$(ocurl -s "$BASE/api/runs/$RID_GOOD/result")"
 python3 - "$rr" "$MSHA" <<'PY' || fail "run result missing merge_sha / archived stream"
 import sys, json
 d = json.loads(sys.argv[1])
@@ -363,7 +399,7 @@ else
 fi
 
 # activity records a pass, a fail, and a completed merge
-body="$(curl -s "$BASE/api/activity")"
+body="$(ocurl -s "$BASE/api/activity")"
 python3 - "$body" <<'PY' || fail "verify-gate activity missing verify.pass / verify.fail / merge.done"
 import sys, json
 verbs = [r.get("verb") for r in json.loads(sys.argv[1])]
@@ -388,17 +424,17 @@ echo "regress project" > "$SCRATCH2/README.md"
 git -C "$SCRATCH2" add -A
 git -C "$SCRATCH2" commit -q -m "seed regress project"
 
-resp="$(curl -s -w $'\n%{http_code}' -X POST "$BASE/api/companies" \
+resp="$(ocurl -s -w $'\n%{http_code}' -X POST "$BASE/api/companies" \
   -H 'Content-Type: application/json' \
   -d "{\"name\":\"Regress Co\",\"issue_prefix\":\"REG\",\"budget_monthly_cents\":1000000,\"repo\":\"$SCRATCH2\",\"verify_cmd\":\"sh verify.sh\",\"protected_paths\":\"protected/\"}")"
 sc="$(printf '%s' "$resp" | tail -n1)"; body="$(printf '%s' "$resp" | sed '$d')"
 [ "$sc" = "201" ] || { echo "$body"; fail "POST regress company expected 201, got $sc"; }
 CID4="$(jget "$body" 'd["id"]')"
-curl -s -X POST "$BASE/api/companies/$CID4/agents" \
+ocurl -s -X POST "$BASE/api/companies/$CID4/agents" \
   -H 'Content-Type: application/json' -d '{"name":"Regsim","runtime":"sim"}' >/dev/null
-curl -s -X POST "$BASE/api/companies/$CID4/issues" \
+ocurl -s -X POST "$BASE/api/companies/$CID4/issues" \
   -H 'Content-Type: application/json' -d '{"title":"[sim:regress] boom"}' >/dev/null
-IID_REG="$(jget "$(curl -s "$BASE/api/companies/$CID4/issues")" 'd[0]["id"]')"
+IID_REG="$(jget "$(ocurl -s "$BASE/api/companies/$CID4/issues")" 'd[0]["id"]')"
 [ -n "$IID_REG" ] || fail "regress issue id missing"
 
 if wait_status "$IID_REG" "Reverted" 120; then
@@ -415,13 +451,34 @@ else
   cat "$TMP/daemon.log" || true; fail "[sim:regress] never reached Reverted"
 fi
 
-body="$(curl -s "$BASE/api/activity")"
+body="$(ocurl -s "$BASE/api/activity")"
 python3 - "$body" <<'PY' || fail "activity missing merge.revert"
 import sys, json
 verbs = [r.get("verb") for r in json.loads(sys.argv[1])]
 assert "merge.revert" in verbs, verbs
 PY
 pass "GET /api/activity contains merge.revert"
+
+# ---- stage h2: SELF-FILED revert-fix issue --------------------
+# The post-merge revert must auto-file exactly ONE origin='auto', high-priority
+# fix issue fingerprinted "revert:<ident>" (ident = the reverted issue's Linear
+# identifier), pointing at the kept branch. Poll: issue_set_status(Reverted)
+# and issue_create_auto commit on separate autocommit statements, so the API
+# can momentarily see "Reverted" a beat before the auto-file lands.
+REG_IDENT="$(sqlite3 "$TMP/o.db" "SELECT identifier FROM issue WHERE id='$IID_REG'")"
+[ -n "$REG_IDENT" ] || fail "revert self-file: could not read reverted issue identifier"
+selffile_ok=""
+for _i in $(seq 1 15); do
+  nrev="$(sqlite3 "$TMP/o.db" "SELECT COUNT(*) FROM issue WHERE company_id='$CID4' AND fingerprint='revert:$REG_IDENT' AND origin='auto' AND priority='high'")"
+  if [ "${nrev:-0}" = "1" ]; then selffile_ok="1"; break; fi
+  sleep 1
+done
+[ -n "$selffile_ok" ] || { cat "$TMP/daemon.log" || true; fail "revert self-file: expected exactly 1 origin=auto high revert:$REG_IDENT issue, got ${nrev:-0}"; }
+sfbody="$(sqlite3 "$TMP/o.db" "SELECT body FROM issue WHERE company_id='$CID4' AND fingerprint='revert:$REG_IDENT'")"
+printf '%s' "$sfbody" | grep -q "o/$IID_REG" || fail "revert self-file: body does not name kept branch o/$IID_REG"
+sqlite3 "$TMP/o.db" "SELECT COUNT(*) FROM activity WHERE verb='selffile.created' AND target='revert:$REG_IDENT'" | grep -q '^1$' \
+  || fail "revert self-file: selffile.created not logged for revert:$REG_IDENT"
+pass "self-file: revert auto-filed exactly one origin=auto high issue (revert:$REG_IDENT), branch named, selffile.created logged"
 
 # ---- stage i: SERIALIZED merges -------------------------------
 # Two [sim:good] issues filed together must BOTH reach Done, leaving TWO merge
@@ -436,20 +493,20 @@ echo "serialize project" > "$SCRATCH3/README.md"
 git -C "$SCRATCH3" add -A
 git -C "$SCRATCH3" commit -q -m "seed serialize project"
 
-resp="$(curl -s -w $'\n%{http_code}' -X POST "$BASE/api/companies" \
+resp="$(ocurl -s -w $'\n%{http_code}' -X POST "$BASE/api/companies" \
   -H 'Content-Type: application/json' \
   -d "{\"name\":\"Serial Co\",\"issue_prefix\":\"SER\",\"budget_monthly_cents\":1000000,\"repo\":\"$SCRATCH3\",\"verify_cmd\":\"sh verify.sh\",\"protected_paths\":\"protected/\"}")"
 sc="$(printf '%s' "$resp" | tail -n1)"; body="$(printf '%s' "$resp" | sed '$d')"
 [ "$sc" = "201" ] || { echo "$body"; fail "POST serial company expected 201, got $sc"; }
 CID5="$(jget "$body" 'd["id"]')"
-curl -s -X POST "$BASE/api/companies/$CID5/agents" \
+ocurl -s -X POST "$BASE/api/companies/$CID5/agents" \
   -H 'Content-Type: application/json' -d '{"name":"Sersim","runtime":"sim"}' >/dev/null
-curl -s -X POST "$BASE/api/companies/$CID5/issues" \
+ocurl -s -X POST "$BASE/api/companies/$CID5/issues" \
   -H 'Content-Type: application/json' -d '{"title":"[sim:good] first"}' >/dev/null
-curl -s -X POST "$BASE/api/companies/$CID5/issues" \
+ocurl -s -X POST "$BASE/api/companies/$CID5/issues" \
   -H 'Content-Type: application/json' -d '{"title":"[sim:good] second"}' >/dev/null
-IID_S1="$(jget "$(curl -s "$BASE/api/companies/$CID5/issues")" 'd[0]["id"]')"
-IID_S2="$(jget "$(curl -s "$BASE/api/companies/$CID5/issues")" 'd[1]["id"]')"
+IID_S1="$(jget "$(ocurl -s "$BASE/api/companies/$CID5/issues")" 'd[0]["id"]')"
+IID_S2="$(jget "$(ocurl -s "$BASE/api/companies/$CID5/issues")" 'd[1]["id"]')"
 [ -n "$IID_S1" ] && [ -n "$IID_S2" ] || fail "serial issue ids missing"
 
 wait_status "$IID_S1" "Done" 120 || { cat "$TMP/daemon.log"; fail "serial issue 1 never Done"; }
@@ -477,17 +534,17 @@ git -C "$SCRATCH4" commit -q -m "seed dirty project"
 # dirty a TRACKED file (uncommitted) — merge cannot proceed until reverted
 echo "uncommitted local edit" >> "$SCRATCH4/README.md"
 
-resp="$(curl -s -w $'\n%{http_code}' -X POST "$BASE/api/companies" \
+resp="$(ocurl -s -w $'\n%{http_code}' -X POST "$BASE/api/companies" \
   -H 'Content-Type: application/json' \
   -d "{\"name\":\"Dirty Co\",\"issue_prefix\":\"DRT\",\"budget_monthly_cents\":1000000,\"repo\":\"$SCRATCH4\",\"verify_cmd\":\"sh verify.sh\",\"protected_paths\":\"protected/\"}")"
 sc="$(printf '%s' "$resp" | tail -n1)"; body="$(printf '%s' "$resp" | sed '$d')"
 [ "$sc" = "201" ] || { echo "$body"; fail "POST dirty company expected 201, got $sc"; }
 CID6="$(jget "$body" 'd["id"]')"
-curl -s -X POST "$BASE/api/companies/$CID6/agents" \
+ocurl -s -X POST "$BASE/api/companies/$CID6/agents" \
   -H 'Content-Type: application/json' -d '{"name":"Drtsim","runtime":"sim"}' >/dev/null
-curl -s -X POST "$BASE/api/companies/$CID6/issues" \
+ocurl -s -X POST "$BASE/api/companies/$CID6/issues" \
   -H 'Content-Type: application/json' -d '{"title":"[sim:good] blocked by dirty"}' >/dev/null
-IID_DRT="$(jget "$(curl -s "$BASE/api/companies/$CID6/issues")" 'd[0]["id"]')"
+IID_DRT="$(jget "$(ocurl -s "$BASE/api/companies/$CID6/issues")" 'd[0]["id"]')"
 [ -n "$IID_DRT" ] || fail "dirty issue id missing"
 
 # merge.dirty must appear for THIS issue while the repo stays dirty
@@ -499,7 +556,7 @@ for _i in $(seq 1 60); do
 done
 [ -n "$dirty_ok" ] || { cat "$TMP/daemon.log" || true; fail "merge.dirty never logged for blocked issue"; }
 # while dirty the issue must NOT terminate — it stays in the merge/verify phase
-st="$(jget "$(curl -s "$BASE/api/issues/$IID_DRT")" 'd["status"]')"
+st="$(jget "$(ocurl -s "$BASE/api/issues/$IID_DRT")" 'd["status"]')"
 [ "$st" = "Verifying" ] || fail "dirty: issue expected to stay Verifying, got '$st'"
 # no attempt consumed: still on attempt 1
 at="$(sqlite3 "$TMP/o.db" "SELECT attempt FROM run WHERE issue_id='$IID_DRT' ORDER BY started_at DESC LIMIT 1")"
@@ -515,6 +572,149 @@ if wait_status "$IID_DRT" "Done" 60; then
 else
   cat "$TMP/daemon.log" || true; fail "dirty: issue never reached Done after cleaning repo"
 fi
+
+# ============================================================
+# Phase-4 stages — self-feedback loop (2nd daemon, tight breakers)
+# ============================================================
+# A second daemon with O_SELF_FILE_CAP=2 + O_NO_SIGNAL_DAYS=2 so the auto-file
+# daily cap and the no-signal breaker fire quickly and observably.
+TMP2="$(mktemp -d)"
+PORT2=$((4650 + RANDOM % 300))
+BASE2="http://127.0.0.1:${PORT2}"
+HOME="$TMP2" O_DB="$TMP2/o.db" O_PORT="$PORT2" O_NO_OPEN=1 O_SELF_FILE_CAP=2 O_NO_SIGNAL_DAYS=2 \
+  ./bin/swarmd >"$TMP2/daemon.log" 2>&1 &
+DAEMON2_PID=$!
+up2=""
+for _i in $(seq 1 30); do
+  if ! kill -0 "$DAEMON2_PID" 2>/dev/null; then cat "$TMP2/daemon.log" || true; fail "daemon2 exited during boot"; fi
+  code="$(ocurl -s -o /dev/null -w '%{http_code}' "$BASE2/api/health" 2>/dev/null || true)"
+  if [ "$code" = "200" ]; then up2="1"; break; fi
+  sleep 0.5
+done
+[ -n "$up2" ] || { cat "$TMP2/daemon.log" || true; fail "daemon2 health never reached 200 (port $PORT2)"; }
+pass "phase4 daemon up on port $PORT2 (O_SELF_FILE_CAP=2, O_NO_SIGNAL_DAYS=2)"
+
+# A scratch repo so a succeeded sim run enters the verify gate. [sim:no-commit]
+# fails at red_no_commit (BEFORE the verify command runs) — the cleanest way to
+# drive an issue to a final verify fail (and thus a verify-final auto-file).
+SCRATCHK="$TMP2/projk"
+mkdir -p "$SCRATCHK"
+git -C "$SCRATCHK" init -q -b main
+git -C "$SCRATCHK" config user.email "o@example.com"
+git -C "$SCRATCHK" config user.name "O Test"
+cp "$SCRATCH/verify.sh" "$SCRATCHK/verify.sh"
+echo "self-file project" > "$SCRATCHK/README.md"
+git -C "$SCRATCHK" add -A
+git -C "$SCRATCHK" commit -q -m "seed self-file project"
+
+mkco2() {  # <name> <prefix> -> company id on daemon2 (wired to SCRATCHK)
+  local resp sc body
+  resp="$(ocurl -s -w $'\n%{http_code}' -X POST "$BASE2/api/companies" \
+    -H 'Content-Type: application/json' \
+    -d "{\"name\":\"$1\",\"issue_prefix\":\"$2\",\"budget_monthly_cents\":100000000,\"repo\":\"$SCRATCHK\",\"verify_cmd\":\"sh verify.sh\",\"protected_paths\":\"protected/\"}")"
+  sc="$(printf '%s' "$resp" | tail -n1)"; body="$(printf '%s' "$resp" | sed '$d')"
+  [ "$sc" = "201" ] || { echo "$body" >&2; return 1; }
+  jget "$body" 'd["id"]'
+}
+mkissue2() {  # <cid> <title> -> issue id
+  jget "$(ocurl -s -X POST "$BASE2/api/companies/$1/issues" -H 'Content-Type: application/json' -d "{\"title\":\"$2\"}")" 'd["id"]'
+}
+
+# ---- stage k: SELF-FILE — depth-1 + daily cap -----------------
+# Two separate companies so their per-company caps don't interfere.
+CID_K1="$(mkco2 'DepthOne Co' 'DP1')"; [ -n "$CID_K1" ] || fail "depth-1 company create failed"
+ocurl -s -X POST "$BASE2/api/companies/$CID_K1/agents" -H 'Content-Type: application/json' -d '{"name":"Dpsim","runtime":"sim"}' >/dev/null
+CID_K2="$(mkco2 'Cap Co' 'CAP')"; [ -n "$CID_K2" ] || fail "cap company create failed"
+ocurl -s -X POST "$BASE2/api/companies/$CID_K2/agents" -H 'Content-Type: application/json' -d '{"name":"Capsim","runtime":"sim"}' >/dev/null
+
+# depth-1: an issue we mark origin='auto' — its own final fail must file NO child.
+IID_K1="$(mkissue2 "$CID_K1" '[sim:no-commit] depth one')"
+[ -n "$IID_K1" ] || fail "depth-1 issue create failed"
+sqlite3 "$TMP2/o.db" "UPDATE issue SET origin='auto' WHERE id='$IID_K1'"
+
+# cap: THREE ordinary no-commit issues — with cap=2, two verify-final children
+# are filed and the third auto-file is capped.
+IID_C1="$(mkissue2 "$CID_K2" '[sim:no-commit] one')"
+IID_C2="$(mkissue2 "$CID_K2" '[sim:no-commit] two')"
+IID_C3="$(mkissue2 "$CID_K2" '[sim:no-commit] three')"
+for x in "$IID_C1" "$IID_C2" "$IID_C3"; do [ -n "$x" ] || fail "cap issue id missing"; done
+
+# all four parents must reach Failed (they run concurrently, cap 3)
+wait_status_at "$BASE2" "$IID_K1" "Failed" 200 || { cat "$TMP2/daemon.log" || true; fail "depth-1 [sim:no-commit] never Failed"; }
+wait_status_at "$BASE2" "$IID_C1" "Failed" 200 || { cat "$TMP2/daemon.log" || true; fail "cap issue 1 never Failed"; }
+wait_status_at "$BASE2" "$IID_C2" "Failed" 200 || { cat "$TMP2/daemon.log" || true; fail "cap issue 2 never Failed"; }
+wait_status_at "$BASE2" "$IID_C3" "Failed" 200 || { cat "$TMP2/daemon.log" || true; fail "cap issue 3 never Failed"; }
+
+# depth-1 assertions: no child filed off the origin=auto issue, skip logged.
+K1_IDENT="$(sqlite3 "$TMP2/o.db" "SELECT identifier FROM issue WHERE id='$IID_K1'")"
+depth_ok=""
+for _i in $(seq 1 15); do
+  ndepth="$(sqlite3 "$TMP2/o.db" "SELECT COUNT(*) FROM activity WHERE verb='selffile.skipped_depth' AND target='$K1_IDENT'")"
+  [ "${ndepth:-0}" -ge 1 ] && { depth_ok="1"; break; }
+  sleep 1
+done
+[ -n "$depth_ok" ] || { cat "$TMP2/daemon.log" || true; fail "depth-1: selffile.skipped_depth not logged for $K1_IDENT"; }
+nchild="$(sqlite3 "$TMP2/o.db" "SELECT COUNT(*) FROM issue WHERE fingerprint='verify-final:$K1_IDENT'")"
+[ "$nchild" = "0" ] || fail "depth-1: a child issue was filed off an origin=auto issue (fork-bomb guard failed), got $nchild"
+pass "self-file depth-1: an origin=auto issue's final fail files NO child (selffile.skipped_depth logged)"
+
+# cap assertions: exactly 2 verify-final children filed, the 3rd capped.
+cap_ok=""
+for _i in $(seq 1 25); do
+  nauto="$(sqlite3 "$TMP2/o.db" "SELECT COUNT(*) FROM issue WHERE company_id='$CID_K2' AND origin='auto' AND fingerprint LIKE 'verify-final:%'")"
+  ncap="$(sqlite3 "$TMP2/o.db" "SELECT COUNT(*) FROM activity WHERE company_id='$CID_K2' AND verb='selffile.capped'")"
+  if [ "${nauto:-0}" = "2" ] && [ "${ncap:-0}" -ge 1 ]; then cap_ok="1"; break; fi
+  sleep 1
+done
+[ -n "$cap_ok" ] || { echo "nauto=${nauto:-?} ncap=${ncap:-?}"; cat "$TMP2/daemon.log" || true; fail "cap: expected exactly 2 auto verify-final issues + >=1 selffile.capped"; }
+ncreated="$(sqlite3 "$TMP2/o.db" "SELECT COUNT(*) FROM activity WHERE company_id='$CID_K2' AND verb='selffile.created'")"
+[ "${ncreated:-0}" = "2" ] || fail "cap: expected exactly 2 selffile.created, got ${ncreated:-0}"
+pass "self-file cap: 3 verify-final fails under cap=2 -> 2 filed, 1 capped (selffile.created x2, selffile.capped)"
+
+# ---- stage l: NO-SIGNAL breaker -------------------------------
+# Seed a company that spent >=80% of its daily budget with zero greens on a
+# stale day; each rollover bumps no_signal_days. At O_NO_SIGNAL_DAYS=2 the 2nd
+# such rollover pauses it (pause_reason='no-signal') and auto-files a
+# diagnostic. No agents: the seeded counters are the only signal.
+resp="$(ocurl -s -w $'\n%{http_code}' -X POST "$BASE2/api/companies" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"NoSignal Co","issue_prefix":"NOS","budget_daily_cents":1000}')"
+sc="$(printf '%s' "$resp" | tail -n1)"; body="$(printf '%s' "$resp" | sed '$d')"
+[ "$sc" = "201" ] || { echo "$body"; fail "POST no-signal company expected 201, got $sc"; }
+CID_L="$(jget "$body" 'd["id"]')"
+[ -n "$CID_L" ] || fail "no-signal company id missing"
+
+DAY_MINUS1="(strftime('%s','now')*1000/86400000)-1"
+# day 1: 900/1000 spent, 0 greens, stamped yesterday -> next rollover bumps to 1
+sqlite3 "$TMP2/o.db" "UPDATE company SET budget_daily_cents=1000, spent_today_cents=900, greens_today=0, no_signal_days=0, status='active', pause_reason='', budget_day=$DAY_MINUS1 WHERE id='$CID_L'"
+ns1_ok=""
+for _i in $(seq 1 20); do
+  n="$(sqlite3 "$TMP2/o.db" "SELECT no_signal_days FROM company WHERE id='$CID_L'")"
+  sp="$(sqlite3 "$TMP2/o.db" "SELECT spent_today_cents FROM company WHERE id='$CID_L'")"
+  if [ "${n:-x}" = "1" ] && [ "${sp:-x}" = "0" ]; then ns1_ok="1"; break; fi
+  sleep 1
+done
+[ -n "$ns1_ok" ] || { cat "$TMP2/daemon.log" || true; fail "no-signal: first rollover expected no_signal_days=1 spent_today=0 (got n=${n:-?} sp=${sp:-?})"; }
+st="$(jget "$(ocurl -s "$BASE2/api/companies/$CID_L")" 'd["status"]')"
+[ "$st" = "active" ] || fail "no-signal: company should still be active after day 1 (got $st)"
+pass "no-signal: day-1 rollover bumped no_signal_days=1, reset spend, still active"
+
+# day 2: spend high again with zero greens, stale day -> rollover to 2 -> pause
+sqlite3 "$TMP2/o.db" "UPDATE company SET spent_today_cents=900, greens_today=0, budget_day=$DAY_MINUS1 WHERE id='$CID_L'"
+paused2_ok=""
+for _i in $(seq 1 20); do
+  body="$(ocurl -s "$BASE2/api/companies/$CID_L")"
+  st="$(jget "$body" 'd["status"]' 2>/dev/null || true)"
+  pr="$(jget "$body" 'd["pause_reason"]' 2>/dev/null || true)"
+  if [ "$st" = "paused" ] && [ "$pr" = "no-signal" ]; then paused2_ok="1"; break; fi
+  sleep 1
+done
+[ -n "$paused2_ok" ] || { cat "$TMP2/daemon.log" || true; fail "no-signal: 2nd rollover expected paused/no-signal (got status=${st:-?} reason=${pr:-?})"; }
+ndiag="$(sqlite3 "$TMP2/o.db" "SELECT COUNT(*) FROM issue WHERE company_id='$CID_L' AND fingerprint='no-signal:$CID_L' AND origin='auto'")"
+[ "$ndiag" = "1" ] || fail "no-signal: expected exactly 1 diagnostic issue no-signal:$CID_L, got $ndiag"
+sqlite3 "$TMP2/o.db" "SELECT COUNT(*) FROM activity WHERE company_id='$CID_L' AND verb='budget.no_signal'" | grep -q '^1$' \
+  || fail "no-signal: budget.no_signal not logged exactly once"
+pass "no-signal: 2nd rollover paused company (pause_reason=no-signal), diagnostic filed, budget.no_signal logged"
 
 echo
 echo "ALL GREEN"

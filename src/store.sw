@@ -11,7 +11,8 @@ module Store
 
 export [next_id, companies, company_row, company_create, company_update,
         company_add_spend, enforce_budget, rollover_day, company_mark_green, global_spent_today,
-        issues_for, issue_row, issue_create, issue_set_status, issue_assign, issue_update,
+        issues_for, issue_row, issue_create, issue_create_auto, issue_open_fp_count,
+        issue_set_status, issue_assign, issue_update,
         log_activity, activity_recent, candidate_issues,
         run_create, run_finish, run_set_state, run_set_verify, run_set_merge, last_run_for_issue, runs_all, run_row,
         agents_for, agent_row, agent_first_active, agent_create,
@@ -89,35 +90,60 @@ fun enforce_budget(db, company_id) {
     }
 }
 
-# Daily rollover. `today` is the epoch-day computed IN SQL (int/int in
-# SQLite) so no sw float→int is needed. For every company whose stored
-# budget_day is not today, reset the daily spend + green counters, stamp
-# the new day, and un-pause any company that was stopped on the DAILY
-# cap (a monthly hard-stop survives the rollover). Returns the list of
-# rolled company ids so the caller can log a budget.reset per company.
-#
-# Phase-4 hook: the no-signal evaluation (greens_today == 0 → bump
-# no_signal_days, maybe trigger reflection) lands here, reading the
-# about-to-be-reset counters BEFORE they are zeroed.
-fun rollover_day(db, now_ms) {
-    rows = db_query(db, "SELECT id FROM company WHERE budget_day != (? / 86400000)", [now_ms])
-    ids = map_ids(rows)
-    # Un-pause the DAILY-capped companies FIRST, guarded by the same
-    # "rolled today" predicate — otherwise a company paused earlier the
-    # SAME day (budget_day already == today) would be reactivated every
-    # tick, turning the daily hard-stop into a 5-second pause. This must
-    # run BEFORE the reset below stamps budget_day, or the guard is moot.
-    _u = db_query(db, "UPDATE company SET status = 'active', pause_reason = '', updated_at = ? WHERE pause_reason = 'budget-daily' AND budget_day != (? / 86400000)", [timestamp(), now_ms])
-    _r = db_query(db, "UPDATE company SET spent_today_cents = 0, greens_today = 0, budget_day = (? / 86400000), updated_at = ? WHERE budget_day != (? / 86400000)", [now_ms, timestamp(), now_ms])
-    ids
+# Daily rollover. The epoch-day is computed IN SQL (int/int in SQLite) so
+# no sw float→int is needed. For every company whose stored budget_day is
+# not today this:
+#   (a) evaluates the NO-SIGNAL breaker on the about-to-be-reset counters:
+#       if budget_daily_cents > 0 AND spent_today_cents >= 80% of it AND
+#       greens_today == 0, no_signal_days += 1 (else it resets to 0). If the
+#       incremented value >= `threshold`, the company is paused with
+#       pause_reason='no-signal'.
+#   (b) resets the daily spend + green counters and stamps the new day.
+#   (c) un-pauses a company that was stopped on the DAILY budget cap — but
+#       NOT one paused for 'no-signal' (that breaker holds until an operator
+#       clears it), and a monthly hard-stop survives too.
+# Runs one UPDATE per rolled company (no bulk sweep) so each carries its own
+# computed no_signal_days + status. Returns a list of per-company info maps
+# %{id, result, no_signal_days} so the ORCHESTRATOR logs budget.reset /
+# budget.no_signal and auto-files the diagnostic issue. `result` is a STRING:
+# "paused" (no-signal tripped) | "unpaused" (budget-daily lifted) | "reset".
+fun rollover_day(db, now_ms, threshold) {
+    rows = db_query(db, "SELECT id, budget_daily_cents, spent_today_cents, greens_today, no_signal_days, pause_reason FROM company WHERE budget_day != (? / 86400000)", [now_ms])
+    rollover_each(db, rows, now_ms, threshold)
 }
 
-# Pull the "id" column out of a list of row maps into a plain list.
-fun map_ids(rows) {
+fun rollover_each(db, rows, now_ms, threshold) {
     if (length(rows) == 0) {
         []
     } else {
-        [map_get(hd(rows), "id")] ++ map_ids(tl(rows))
+        info = rollover_one(db, hd(rows), now_ms, threshold)
+        [info] ++ rollover_each(db, tl(rows), now_ms, threshold)
+    }
+}
+
+fun rollover_one(db, c, now_ms, threshold) {
+    cid = map_get(c, "id")
+    budget_daily = map_get(c, "budget_daily_cents")
+    spent_today = map_get(c, "spent_today_cents")
+    greens = map_get(c, "greens_today")
+    prior = map_get(c, "no_signal_days")
+    pause_reason = map_get(c, "pause_reason")
+    # 80% threshold with integer math (no float→int): spent*10 >= budget*8.
+    incremented = if (budget_daily > 0 && greens == 0 && (spent_today * 10) >= (budget_daily * 8)) { 'true' } else { 'false' }
+    new_nosig = if (incremented == 'true') { prior + 1 } else { 0 }
+    tripped = if (incremented == 'true' && new_nosig >= threshold) { 'true' } else { 'false' }
+    now = timestamp()
+    if (tripped == 'true') {
+        _u = db_query(db, "UPDATE company SET spent_today_cents = 0, greens_today = 0, budget_day = (? / 86400000), no_signal_days = ?, status = 'paused', pause_reason = 'no-signal', updated_at = ? WHERE id = ?", [now_ms, new_nosig, now, cid])
+        %{id: cid, result: "paused", no_signal_days: new_nosig}
+    } else {
+        if (pause_reason == "budget-daily") {
+            _u = db_query(db, "UPDATE company SET spent_today_cents = 0, greens_today = 0, budget_day = (? / 86400000), no_signal_days = ?, status = 'active', pause_reason = '', updated_at = ? WHERE id = ?", [now_ms, new_nosig, now, cid])
+            %{id: cid, result: "unpaused", no_signal_days: new_nosig}
+        } else {
+            _u = db_query(db, "UPDATE company SET spent_today_cents = 0, greens_today = 0, budget_day = (? / 86400000), no_signal_days = ?, updated_at = ? WHERE id = ?", [now_ms, new_nosig, now, cid])
+            %{id: cid, result: "reset", no_signal_days: new_nosig}
+        }
     }
 }
 
@@ -163,6 +189,65 @@ fun issue_create(db, company_id, title, body, priority) {
     }
 }
 
+# The self-file cap: max auto/reflect issues a company may file per day.
+# O_SELF_FILE_CAP overrides; default 10.
+fun self_file_cap() {
+    v = getenv("O_SELF_FILE_CAP")
+    if (v == nil) {
+        10
+    } else {
+        n = to_int(v)
+        if (n == nil) { 10 } else { n }
+    }
+}
+
+# Count of OPEN (non-terminal) issues in a company carrying this exact
+# fingerprint. The dedup key for auto-filing: a caller that got nil back
+# from issue_create_auto uses this to tell "duped" (>0) from "capped" (0).
+fun issue_open_fp_count(db, company_id, fingerprint) {
+    rows = db_query(db, "SELECT COUNT(*) AS n FROM issue WHERE company_id = ? AND fingerprint = ? AND status NOT IN ('Done', 'Canceled', 'Failed', 'Reverted')", [company_id, fingerprint])
+    if (length(rows) == 0) { 0 } else { map_get(hd(rows), "n") }
+}
+
+# Auto-file an issue on the loop's own behalf (origin 'auto'/'reflect'),
+# with two guard rails:
+#   dedup  — a non-empty fingerprint that already matches an OPEN issue in
+#            this company returns nil (the caller logs "selffile.duped").
+#   daily cap — if the company already filed self_file_cap() auto/reflect
+#            issues TODAY, returns nil (the caller logs "selffile.capped").
+# Otherwise it creates the issue exactly like issue_create but with the
+# origin + fingerprint columns set, and returns the new id.
+fun issue_create_auto(db, company_id, title, body, priority, origin, fingerprint) {
+    crow = company_row(db, company_id)
+    if (crow == nil) {
+        nil
+    } else {
+        now = timestamp()
+        dup = if (string_length(fingerprint) == 0) {
+            0
+        } else {
+            issue_open_fp_count(db, company_id, fingerprint)
+        }
+        if (dup > 0) {
+            nil
+        } else {
+            caprows = db_query(db, "SELECT COUNT(*) AS n FROM issue WHERE company_id = ? AND origin IN ('auto', 'reflect') AND (created_at / 86400000) = (? / 86400000)", [company_id, now])
+            filed_today = if (length(caprows) == 0) { 0 } else { map_get(hd(caprows), "n") }
+            if (filed_today >= self_file_cap()) {
+                nil
+            } else {
+                prefix = map_get(crow, "issue_prefix")
+                n = map_get(crow, "issue_counter") + 1
+                identifier = f"{prefix}-{n}"
+                id = next_id("iss")
+                _upd = db_query(db, "UPDATE company SET issue_counter = ?, updated_at = ? WHERE id = ?", [n, now, company_id])
+                _ins = db_query(db, "INSERT INTO issue (id, company_id, identifier, title, body, status, priority, sort_order, created_at, updated_at, origin, fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [id, company_id, identifier, title, body, "Backlog", priority, now, now, now, origin, fingerprint])
+                id
+            }
+        }
+    }
+}
+
 fun issue_set_status(db, id, status) {
     _u = db_query(db, "UPDATE issue SET status = ?, updated_at = ? WHERE id = ?", [status, timestamp(), id])
     id
@@ -183,7 +268,7 @@ fun issue_assign(db, id, agent_id) {
 # id already in running, so no double-dispatch occurs. Only "Reverted" (a phase-3
 # terminal state) joins Done/Canceled/Failed in the exclusion list.
 fun candidate_issues(db) {
-    db_query(db, "SELECT id, company_id, identifier, title, body, status, priority, assignee_agent_id, sort_order, origin, fingerprint FROM issue WHERE status NOT IN ('Done', 'Canceled', 'Failed', 'Reverted') AND company_id IN (SELECT id FROM company WHERE status = 'active') ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, created_at ASC", [])
+    db_query(db, "SELECT id, company_id, identifier, title, body, status, priority, assignee_agent_id, sort_order, origin, fingerprint FROM issue WHERE status NOT IN ('Done', 'Canceled', 'Failed', 'Reverted') AND company_id IN (SELECT id FROM company WHERE status = 'active') ORDER BY CASE WHEN origin = 'auto' THEN 0 ELSE 1 END, CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, created_at ASC", [])
 }
 
 # Partial update of the operator-editable issue fields.

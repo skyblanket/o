@@ -92,6 +92,54 @@ fun max_turns() {
     if (t == nil) { "50" } else { t }
 }
 
+# Consecutive no-signal days before the breaker pauses a company.
+# O_NO_SIGNAL_DAYS overrides; default 2.
+fun no_signal_days_threshold() {
+    v = getenv("O_NO_SIGNAL_DAYS")
+    if (v == nil) {
+        2
+    } else {
+        n = to_int(v)
+        if (n == nil) { 2 } else { n }
+    }
+}
+
+# ---- self-feedback: auto-file a follow-up issue --------------
+# The loop files its own follow-up work (a regression to fix, a repeated
+# stall, a no-signal diagnostic) as an origin='auto' issue that outranks
+# operator work. Two invariants live here:
+#   DEPTH-1 — a fix issue that itself fails must NOT spawn another fix
+#   issue (that is how a red loop becomes a fork bomb). If origin_issue is
+#   already origin 'auto' (STRING compare — DB value), skip entirely.
+#   nil origin_issue is operator-origin (the no-signal breaker), never depth.
+# The fingerprint (class ++ ":" ++ ident) is the dedup + cap key Store
+# enforces; this logs the outcome verb (created / duped / capped / skipped).
+fun auto_file(db, company_id, origin_issue, class, ident, title, body, priority) {
+    is_depth = if (origin_issue == nil) {
+        'false'
+    } else {
+        if (map_get(origin_issue, "origin") == "auto") { 'true' } else { 'false' }
+    }
+    if (is_depth == 'true') {
+        _a = Store.log_activity(db, company_id, "orchestrator", "selffile.skipped_depth", ident)
+        ""
+    } else {
+        fingerprint = class ++ ":" ++ ident
+        res = Store.issue_create_auto(db, company_id, title, body, priority, "auto", fingerprint)
+        if (res == nil) {
+            # Store guarded it: an OPEN issue with this fingerprint still
+            # exists -> deduped; none exists -> the daily cap tripped.
+            open_n = Store.issue_open_fp_count(db, company_id, fingerprint)
+            verb = if (open_n > 0) { "selffile.duped" } else { "selffile.capped" }
+            _a = Store.log_activity(db, company_id, "orchestrator", verb, fingerprint)
+            ""
+        } else {
+            _a = Store.log_activity(db, company_id, "orchestrator", "selffile.created", fingerprint)
+            res
+        }
+    }
+}
+
 # ---- small math helpers --------------------------------------
 fun pow2(k) {
     if (k <= 0) { 1 } else { 2 * pow2(k - 1) }
@@ -243,22 +291,40 @@ fun do_tick(db, tick_n, running, retry) {
     dispatch_batch(db, cands, slots, sr, sq, now)
 }
 
-# Daily rollover: reset per-day counters and lift daily-budget pauses.
-# Store.rollover_day returns the ids of companies it rolled; log one
-# budget.reset per company (actor budget-guard).
+# Daily rollover: reset per-day counters, lift daily-budget pauses, and run
+# the no-signal breaker. Store.rollover_day returns a per-company info map for
+# every company it rolled; for each we log budget.reset (actor budget-guard),
+# and when the no-signal breaker tripped we additionally log budget.no_signal
+# and auto-file a diagnostic issue so the pause is actionable, not silent.
 fun maybe_rollover(db, now) {
-    rolled = Store.rollover_day(db, now)
-    log_rolled(db, rolled)
+    rolled = Store.rollover_day(db, now, no_signal_days_threshold())
+    process_rolled(db, rolled)
 }
 
-fun log_rolled(db, ids) {
-    if (length(ids) == 0) {
+fun process_rolled(db, infos) {
+    if (length(infos) == 0) {
         ""
     } else {
-        cid = hd(ids)
+        info = hd(infos)
+        cid = map_get(info, "id")
         _a = Store.log_activity(db, cid, "budget-guard", "budget.reset", cid)
-        log_rolled(db, tl(ids))
+        _x = if (map_get(info, "result") == "paused") {
+            no_signal_filed(db, cid, map_get(info, "no_signal_days"))
+        } else {
+            ""
+        }
+        process_rolled(db, tl(infos))
     }
+}
+
+# The no-signal breaker fired: log it and auto-file an operator-origin
+# diagnostic (origin_issue nil, so the depth-1 rule does not apply).
+fun no_signal_filed(db, cid, days) {
+    _l = Store.log_activity(db, cid, "budget-guard", "budget.no_signal", cid)
+    title = f"No-signal breaker tripped for {cid}"
+    body = f"The no-signal circuit breaker paused company {cid}. For {days} consecutive day(s) the company spent at least 80% of its daily budget while producing ZERO verified-green merges. Investigate why work is burning budget without shipping green: failing verify command, an issue that never terminates, or a mis-scoped task. Clear pause_reason to resume."
+    _sf = auto_file(db, cid, nil, "no-signal", cid, title, body, "high")
+    ""
 }
 
 # Available dispatch slots this tick. Normally max_concurrent minus
@@ -297,6 +363,22 @@ fun default_phase(p) {
     if (p == nil) { 'agent' } else { p }
 }
 
+# Auto-file a "stall" diagnostic for an issue that exhausted its attempts on
+# repeated stalls. Reads the issue row for origin (depth-1 guard) + identifier
+# (the fingerprint ident). Best-effort: a vanished issue files nothing.
+fun file_stall(db, company_id, iid, phase) {
+    issue = Store.issue_row(db, iid)
+    if (issue == nil) {
+        ""
+    } else {
+        ident = str_or(map_get(issue, "identifier"), iid)
+        title = f"Repeated stall: {ident}"
+        body = f"Issue {ident} stalled in the {phase} phase and exhausted every retry attempt. The worker never reported completion within the phase's stall timeout. Investigate whether the task hangs the runtime (an unbounded command, a prompt the agent can't finish) or the verify/merge step wedges."
+        _sf = auto_file(db, company_id, issue, "stall", ident, title, body, "medium")
+        ""
+    }
+}
+
 # Walk running entries; kill + retry any past its phase's stall timeout. A
 # stalled verify (or merge) counts as a failed attempt like any other stall.
 fun sweep_stalls(db, ids, running, retry, now) {
@@ -315,11 +397,33 @@ fun sweep_stalls(db, ids, running, retry, now) {
             _k = if (wpid == nil) { "" } else { exit_proc(wpid, 'stalled') }
             ws = map_get(info, "workspace")
             _pk = if (ws == nil) { "" } else { elem(shell(f"pkill -f {ws}"), 1) }
-            _m = Store.run_finish(db, map_get(info, "run_id"), "Stalled", 0)
-            _a = Store.log_activity(db, "", "orchestrator", "run.stalled", iid)
+            run_id = map_get(info, "run_id")
+            company_id = map_get(info, "company_id")
+            # A stalled AGENT run has no cost written yet, so run_finish (which
+            # zeroes cost_cents) is correct. A stalled verify/merge run already
+            # had its cost written on entering that phase — use a state-only
+            # update so the sweep never clobbers that recorded spend to 0.
+            _m = if (phase == 'agent') {
+                Store.run_finish(db, run_id, "Stalled", 0)
+            } else {
+                Store.run_set_state(db, run_id, "Stalled")
+            }
+            _a = Store.log_activity(db, company_id, "orchestrator", "run.stalled", iid)
+            attempt = map_get(info, "attempt")
             running2 = map_remove(running, iid)
-            retry2 = schedule_retry(retry, iid, map_get(info, "attempt"), now)
-            sweep_stalls(db, tl(ids), running2, retry2, now)
+            if (attempt >= max_attempts()) {
+                # Repeated stall exhausted the final attempt — terminate the
+                # issue and auto-file a diagnostic so a chronically stalling
+                # task surfaces instead of silently ending Failed.
+                _is = Store.issue_set_status(db, iid, "Failed")
+                _fc = final_fail_cleanup(db, company_id, ws, run_id)
+                _a2 = Store.log_activity(db, company_id, "orchestrator", "run.failed_final", iid)
+                _sf = file_stall(db, company_id, iid, phase)
+                sweep_stalls(db, tl(ids), running2, retry, now)
+            } else {
+                retry2 = schedule_retry(retry, iid, attempt, now)
+                sweep_stalls(db, tl(ids), running2, retry2, now)
+            }
         } else {
             sweep_stalls(db, tl(ids), running, retry, now)
         }
@@ -1036,12 +1140,46 @@ fun handle_verify_done(db, running, retry, run_id, issue_id, verdict, tail) {
                 _is = Store.issue_set_status(db, issue_id, "Failed")
                 _fc = final_fail_cleanup(db, company_id, map_get(info, "workspace"), run_id)
                 _a2 = Store.log_activity(db, company_id, "orchestrator", "run.failed_final", issue_id)
+                _sf = file_verify_final(db, company_id, issue_id, verdict, tail)
                 %{running: map_remove(running, issue_id), retry: map_remove(retry, issue_id)}
             } else {
                 retry2 = schedule_retry(retry, issue_id, attempt, now)
                 %{running: map_remove(running, issue_id), retry: retry2}
             }
         }
+    }
+}
+
+# Auto-file a "verify-final" fix request for an issue that exhausted its
+# attempts against the grounded verifier. The body embeds the last verdict,
+# the verify output tail, and the branch that holds the (failing) work.
+fun file_verify_final(db, company_id, issue_id, verdict, tail) {
+    issue = Store.issue_row(db, issue_id)
+    if (issue == nil) {
+        ""
+    } else {
+        ident = str_or(map_get(issue, "identifier"), issue_id)
+        branch = f"o/{issue_id}"
+        title = f"Fix failing verification: {ident}"
+        body = f"Issue {ident} failed verification after every retry attempt. Final verdict: {verdict}. The work is on branch {branch}. Diagnose and fix so the verify command passes.\n\nVerify output tail:\n{tail}"
+        _sf = auto_file(db, company_id, issue, "verify-final", ident, title, body, "medium")
+        ""
+    }
+}
+
+# Auto-file a "revert" fix request for a change that merged clean but regressed
+# main and was reverted. High priority (main was broken); the body embeds the
+# reverted merge sha, the verify-main output tail, and the kept branch.
+fun file_revert(db, company_id, issue_id, merge_sha, branch, tail) {
+    issue = Store.issue_row(db, issue_id)
+    if (issue == nil) {
+        ""
+    } else {
+        ident = str_or(map_get(issue, "identifier"), issue_id)
+        title = f"Fix reverted regression: {ident}"
+        body = f"Issue {ident} merged clean but regressed main and was auto-reverted. The merge commit {merge_sha} was reverted with -m 1. The change is preserved on branch {branch}. Re-do it so it passes verification ON MAIN this time.\n\nVerify-on-main output tail:\n{tail}"
+        _sf = auto_file(db, company_id, issue, "revert", ident, title, body, "high")
+        ""
     }
 }
 
@@ -1170,21 +1308,42 @@ fun handle_merge_done(db, running, retry, run_id, issue_id, outcome, merge_sha, 
                     _is = Store.issue_set_status(db, issue_id, "Reverted")
                     _arch = archive_run(db, run_id, ws)
                     _wr = shell(f"git -C {repo} worktree remove {ws} --force")
-                    # TODO(phase4): auto-file a "fix the regression" issue here,
-                    # fingerprinted off merge_sha, pointing at the kept branch.
                     _a = Store.log_activity(db, company_id, "orchestrator", "merge.revert", issue_id)
+                    # Auto-file the regression fix, pointing at the kept branch.
+                    _sf = file_revert(db, company_id, issue_id, merge_sha, branch, tail)
                     %{running: map_remove(running, issue_id), retry: map_remove(retry, issue_id)}
                 } else {
-                    # "dirty" — repo was untouched. Re-queue the SAME merge job
-                    # (attempt NOT consumed); the entry stays phase 'merge' with a
-                    # fresh clock so the stall sweep's 20-min merge budget restarts.
-                    _a = Store.log_activity(db, company_id, "orchestrator", "merge.dirty", issue_id)
-                    verify_cmd = str_or(map_get(company, "verify_cmd"), "")
-                    base = detect_base(repo)
-                    job = %{run_id: run_id, issue_id: issue_id, ws: ws, repo: repo, base: base, branch: branch, verify_cmd: verify_cmd, timeout_s: verify_timeout_s()}
-                    _snd = send(whereis('merger'), {'merge', self(), job})
-                    info2 = map_put(info, "started_at", now)
-                    %{running: map_put(running, issue_id, info2), retry: map_remove(retry, issue_id)}
+                    # "dirty" — repo was untouched (dirty tree or a failed
+                    # checkout). Bounded: re-queue the SAME merge job (attempt NOT
+                    # consumed) up to 3 times; the entry stays phase 'merge' with a
+                    # fresh clock so the stall sweep's 20-min budget restarts. After
+                    # 3 requeues the repo is treated as wedged — a conflict-class
+                    # red that consumes an attempt so the issue can terminate.
+                    dc = map_get(info, "dirty_count")
+                    dcount = if (dc == nil) { 0 } else { dc }
+                    if (dcount >= 3) {
+                        _v = Store.run_set_verify(db, run_id, "conflict", "repo dirty / checkout failed after 3 requeues")
+                        _st = Store.run_set_state(db, run_id, "VerifyFailed")
+                        _a = Store.log_activity(db, company_id, "orchestrator", "merge.dirty_giveup", issue_id)
+                        attempt = map_get(info, "attempt")
+                        if (attempt >= max_attempts()) {
+                            _is = Store.issue_set_status(db, issue_id, "Failed")
+                            _fc = final_fail_cleanup(db, company_id, ws, run_id)
+                            _a2 = Store.log_activity(db, company_id, "orchestrator", "run.failed_final", issue_id)
+                            %{running: map_remove(running, issue_id), retry: map_remove(retry, issue_id)}
+                        } else {
+                            retry2 = schedule_retry(retry, issue_id, attempt, now)
+                            %{running: map_remove(running, issue_id), retry: retry2}
+                        }
+                    } else {
+                        _a = Store.log_activity(db, company_id, "orchestrator", "merge.dirty", issue_id)
+                        verify_cmd = str_or(map_get(company, "verify_cmd"), "")
+                        base = detect_base(repo)
+                        job = %{run_id: run_id, issue_id: issue_id, ws: ws, repo: repo, base: base, branch: branch, verify_cmd: verify_cmd, timeout_s: verify_timeout_s()}
+                        _snd = send(whereis('merger'), {'merge', self(), job})
+                        info2 = map_put(map_put(info, "started_at", now), "dirty_count", dcount + 1)
+                        %{running: map_put(running, issue_id, info2), retry: map_remove(retry, issue_id)}
+                    }
                 }
             }
         }
