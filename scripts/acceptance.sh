@@ -218,7 +218,44 @@ else
 fi
 
 # ============================================================
-# Stage 5 — regression drill: caught, reverted, fix filed, ranked first
+# Stage 4b — long verify survives (>120s commands)
+# ============================================================
+# Regression guard for the shell() 120s-cap bug class: swarmrt's plain shell()
+# hard-caps at 120s and orphans the child, which silently killed every real
+# (multi-minute) agent run while all-fast sim suites stayed green. The engine
+# now uses shell_managed for agent runs and verify commands; this stage proves
+# a verify that takes >120s still goes green through BOTH verify sites
+# (worktree verify + the merger's post-merge re-verify). Costs ~4.5 min.
+stage "stage 4b: >120s verify command survives (shell_managed, both verify sites)"
+LONGREPO="$TMP/longproj"
+mkdir -p "$LONGREPO"
+git -C "$LONGREPO" init -q -b main
+git -C "$LONGREPO" config user.email "o@example.com"
+git -C "$LONGREPO" config user.name "O Acceptance"
+printf '#!/bin/sh\nexit 0\n' > "$LONGREPO/verify.sh"
+git -C "$LONGREPO" add -A && git -C "$LONGREPO" commit -qm init
+resp="$(ocurl -s -X POST "$BASE/api/companies" -H 'Content-Type: application/json' \
+  -d '{"name":"LongVerify","issue_prefix":"LNG","repo":"'"$LONGREPO"'","verify_cmd":"sleep 130; sh verify.sh","budget_monthly_cents":100000}')"
+CID_LONG="$(jget "$resp" 'd["id"]')"
+[ -n "$CID_LONG" ] || die "long-verify company id missing"
+ocurl -s -X POST "$BASE/api/companies/$CID_LONG/agents" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"Slow","runtime":"sim","repo":"'"$LONGREPO"'"}' >/dev/null
+resp="$(ocurl -s -X POST "$BASE/api/companies/$CID_LONG/issues" \
+  -H 'Content-Type: application/json' -d '{"title":"[sim:good] add file"}')"
+IID_LONG="$(jget "$resp" 'd["id"]')"
+[ -n "$IID_LONG" ] || die "long-verify issue id missing"
+if wait_issue_status "$BASE" "$IID_LONG" "Done" 420; then
+  git -C "$LONGREPO" log --oneline main | grep "o/$IID_LONG" >/dev/null \
+    || die "no merge commit for o/$IID_LONG on long-verify main"
+  ok "130s verify went green in worktree AND post-merge; issue Done"
+  pass_stage
+else
+  cat "$TMP/daemon.log" | tail -30 || true; die ">120s verify did not survive (shell 120s-cap regression?)"
+fi
+
+# ============================================================
+# Stage 5 — regression drill: caught, reverted, fix issue ranked first
 # ============================================================
 stage "stage 5: regression -> auto-revert -> fix issue ranked first"
 # In real mode we need a deterministic sim agent to inject a known regression.

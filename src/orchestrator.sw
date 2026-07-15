@@ -597,7 +597,11 @@ fun run_claude_code(orch, run_id, issue_id, prompt, workspace, repo, session_id)
     # and session — parse_stream_* find it after the run.
     turns = max_turns()
     cmd = f"cd {workspace} && cat PROMPT.txt | {bin} -p{resume} --max-turns {turns} --dangerously-skip-permissions --verbose --output-format stream-json > stream.jsonl 2> err.log"
-    result = shell(cmd)
+    # shell_managed, NOT shell: plain shell() hard-caps at 120s and ORPHANS the
+    # child — a real agent run (minutes) would "crash" at 2min while claude kept
+    # working unsupervised. shell_managed owns the process group, enforces the
+    # timeout in C, and killpg's on expiry (exit 124), aligned with the sweeper.
+    result = shell_managed(cmd, stall_timeout())
     code = elem(result, 0)
     cost = parse_stream_cost(f"{workspace}/stream.jsonl")
     new_session = parse_stream_session(f"{workspace}/stream.jsonl")
@@ -705,7 +709,8 @@ fun run_swarm_code(orch, run_id, issue_id, prompt, workspace, repo) {
     _w = file_write(f"{workspace}/PROMPT.txt", prompt)
     bin = swarm_bin()
     cmd = f"cd {workspace} && cat PROMPT.txt | SWARM_CODE_CWD={workspace} {bin} -p --json > result.json 2> err.log"
-    result = shell(cmd)
+    # shell_managed: see run_claude_code — plain shell() caps at 120s + orphans.
+    result = shell_managed(cmd, stall_timeout())
     code = elem(result, 0)
     cost = swarm_flat_cents()
     if (code == 0) {
@@ -774,17 +779,17 @@ fun chat_worker(dbpath, agent_id, message) {
 fun chat_invoke(runtime, workspace, session_id) {
     if (runtime == "swarm-code") {
         bin = swarm_bin()
-        _r = shell(f"cd {workspace} && cat CHAT.txt | SWARM_CODE_CWD={workspace} {bin} -p --json > reply.json 2> err.log")
+        _r = shell_managed(f"cd {workspace} && cat CHAT.txt | SWARM_CODE_CWD={workspace} {bin} -p --json > reply.json 2> err.log", 300000)
         %{reply: chat_reply_swarm(f"{workspace}/reply.json"), session: ""}
     } else {
         bin = claude_bin()
         resume = if (string_length(session_id) > 0) { f" --resume {session_id}" } else { "" }
-        _r = shell(f"cd {workspace} && cat CHAT.txt | {bin} -p{resume} --dangerously-skip-permissions --output-format json > reply.json 2> err.log")
+        _r = shell_managed(f"cd {workspace} && cat CHAT.txt | {bin} -p{resume} --dangerously-skip-permissions --output-format json > reply.json 2> err.log", 300000)
         reply = chat_reply_claude(f"{workspace}/reply.json")
         if (reply == "(no reply)") {
             # the stored session was stale / not found in this dir —
             # retry once with a fresh session so chat never dead-ends.
-            _r2 = shell(f"cd {workspace} && cat CHAT.txt | {bin} -p --dangerously-skip-permissions --output-format json > reply.json 2> err.log")
+            _r2 = shell_managed(f"cd {workspace} && cat CHAT.txt | {bin} -p --dangerously-skip-permissions --output-format json > reply.json 2> err.log", 300000)
             %{reply: chat_reply_claude(f"{workspace}/reply.json"), session: parse_session(f"{workspace}/reply.json")}
         } else {
             %{reply: reply, session: parse_session(f"{workspace}/reply.json")}
@@ -866,7 +871,8 @@ fun reflect_worker(dbpath, company_id, port) {
         _w = file_write(f"{dir}/PROMPT.txt", prompt)
         bin = claude_bin()
         cmd = f"cd {dir} && cat PROMPT.txt | {bin} -p --dangerously-skip-permissions --max-turns 15 --verbose --output-format stream-json > stream.jsonl 2> err.log"
-        _r = shell(cmd)
+        # shell_managed: see run_claude_code — plain shell() caps at 120s + orphans.
+        _r = shell_managed(cmd, 600000)
         cost = parse_stream_cost(f"{dir}/stream.jsonl")
         send(whereis('orchestrator'), {'reflect_done', company_id, cost})
         ""
@@ -1140,11 +1146,15 @@ fun run_verify(orch, run_id, issue_id, ws, repo, base, verify_cmd, protected) {
             send(orch, {'verify_done', run_id, issue_id, "red_protected", ""})
         } else {
             logpath = f"{ws}/verify.log"
-            r = shell(timeout_cmd(verify_timeout_s(), verify_cmd, ws, logpath))
+            # shell_managed (not shell — 120s cap + orphaning) with a grace margin
+            # past the perl alarm: alarm fires first (exit 142); if it somehow
+            # doesn't, the C timeout killpg's the group (exit 124). NB
+            # verify_timeout_s() is a STRING (perl splice); the ms variant is int.
+            r = shell_managed(timeout_cmd(verify_timeout_s(), verify_cmd, ws, logpath), verify_timeout_ms())
             code = elem(r, 0)
             tail = tail_log(logpath)
             verdict = if (code == 0) { "green" } else {
-                if (code == 142) { "red_timeout" } else { "red_tests" }
+                if (code == 142 || code == 124) { "red_timeout" } else { "red_tests" }
             }
             send(orch, {'verify_done', run_id, issue_id, verdict, tail})
         }
@@ -1376,7 +1386,10 @@ fun do_merge(job) {
             } else {
                 sha = string_trim(elem(shell(f"git -C {repo} rev-parse HEAD"), 1))
                 logpath = f"{ws}/merge-verify.log"
-                vr = shell(timeout_cmd_in(repo, timeout_s, verify_cmd, logpath))
+                # shell_managed: see run_verify — plain shell() caps at 120s.
+                # timeout_s is the STRING seconds for the perl splice; the C-level
+                # backstop uses the int ms variant (perl alarm + 60s grace).
+                vr = shell_managed(timeout_cmd_in(repo, timeout_s, verify_cmd, logpath), verify_timeout_ms())
                 if (elem(vr, 0) == 0) {
                     %{outcome: "merged", sha: sha, tail: ""}
                 } else {
