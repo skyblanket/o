@@ -228,7 +228,7 @@
   }
 
   function onKey(e) {
-    if (e.altKey && e.shiftKey && (e.key === "A" || e.key === "a")) {
+    if (e.altKey && e.shiftKey && (e.code === "KeyA" || e.key === "A" || e.key === "a")) {
       e.preventDefault();
       toggle();
     } else if (e.key === "Escape" && active && !pendingTarget) {
