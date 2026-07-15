@@ -162,15 +162,58 @@ fun tick_loop(db, tick_n, running, retry) {
     }
 }
 
-# ---- one tick: reconcile, fetch, dispatch --------------------
+# ---- one tick: rollover, reconcile, fetch, dispatch ----------
 fun do_tick(db, tick_n, running, retry) {
     now = timestamp()
+    _rb = maybe_rollover(db, now)
     swept = sweep_stalls(db, map_keys(running), running, retry, now)
     sr = map_get(swept, "running")
     sq = map_get(swept, "retry")
     cands = Store.candidate_issues(db)
-    slots = max_concurrent() - map_size(sr)
+    slots = dispatch_slots(db, map_size(sr))
     dispatch_batch(db, cands, slots, sr, sq, now)
+}
+
+# Daily rollover: reset per-day counters and lift daily-budget pauses.
+# Store.rollover_day returns the ids of companies it rolled; log one
+# budget.reset per company (actor budget-guard).
+fun maybe_rollover(db, now) {
+    rolled = Store.rollover_day(db, now)
+    log_rolled(db, rolled)
+}
+
+fun log_rolled(db, ids) {
+    if (length(ids) == 0) {
+        ""
+    } else {
+        cid = hd(ids)
+        _a = Store.log_activity(db, cid, "budget-guard", "budget.reset", cid)
+        log_rolled(db, tl(ids))
+    }
+}
+
+# Available dispatch slots this tick. Normally max_concurrent minus
+# what is already running, but if the global daily spend cap
+# (O_GLOBAL_DAILY_CENTS) is set and already met, dispatch zero this
+# tick — stalls are still swept regardless.
+fun dispatch_slots(db, running_size) {
+    base = max_concurrent() - running_size
+    cap = getenv("O_GLOBAL_DAILY_CENTS")
+    if (cap == nil) {
+        base
+    } else {
+        limit = to_int(cap)
+        if (limit == nil) {
+            base
+        } else {
+            if (Store.global_spent_today(db) >= limit) {
+                _p = print(f"[orch] GLOBAL daily cap {limit}c reached — dispatching 0 slots this tick")
+                0
+            } else {
+                base
+            }
+        }
+    }
 }
 
 # Walk running entries; kill + retry any past the stall timeout.
@@ -414,10 +457,27 @@ fun run_swarm_code(orch, run_id, issue_id, prompt, workspace, repo) {
     cmd = f"cd {workspace} && cat PROMPT.txt | SWARM_CODE_CWD={workspace} {bin} -p --json > result.json 2> err.log"
     result = shell(cmd)
     code = elem(result, 0)
+    cost = swarm_flat_cents()
     if (code == 0) {
-        send(orch, {'run_done', run_id, issue_id, 'succeeded', 0, ""})
+        send(orch, {'run_done', run_id, issue_id, 'succeeded', cost, ""})
     } else {
-        send(orch, {'run_done', run_id, issue_id, 'crashed', 0, ""})
+        send(orch, {'run_done', run_id, issue_id, 'crashed', cost, ""})
+    }
+}
+
+# swarm-code reports neither cost nor tokens today, so a real run
+# would otherwise be charged 0 and bypass the budget guard entirely.
+# Charge a flat per-run estimate instead; O_SWARM_FLAT_CENTS overrides,
+# default 25.
+# TODO: replace with real token telemetry once swarm-code emits a
+# final usage event (mirror the claude-code stream-json result parse).
+fun swarm_flat_cents() {
+    v = getenv("O_SWARM_FLAT_CENTS")
+    if (v == nil) {
+        25
+    } else {
+        n = to_int(v)
+        if (n == nil) { 25 } else { n }
     }
 }
 

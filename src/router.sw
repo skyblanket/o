@@ -208,12 +208,21 @@ fun create_company(db, conn, body) {
         if (name == nil) {
             respond(conn, 400, err_json("field 'name' is required"))
         } else {
-            mission = default_str(map_get(data, "mission"), "")
-            prefix = default_str(map_get(data, "issue_prefix"), "TASK")
-            budget = default_num(map_get(data, "budget_monthly_cents"), 0)
-            id = Store.company_create(db, name, mission, prefix, budget)
-            _l = Store.log_activity(db, id, "operator", "company.create", id)
-            respond(conn, 201, json_encode(Store.company_row(db, id)))
+            repo = default_str(map_get(data, "repo"), "")
+            verr = validate_repo(repo)
+            if (string_length(verr) > 0) {
+                respond(conn, 400, err_json(verr))
+            } else {
+                mission = default_str(map_get(data, "mission"), "")
+                prefix = default_str(map_get(data, "issue_prefix"), "TASK")
+                budget = default_num(map_get(data, "budget_monthly_cents"), 0)
+                verify_cmd = default_str(map_get(data, "verify_cmd"), "")
+                protected_paths = default_str(map_get(data, "protected_paths"), "")
+                budget_daily = default_num(map_get(data, "budget_daily_cents"), 0)
+                id = Store.company_create(db, name, mission, prefix, budget, repo, verify_cmd, protected_paths, budget_daily)
+                _l = Store.log_activity(db, id, "operator", "company.create", id)
+                respond(conn, 201, json_encode(Store.company_row(db, id)))
+            }
         }
     }
 }
@@ -256,10 +265,19 @@ fun update_company(db, conn, id, body) {
         respond(conn, 404, err_json("company not found"))
     } else {
         data = json_decode(body)
-        budget = default_num(map_get(data, "budget_monthly_cents"), map_get(cur, "budget_monthly_cents"))
-        status = default_str(map_get(data, "status"), map_get(cur, "status"))
-        _u = Store.company_update(db, id, budget, status)
-        respond(conn, 200, json_encode(Store.company_row(db, id)))
+        repo = default_str(map_get(data, "repo"), map_get(cur, "repo"))
+        verr = validate_repo(repo)
+        if (string_length(verr) > 0) {
+            respond(conn, 400, err_json(verr))
+        } else {
+            budget = default_num(map_get(data, "budget_monthly_cents"), map_get(cur, "budget_monthly_cents"))
+            status = default_str(map_get(data, "status"), map_get(cur, "status"))
+            verify_cmd = default_str(map_get(data, "verify_cmd"), map_get(cur, "verify_cmd"))
+            protected_paths = default_str(map_get(data, "protected_paths"), map_get(cur, "protected_paths"))
+            budget_daily = default_num(map_get(data, "budget_daily_cents"), map_get(cur, "budget_daily_cents"))
+            _u = Store.company_update(db, id, budget, status, repo, verify_cmd, protected_paths, budget_daily)
+            respond(conn, 200, json_encode(Store.company_row(db, id)))
+        }
     }
 }
 

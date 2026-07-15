@@ -52,5 +52,26 @@ fun migrate(db) {
     # cannot resume a session captured inside an issue worktree.
     _alt_cs = db_exec(db, "ALTER TABLE agent ADD COLUMN chat_session_id TEXT DEFAULT ''")
 
+    # ---- self-improving loop columns (Phase 1) ----------------
+    # Each errors harmlessly if the column is already present, so
+    # migrate/1 stays idempotent for older control-plane databases.
+    _c_repo   = db_exec(db, "ALTER TABLE company ADD COLUMN repo TEXT DEFAULT ''")
+    _c_vcmd   = db_exec(db, "ALTER TABLE company ADD COLUMN verify_cmd TEXT DEFAULT ''")
+    _c_prot   = db_exec(db, "ALTER TABLE company ADD COLUMN protected_paths TEXT DEFAULT ''")
+    _c_bday   = db_exec(db, "ALTER TABLE company ADD COLUMN budget_daily_cents INTEGER DEFAULT 0")
+    _c_stoday = db_exec(db, "ALTER TABLE company ADD COLUMN spent_today_cents INTEGER DEFAULT 0")
+    _c_bdayn  = db_exec(db, "ALTER TABLE company ADD COLUMN budget_day INTEGER DEFAULT 0")
+    _c_prsn   = db_exec(db, "ALTER TABLE company ADD COLUMN pause_reason TEXT DEFAULT ''")
+    _c_greens = db_exec(db, "ALTER TABLE company ADD COLUMN greens_today INTEGER DEFAULT 0")
+    _c_nosig  = db_exec(db, "ALTER TABLE company ADD COLUMN no_signal_days INTEGER DEFAULT 0")
+    _c_lrefl  = db_exec(db, "ALTER TABLE company ADD COLUMN last_reflect_day INTEGER DEFAULT 0")
+
+    _i_orig   = db_exec(db, "ALTER TABLE issue ADD COLUMN origin TEXT DEFAULT 'operator'")
+    _i_fp     = db_exec(db, "ALTER TABLE issue ADD COLUMN fingerprint TEXT DEFAULT ''")
+
+    _r_vstate = db_exec(db, "ALTER TABLE run ADD COLUMN verify_state TEXT DEFAULT ''")
+    _r_vout   = db_exec(db, "ALTER TABLE run ADD COLUMN verify_output TEXT DEFAULT ''")
+    _r_msha   = db_exec(db, "ALTER TABLE run ADD COLUMN merge_sha TEXT DEFAULT ''")
+
     print("  schema     migrated (9 tables)")
 }

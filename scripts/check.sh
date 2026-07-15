@@ -152,5 +152,79 @@ assert "run.succeeded" in verbs, verbs
 PY
 pass "GET /api/activity contains run.succeeded"
 
+# ---- stage f: daily budget ledger — pause + rollover ---------
+# A company with budget_daily_cents=100 and a sim agent (each run
+# costs 300) must hard-stop on the DAILY cap after its first run,
+# with pause_reason="budget-daily". Rewinding budget_day by one day
+# then makes the next tick's rollover reset spent_today and un-pause.
+resp="$(curl -s -w $'\n%{http_code}' -X POST "$BASE/api/companies" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"Daily Co","issue_prefix":"DAY","budget_daily_cents":100}')"
+sc="$(printf '%s' "$resp" | tail -n1)"
+body="$(printf '%s' "$resp" | sed '$d')"
+[ "$sc" = "201" ] || { echo "$body"; fail "POST daily-budget company expected 201, got $sc"; }
+CID2="$(jget "$body" 'd["id"]')"
+python3 - "$body" <<'PY' || fail "created company missing budget_daily_cents field"
+import sys, json
+d = json.loads(sys.argv[1])
+assert d["budget_daily_cents"] == 100, d.get("budget_daily_cents")
+assert d["status"] == "active", d.get("status")
+PY
+pass "POST /api/companies daily budget -> 201 (id $CID2, budget_daily_cents=100)"
+
+curl -s -X POST "$BASE/api/companies/$CID2/agents" \
+  -H 'Content-Type: application/json' -d '{"name":"Dailysim","runtime":"sim"}' >/dev/null
+curl -s -X POST "$BASE/api/companies/$CID2/issues" \
+  -H 'Content-Type: application/json' -d '{"title":"burn"}' >/dev/null
+
+# Wait for the daily cap to hard-stop the company.
+paused_ok=""
+for _i in $(seq 1 60); do
+  body="$(curl -s "$BASE/api/companies/$CID2")"
+  st="$(jget "$body" 'd["status"]' 2>/dev/null || true)"
+  if [ "$st" = "paused" ]; then paused_ok="1"; break; fi
+  sleep 1
+done
+[ -n "$paused_ok" ] || { cat "$TMP/daemon.log" || true; fail "daily-budget company never paused (last status: ${st:-none})"; }
+body="$(curl -s "$BASE/api/companies/$CID2")"
+python3 - "$body" <<'PY' || fail "expected pause_reason=budget-daily"
+import sys, json
+d = json.loads(sys.argv[1])
+assert d["status"] == "paused", d.get("status")
+assert d["pause_reason"] == "budget-daily", d.get("pause_reason")
+assert d["spent_today_cents"] >= 100, d.get("spent_today_cents")
+PY
+pass "daily cap: company $CID2 paused with pause_reason=budget-daily"
+
+# Cancel the open issue so the rolled-over company has no candidate to
+# re-dispatch (which would re-charge 300 and re-pause) — we are
+# asserting the rollover reset, not the re-dispatch.
+IID2="$(jget "$(curl -s "$BASE/api/companies/$CID2/issues")" 'd[0]["id"]')"
+curl -s -X POST "$BASE/api/issues/$IID2" \
+  -H 'Content-Type: application/json' -d '{"status":"Canceled"}' >/dev/null
+
+# Rewind the ledger day; the next tick's rollover must reset + un-pause.
+sqlite3 "$TMP/o.db" "UPDATE company SET budget_day = budget_day - 1 WHERE id='$CID2'"
+
+rolled_ok=""
+for _i in $(seq 1 20); do
+  body="$(curl -s "$BASE/api/companies/$CID2")"
+  st="$(jget "$body" 'd["status"]' 2>/dev/null || true)"
+  sp="$(jget "$body" 'd["spent_today_cents"]' 2>/dev/null || true)"
+  if [ "$st" = "active" ] && [ "$sp" = "0" ]; then rolled_ok="1"; break; fi
+  sleep 1
+done
+[ -n "$rolled_ok" ] || { cat "$TMP/daemon.log" || true; fail "rollover never reset company $CID2 (status=${st:-none} spent_today=${sp:-none})"; }
+pass "rollover: company $CID2 active again, spent_today_cents=0"
+
+body="$(curl -s "$BASE/api/activity")"
+python3 - "$body" <<'PY' || fail "activity log missing budget.reset"
+import sys, json
+rows = json.loads(sys.argv[1])
+verbs = [r.get("verb") for r in rows]
+assert "budget.reset" in verbs, verbs
+PY
+pass "GET /api/activity contains budget.reset"
+
 echo
 echo "ALL GREEN"
