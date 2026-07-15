@@ -11,9 +11,11 @@ module Store
 
 export [next_id, companies, company_row, company_create, company_update,
         company_add_spend, enforce_budget, rollover_day, company_mark_green, global_spent_today,
+        company_touch_reflect, companies_to_reflect,
         issues_for, issue_row, issue_create, issue_create_auto, issue_open_fp_count,
-        issue_set_status, issue_assign, issue_update,
-        log_activity, activity_recent, candidate_issues,
+        issue_set_status, issue_assign, issue_update, open_issue_titles,
+        log_activity, activity_recent, activity_since, candidate_issues,
+        failed_runs_for,
         run_create, run_finish, run_set_state, run_set_verify, run_set_merge, last_run_for_issue, runs_all, run_row,
         agents_for, agent_row, agent_first_active, agent_create,
         agent_set_session, agent_set_chat_session,
@@ -161,6 +163,21 @@ fun global_spent_today(db) {
     if (length(rows) == 0) { 0 } else { map_get(hd(rows), "total") }
 }
 
+# ---- daily reflection (Phase 5) -------------------------------
+# Stamp last_reflect_day = today (epoch-day computed IN SQL, no sw float→int).
+# Called BEFORE the reflect worker is spawned, so reflection is at-most-once
+# per company per day even if the worker run itself fails.
+fun company_touch_reflect(db, id, now_ms) {
+    _u = db_query(db, "UPDATE company SET last_reflect_day = (? / 86400000), updated_at = ? WHERE id = ?", [now_ms, timestamp(), id])
+    id
+}
+
+# Active companies with a repo whose last_reflect_day is before today — the
+# candidates for a daily reflection pass. Epoch-day computed IN SQL.
+fun companies_to_reflect(db, now_ms) {
+    db_query(db, "SELECT id, name, repo FROM company WHERE status = 'active' AND repo != '' AND last_reflect_day < (? / 86400000)", [now_ms])
+}
+
 # ---- issues ---------------------------------------------------
 
 fun issues_for(db, company_id) {
@@ -275,6 +292,12 @@ fun candidate_issues(db) {
 fun issue_update(db, id, status, priority, assignee) {
     _u = db_query(db, "UPDATE issue SET status = ?, priority = ?, assignee_agent_id = ?, updated_at = ? WHERE id = ?", [status, priority, assignee, timestamp(), id])
     id
+}
+
+# Open (non-terminal) issue identifiers + titles for a company — the reflection
+# pass reads these so it never re-files work already tracked.
+fun open_issue_titles(db, company_id) {
+    db_query(db, "SELECT identifier, title, priority, origin, status FROM issue WHERE company_id = ? AND status NOT IN ('Done', 'Canceled', 'Failed', 'Reverted') ORDER BY created_at DESC LIMIT 50", [company_id])
 }
 
 # ---- agents ---------------------------------------------------
@@ -410,4 +433,16 @@ fun log_activity(db, company_id, actor, verb, target) {
 
 fun activity_recent(db) {
     db_query(db, "SELECT id, company_id, actor, verb, target, ts FROM activity ORDER BY ts DESC LIMIT 60", [])
+}
+
+# A company's activity since `since_ms` (the reflection pass reads the last 24h).
+fun activity_since(db, company_id, since_ms) {
+    db_query(db, "SELECT actor, verb, target, ts FROM activity WHERE company_id = ? AND ts >= ? ORDER BY ts DESC LIMIT 100", [company_id, since_ms])
+}
+
+# A company's failed / reverted / stalled runs, newest first, with the verify
+# verdict + output tail each carried — the grounded material the reflection pass
+# reasons over. Joined through issue to scope by company.
+fun failed_runs_for(db, company_id) {
+    db_query(db, "SELECT r.state AS state, r.verify_state AS verify_state, r.verify_output AS verify_output, i.identifier AS identifier, i.title AS title FROM run r JOIN issue i ON r.issue_id = i.id WHERE i.company_id = ? AND r.state IN ('Failed', 'Reverted', 'VerifyFailed', 'Stalled') ORDER BY r.started_at DESC LIMIT 20", [company_id])
 }

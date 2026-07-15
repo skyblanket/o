@@ -19,6 +19,8 @@ DAEMON_PID=""
 TMP=""
 DAEMON2_PID=""
 TMP2=""
+DAEMON3_PID=""
+TMP3=""
 
 cleanup() {
   if [ -n "$DAEMON_PID" ]; then
@@ -29,11 +31,18 @@ cleanup() {
     kill "$DAEMON2_PID" 2>/dev/null || true
     wait "$DAEMON2_PID" 2>/dev/null || true
   fi
+  if [ -n "$DAEMON3_PID" ]; then
+    kill "$DAEMON3_PID" 2>/dev/null || true
+    wait "$DAEMON3_PID" 2>/dev/null || true
+  fi
   if [ -n "$TMP" ]; then
     rm -rf "$TMP" 2>/dev/null || true
   fi
   if [ -n "$TMP2" ]; then
     rm -rf "$TMP2" 2>/dev/null || true
+  fi
+  if [ -n "$TMP3" ]; then
+    rm -rf "$TMP3" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
@@ -715,6 +724,100 @@ ndiag="$(sqlite3 "$TMP2/o.db" "SELECT COUNT(*) FROM issue WHERE company_id='$CID
 sqlite3 "$TMP2/o.db" "SELECT COUNT(*) FROM activity WHERE company_id='$CID_L' AND verb='budget.no_signal'" | grep -q '^1$' \
   || fail "no-signal: budget.no_signal not logged exactly once"
 pass "no-signal: 2nd rollover paused company (pause_reason=no-signal), diagnostic filed, budget.no_signal logged"
+
+# ============================================================
+# Phase-5 stage — daily reflection pass (3rd daemon, O_REFLECT=1)
+# ============================================================
+# A dedicated daemon with O_REFLECT=1 and a STUB claude binary. The stub
+# ignores its args, reads the prompt on stdin, files ONE reflect-origin issue
+# back through the daemon's REST API (the endpoint URL is scraped out of the
+# prompt), then emits a single stream-json result line reporting $0.05. The
+# company has a repo + verify_cmd but NO agent — so dispatch skips it and the
+# stage stays deterministic (nothing consumes the reflect-filed Backlog issue).
+TMP3="$(mktemp -d)"
+PORT3=$((4980 + RANDOM % 300))
+BASE3="http://127.0.0.1:${PORT3}"
+
+# The stub stands in for `claude -p`. It scrapes the /issues endpoint out of
+# the piped prompt and POSTs one reflect-origin issue, then prints the final
+# {type:result} event carrying a fixed $0.05 cost (parse_stream_cost -> 5c).
+cat > "$TMP3/claude-stub" <<'STUB'
+#!/usr/bin/env bash
+prompt="$(cat)"
+url="$(printf '%s' "$prompt" | grep -oE 'http://127[^ ]*/issues' | head -n1)"
+if [ -n "$url" ]; then
+  curl -s --max-time 10 -X POST "$url" -H 'Content-Type: application/json' \
+    -d '{"title":"stub reflection improvement","body":"filed by the reflect stub","priority":"medium","origin":"reflect"}' >/dev/null 2>&1 || true
+fi
+printf '%s\n' '{"type":"result","total_cost_usd":0.05,"session_id":"stub"}'
+exit 0
+STUB
+chmod +x "$TMP3/claude-stub"
+
+HOME="$TMP3" O_DB="$TMP3/o.db" O_PORT="$PORT3" O_NO_OPEN=1 O_REFLECT=1 \
+  O_CLAUDE_BIN="$TMP3/claude-stub" ./bin/swarmd >"$TMP3/daemon.log" 2>&1 &
+DAEMON3_PID=$!
+up3=""
+for _i in $(seq 1 30); do
+  if ! kill -0 "$DAEMON3_PID" 2>/dev/null; then cat "$TMP3/daemon.log" || true; fail "daemon3 exited during boot"; fi
+  code="$(ocurl -s -o /dev/null -w '%{http_code}' "$BASE3/api/health" 2>/dev/null || true)"
+  if [ "$code" = "200" ]; then up3="1"; break; fi
+  sleep 0.5
+done
+[ -n "$up3" ] || { cat "$TMP3/daemon.log" || true; fail "daemon3 health never reached 200 (port $PORT3)"; }
+pass "phase5 daemon up on port $PORT3 (O_REFLECT=1, stub claude)"
+
+# A scratch repo so the company qualifies for reflection (repo != '').
+SCRATCHR="$TMP3/projr"
+mkdir -p "$SCRATCHR"
+git -C "$SCRATCHR" init -q -b main
+git -C "$SCRATCHR" config user.email "o@example.com"
+git -C "$SCRATCHR" config user.name "O Test"
+cp "$SCRATCH/verify.sh" "$SCRATCHR/verify.sh"
+echo "reflect project" > "$SCRATCHR/README.md"
+git -C "$SCRATCHR" add -A
+git -C "$SCRATCHR" commit -q -m "seed reflect project"
+
+# Company WITH repo + verify_cmd but deliberately NO agent. A fresh company has
+# last_reflect_day=0 < today, so the very next tick reflects exactly once.
+resp="$(ocurl -s -w $'\n%{http_code}' -X POST "$BASE3/api/companies" \
+  -H 'Content-Type: application/json' \
+  -d "{\"name\":\"Reflect Co\",\"issue_prefix\":\"RFL\",\"budget_monthly_cents\":1000000,\"repo\":\"$SCRATCHR\",\"verify_cmd\":\"sh verify.sh\",\"protected_paths\":\"protected/\"}")"
+sc="$(printf '%s' "$resp" | tail -n1)"; body="$(printf '%s' "$resp" | sed '$d')"
+[ "$sc" = "201" ] || { echo "$body"; fail "POST reflect company expected 201, got $sc"; }
+CID_R="$(jget "$body" 'd["id"]')"
+[ -n "$CID_R" ] || fail "reflect company id missing"
+pass "phase5: reflect company $CID_R created (repo wired, no agent)"
+
+# Within a few ticks: reflect.spawn, reflect.filed and reflect.done all logged.
+reflect_ok=""
+for _i in $(seq 1 40); do
+  nsp="$(sqlite3 "$TMP3/o.db" "SELECT COUNT(*) FROM activity WHERE company_id='$CID_R' AND verb='reflect.spawn'")"
+  nfl="$(sqlite3 "$TMP3/o.db" "SELECT COUNT(*) FROM activity WHERE company_id='$CID_R' AND verb='reflect.filed'")"
+  ndn="$(sqlite3 "$TMP3/o.db" "SELECT COUNT(*) FROM activity WHERE company_id='$CID_R' AND verb='reflect.done'")"
+  if [ "${nsp:-0}" -ge 1 ] && [ "${nfl:-0}" -ge 1 ] && [ "${ndn:-0}" -ge 1 ]; then reflect_ok="1"; break; fi
+  sleep 1
+done
+[ -n "$reflect_ok" ] || { cat "$TMP3/daemon.log" || true; fail "reflect: expected reflect.spawn/filed/done (spawn=${nsp:-?} filed=${nfl:-?} done=${ndn:-?})"; }
+pass "reflect: reflect.spawn, reflect.filed and reflect.done all logged"
+
+# Exactly ONE reflect-origin issue was filed.
+nref="$(sqlite3 "$TMP3/o.db" "SELECT COUNT(*) FROM issue WHERE company_id='$CID_R' AND origin='reflect'")"
+[ "$nref" = "1" ] || { cat "$TMP3/daemon.log" || true; fail "reflect: expected exactly 1 origin=reflect issue, got ${nref}"; }
+pass "reflect: exactly one origin=reflect issue filed"
+
+# The stub's $0.05 was accounted onto the company (spent_today_cents == 5). The
+# agentless company runs nothing else, so 5 is the only spend.
+sp="$(jget "$(ocurl -s "$BASE3/api/companies/$CID_R")" 'd["spent_today_cents"]')"
+[ "$sp" = "5" ] || { cat "$TMP3/daemon.log" || true; fail "reflect: expected spent_today_cents=5 (0.05*100), got ${sp}"; }
+pass "reflect: reflection cost accounted (spent_today_cents=5)"
+
+# Reflection is at-most-once per day: last_reflect_day is stamped to today, and
+# only one reflect.spawn ever fires even across many subsequent ticks.
+sleep 6
+nsp2="$(sqlite3 "$TMP3/o.db" "SELECT COUNT(*) FROM activity WHERE company_id='$CID_R' AND verb='reflect.spawn'")"
+[ "$nsp2" = "1" ] || fail "reflect: expected exactly 1 reflect.spawn (at-most-once/day), got ${nsp2}"
+pass "reflect: at-most-once per day (single reflect.spawn after extra ticks)"
 
 echo
 echo "ALL GREEN"

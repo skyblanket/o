@@ -311,12 +311,28 @@ fun create_issue(db, conn, cid, body) {
         } else {
             ibody = default_str(map_get(data, "body"), "")
             priority = default_str(map_get(data, "priority"), "medium")
-            id = Store.issue_create(db, cid, title, ibody, priority)
-            if (id == nil) {
-                respond(conn, 404, err_json("company not found"))
+            # Only "reflect" is an honored self-origin over the API; any other
+            # value (or absence) is operator-filed. A reflect issue routes
+            # through the capped auto path with an EMPTY fingerprint (cap-only,
+            # no dedup — distinct reflections are allowed) and is logged as
+            # reflect.filed by the reflection actor.
+            raw_origin = default_str(map_get(data, "origin"), "operator")
+            if (raw_origin == "reflect") {
+                id = Store.issue_create_auto(db, cid, title, ibody, priority, "reflect", "")
+                if (id == nil) {
+                    respond(conn, 429, err_json("reflection cap reached"))
+                } else {
+                    _l = Store.log_activity(db, cid, "reflection", "reflect.filed", id)
+                    respond(conn, 201, json_encode(Store.issue_row(db, id)))
+                }
             } else {
-                _l = Store.log_activity(db, cid, "operator", "issue.create", id)
-                respond(conn, 201, json_encode(Store.issue_row(db, id)))
+                id = Store.issue_create(db, cid, title, ibody, priority)
+                if (id == nil) {
+                    respond(conn, 404, err_json("company not found"))
+                } else {
+                    _l = Store.log_activity(db, cid, "operator", "issue.create", id)
+                    respond(conn, 201, json_encode(Store.issue_row(db, id)))
+                }
             }
         }
     }

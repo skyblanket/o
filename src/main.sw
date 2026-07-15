@@ -48,9 +48,12 @@ fun main() {
     } else {
         register('idgen', spawn(idgen_loop(1)))
         Schema.migrate(db)
-        Orchestrator.start(dbpath)
-
+        # The port is resolved BEFORE the orchestrator starts so the tick loop
+        # can hand a reflection worker the daemon's own base URL (it files
+        # improvement issues back through the REST API on 127.0.0.1:{port}).
         port = resolve_port()
+        Orchestrator.start(dbpath, port)
+
         http_listen(port)
         print("")
         print("  O v4 - agent-company orchestrator")

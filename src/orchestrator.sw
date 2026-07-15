@@ -229,10 +229,12 @@ fun sim_cost() { 300 }
 # ---- startup -------------------------------------------------
 # Opens its own DB connection (separate from the HTTP loop's) so
 # the two processes never share a sqlite handle across schedulers.
-fun start(dbpath) {
+fun start(dbpath, port) {
     db = db_open(dbpath)
     _bt = db_exec(db, "PRAGMA busy_timeout=5000")
-    orch = spawn(tick_loop(db, 0, %{}, %{}))
+    # dbpath + port are threaded into the tick loop so do_tick can spawn a
+    # reflection worker its own DB connection string and the daemon's base URL.
+    orch = spawn(tick_loop(db, dbpath, port, 0, %{}, %{}))
     register('orchestrator', orch)
     # The merger is a SINGLE process, so every company's merges are serialized
     # through it: only one `git checkout main && merge` touches a repo at a
@@ -254,35 +256,39 @@ fun ticker_loop(orch, interval) {
 }
 
 # ---- the orchestrator process: single authority --------------
-fun tick_loop(db, tick_n, running, retry) {
+fun tick_loop(db, dbpath, port, tick_n, running, retry) {
     receive {
         'tick' ->
-            r = do_tick(db, tick_n, running, retry)
+            r = do_tick(db, dbpath, port, tick_n, running, retry)
             nr = map_get(r, "running")
             nq = map_get(r, "retry")
             rc = map_size(nr)
             qc = map_size(nq)
             print(f"[orch] tick {tick_n}  running={rc}  retry={qc}")
-            tick_loop(db, tick_n + 1, nr, nq)
+            tick_loop(db, dbpath, port, tick_n + 1, nr, nq)
         {'run_done', run_id, issue_id, outcome, cost, session_id} ->
             r = handle_done(db, running, retry, run_id, issue_id, outcome, cost, session_id)
-            tick_loop(db, tick_n, map_get(r, "running"), map_get(r, "retry"))
+            tick_loop(db, dbpath, port, tick_n, map_get(r, "running"), map_get(r, "retry"))
         {'verify_done', run_id, issue_id, verdict, tail} ->
             r = handle_verify_done(db, running, retry, run_id, issue_id, verdict, tail)
-            tick_loop(db, tick_n, map_get(r, "running"), map_get(r, "retry"))
+            tick_loop(db, dbpath, port, tick_n, map_get(r, "running"), map_get(r, "retry"))
         {'merge_done', run_id, issue_id, outcome, merge_sha, tail} ->
             r = handle_merge_done(db, running, retry, run_id, issue_id, outcome, merge_sha, tail)
-            tick_loop(db, tick_n, map_get(r, "running"), map_get(r, "retry"))
+            tick_loop(db, dbpath, port, tick_n, map_get(r, "running"), map_get(r, "retry"))
+        {'reflect_done', company_id, cost} ->
+            _rd = handle_reflect_done(db, company_id, cost)
+            tick_loop(db, dbpath, port, tick_n, running, retry)
         {'snapshot', from} ->
             send(from, {'snapshot_reply', %{tick: tick_n, running: map_size(running), retrying: map_size(retry), tick_interval_ms: tick_interval(), max_concurrent: max_concurrent()}})
-            tick_loop(db, tick_n, running, retry)
+            tick_loop(db, dbpath, port, tick_n, running, retry)
     }
 }
 
-# ---- one tick: rollover, reconcile, fetch, dispatch ----------
-fun do_tick(db, tick_n, running, retry) {
+# ---- one tick: rollover, reflect, reconcile, fetch, dispatch ----------
+fun do_tick(db, dbpath, port, tick_n, running, retry) {
     now = timestamp()
     _rb = maybe_rollover(db, now)
+    _rf = maybe_reflect(db, dbpath, port, now)
     swept = sweep_stalls(db, map_keys(running), running, retry, now)
     sr = map_get(swept, "running")
     sq = map_get(swept, "retry")
@@ -324,6 +330,46 @@ fun no_signal_filed(db, cid, days) {
     title = f"No-signal breaker tripped for {cid}"
     body = f"The no-signal circuit breaker paused company {cid}. For {days} consecutive day(s) the company spent at least 80% of its daily budget while producing ZERO verified-green merges. Investigate why work is burning budget without shipping green: failing verify command, an issue that never terminates, or a mis-scoped task. Clear pause_reason to resume."
     _sf = auto_file(db, cid, nil, "no-signal", cid, title, body, "high")
+    ""
+}
+
+# ---- daily reflection pass (Phase 5) -------------------------
+# Once a day, gated behind O_REFLECT=1, the loop reviews itself: for every
+# active company with a repo whose last_reflect_day is before today, it stamps
+# last_reflect_day = today FIRST (at-most-once even if the run fails), logs
+# reflect.spawn, and spawns a reflect_worker. The worker (its own DB handle,
+# reads only) composes a prompt from the last 24h and files improvement issues
+# back through the REST API, then reports its cost so the ORCHESTRATOR — the
+# sole DB writer — accounts the spend and logs reflect.done.
+fun maybe_reflect(db, dbpath, port, now) {
+    if (getenv("O_REFLECT") == "1") {
+        cands = Store.companies_to_reflect(db, now)
+        reflect_each(db, dbpath, port, cands, now)
+    } else {
+        ""
+    }
+}
+
+fun reflect_each(db, dbpath, port, cands, now) {
+    if (length(cands) == 0) {
+        ""
+    } else {
+        c = hd(cands)
+        cid = map_get(c, "id")
+        # Stamp the day BEFORE spawning: a crashed/never-finished reflection
+        # still consumes today's slot, so a wedged run can't re-spawn each tick.
+        _t = Store.company_touch_reflect(db, cid, now)
+        _l = Store.log_activity(db, cid, "orchestrator", "reflect.spawn", cid)
+        _s = spawn(reflect_worker(dbpath, cid, port))
+        reflect_each(db, dbpath, port, tl(cands), now)
+    }
+}
+
+# Sole DB writer for a completed reflection: account the (real) spend — which
+# may trip the budget guard — and log reflect.done. Workers never write.
+fun handle_reflect_done(db, company_id, cost) {
+    account_cost(db, company_id, cost)
+    _a = Store.log_activity(db, company_id, "orchestrator", "reflect.done", company_id)
     ""
 }
 
@@ -785,6 +831,94 @@ fun last_line(lines) {
     if (length(lines) == 0) { "" }
     else { if (length(lines) == 1) { hd(lines) }
     else { last_line(tl(lines)) }}
+}
+
+# ============================================================
+# Reflection worker (Phase 5)
+# ============================================================
+#
+# Spawned once a day per company. Opens its OWN db handle (chat_worker
+# pattern) for READS ONLY — it never writes the control plane. It gathers the
+# last 24h of activity, the failed/reverted runs with their verify tails, the
+# open issues and today's spend/greens, writes a PROMPT.txt, and runs a real
+# headless `claude -p` that files improvement issues back through the REST API
+# (origin=reflect). It parses the run's cost and reports it to the orchestrator,
+# which does the accounting + reflect.done log.
+fun reflect_worker(dbpath, company_id, port) {
+    db = db_open(dbpath)
+    _bt = db_exec(db, "PRAGMA busy_timeout=5000")
+    company = Store.company_row(db, company_id)
+    if (company == nil) {
+        ""
+    } else {
+        name = str_or(map_get(company, "name"), company_id)
+        repo = str_or(map_get(company, "repo"), "")
+        spent = map_get(company, "spent_today_cents")
+        greens = map_get(company, "greens_today")
+        since = timestamp() - 86400000
+        acts = Store.activity_since(db, company_id, since)
+        fails = Store.failed_runs_for(db, company_id)
+        issues = Store.open_issue_titles(db, company_id)
+        prompt = build_reflect_prompt(name, repo, port, company_id, spent, greens, acts, fails, issues)
+        home = getenv("HOME")
+        dir = f"{home}/.o/reflect/{company_id}"
+        _mk = shell(f"mkdir -p {dir}")
+        _w = file_write(f"{dir}/PROMPT.txt", prompt)
+        bin = claude_bin()
+        cmd = f"cd {dir} && cat PROMPT.txt | {bin} -p --dangerously-skip-permissions --max-turns 15 --verbose --output-format stream-json > stream.jsonl 2> err.log"
+        _r = shell(cmd)
+        cost = parse_stream_cost(f"{dir}/stream.jsonl")
+        send(whereis('orchestrator'), {'reflect_done', company_id, cost})
+        ""
+    }
+}
+
+# The reflection prompt. The instruction header is assembled by ++ concatenation
+# (not an f-string) so the JSON payload example's literal braces are never read
+# as interpolation; only the endpoint URL interpolates {port}/{company_id}. The
+# last-24h context is appended below it.
+fun build_reflect_prompt(name, repo, port, company_id, spent, greens, acts, fails, issues) {
+    url = f"http://127.0.0.1:{port}/api/companies/{company_id}/issues"
+    payload = "{\"title\":\"...\",\"body\":\"...\",\"priority\":\"medium\",\"origin\":\"reflect\"}"
+    head = "You are the daily reflection pass for company " ++ name ++ ", the autonomous maintainer of " ++ repo ++ ". Below is the last 24h: activity, failed/reverted runs with verify output, and currently open issues. Identify at most 3 concrete, high-value improvement issues — root causes behind repeated failures, flaky or slow verification, missing tests, recurring conflict hotspots. Do NOT duplicate an open issue. Do NOT modify any files. File each via: curl -s -X POST " ++ url ++ " -H 'Content-Type: application/json' -d '" ++ payload ++ "'. If nothing is worth filing, file nothing. Then reply DONE.\n\n"
+    stats = f"Today so far: spent {spent} cents, {greens} verified-green merges.\n\n"
+    a_sec = "== Activity (last 24h) ==\n" ++ fmt_activity(acts) ++ "\n"
+    f_sec = "== Failed / reverted runs ==\n" ++ fmt_fails(fails) ++ "\n"
+    i_sec = "== Currently open issues (do NOT duplicate) ==\n" ++ fmt_issues(issues) ++ "\n"
+    head ++ stats ++ a_sec ++ f_sec ++ i_sec
+}
+
+fun fmt_activity(rows) {
+    if (length(rows) == 0) {
+        "(none)\n"
+    } else {
+        r = hd(rows)
+        line = "- " ++ str_or(map_get(r, "actor"), "") ++ " " ++ str_or(map_get(r, "verb"), "") ++ " " ++ str_or(map_get(r, "target"), "") ++ "\n"
+        line ++ fmt_activity(tl(rows))
+    }
+}
+
+fun fmt_fails(rows) {
+    if (length(rows) == 0) {
+        "(none)\n"
+    } else {
+        r = hd(rows)
+        vs = str_or(map_get(r, "verify_state"), "")
+        vout = str_or(map_get(r, "verify_output"), "")
+        tail = if (string_length(vout) > 500) { string_sub(vout, string_length(vout) - 500, 500) } else { vout }
+        line = "- [" ++ str_or(map_get(r, "identifier"), "") ++ "] " ++ str_or(map_get(r, "title"), "") ++ " — state=" ++ str_or(map_get(r, "state"), "") ++ " verify=" ++ vs ++ "\n  output: " ++ tail ++ "\n"
+        line ++ fmt_fails(tl(rows))
+    }
+}
+
+fun fmt_issues(rows) {
+    if (length(rows) == 0) {
+        "(none)\n"
+    } else {
+        r = hd(rows)
+        line = "- [" ++ str_or(map_get(r, "identifier"), "") ++ "] " ++ str_or(map_get(r, "title"), "") ++ " (" ++ str_or(map_get(r, "priority"), "") ++ ", " ++ str_or(map_get(r, "origin"), "") ++ ", " ++ str_or(map_get(r, "status"), "") ++ ")\n"
+        line ++ fmt_issues(tl(rows))
+    }
 }
 
 # Create an isolated git worktree of `repo` for this issue, on a fresh
