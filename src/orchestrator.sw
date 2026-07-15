@@ -35,8 +35,62 @@ fun stall_timeout()  { 600000 }   # 10 min — real agent runs are slow
 fun backoff_base()   { 2000 }     # PRD: 10000
 fun max_backoff()    { 60000 }    # PRD: 300000
 fun max_attempts()   { 3 }        # after this many failed runs, the issue is marked Failed
-fun claude_bin()     { "/Users/sky/.local/bin/claude" }
-fun swarm_bin()      { "/Users/sky/swarm-code/bin/swarm-code" }
+
+# ---- runtime binary discovery --------------------------------
+# No absolute paths baked in: an explicit env override wins, then
+# `command -v` on PATH, then a conventional home-relative fallback.
+# Keeps the daemon portable across machines and CI.
+fun which_bin(cmd) {
+    r = shell(f"command -v {cmd}")
+    out = string_trim(elem(r, 1))
+    if (elem(r, 0) == 0) {
+        if (string_length(out) > 0) { out } else { "" }
+    } else {
+        ""
+    }
+}
+
+fun claude_bin() {
+    e = getenv("O_CLAUDE_BIN")
+    if (e == nil) {
+        found = which_bin("claude")
+        if (string_length(found) > 0) {
+            found
+        } else {
+            home = getenv("HOME")
+            f"{home}/.local/bin/claude"
+        }
+    } else {
+        e
+    }
+}
+
+fun swarm_bin() {
+    e = getenv("O_SWARM_BIN")
+    if (e == nil) {
+        found = which_bin("swarm-code")
+        if (string_length(found) > 0) {
+            found
+        } else {
+            found2 = which_bin("swarm")
+            if (string_length(found2) > 0) {
+                found2
+            } else {
+                home = getenv("HOME")
+                f"{home}/swarm-code/bin/swarm-code"
+            }
+        }
+    } else {
+        e
+    }
+}
+
+# Per-run cost ceiling for claude-code: --max-turns caps how many
+# agent turns a single issue run may take. O_MAX_TURNS overrides.
+fun max_turns() {
+    t = getenv("O_MAX_TURNS")
+    if (t == nil) { "50" } else { t }
+}
 
 # ---- small math helpers --------------------------------------
 fun pow2(k) {
@@ -248,7 +302,8 @@ fun run_claude_code(orch, run_id, issue_id, prompt, workspace, repo, session_id)
     # stream-json: one JSON event per turn so the UI can watch the
     # agent work live. The final {type:"result"} event carries cost
     # and session — parse_stream_* find it after the run.
-    cmd = f"cd {workspace} && cat PROMPT.txt | {bin} -p{resume} --dangerously-skip-permissions --verbose --output-format stream-json > stream.jsonl 2> err.log"
+    turns = max_turns()
+    cmd = f"cd {workspace} && cat PROMPT.txt | {bin} -p{resume} --max-turns {turns} --dangerously-skip-permissions --verbose --output-format stream-json > stream.jsonl 2> err.log"
     result = shell(cmd)
     code = elem(result, 0)
     cost = parse_stream_cost(f"{workspace}/stream.jsonl")

@@ -9,9 +9,14 @@ SOURCES := $(wildcard $(SRC_DIR)/*.sw)
 PREFIX  ?= $(HOME)/.local
 DATADIR := $(HOME)/.o
 
-.PHONY: all clean run install seed dev stop-dev logs
+.PHONY: all clean run install seed dev stop-dev logs check
 
 all: $(BIN)
+
+# Hermetic test suite — builds, boots a throwaway daemon on a random
+# port + temp DB, and drives the REST pipeline end to end.
+check: $(BIN)
+	@./scripts/check.sh
 
 $(BIN): $(SOURCES)
 	@mkdir -p bin
