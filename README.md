@@ -41,7 +41,7 @@ O builds with the swarmrt toolchain. Clone swarmrt as a sibling of this repo
 
 ```sh
 git clone https://github.com/skyblanket/swarmrt   # sibling of this repo
-git clone <this-repo> o
+git clone https://github.com/skyblanket/o
 cd o
 make                 # -> bin/swarmd   (or: make SWARMRT=/path/to/swarmrt)
 make check           # hermetic end-to-end test suite
@@ -57,7 +57,7 @@ open http://localhost:5173
 Point O at a repo it should maintain — including itself:
 
 ```sh
-./scripts/seed-maintainer.sh          # a "O Core" company that maintains this repo
+./scripts/seed-maintainer.sh          # an "O Core" company that maintains this repo
 ./scripts/seed-example.sh             # a sim-runtime demo company, no tokens spent
 ```
 
