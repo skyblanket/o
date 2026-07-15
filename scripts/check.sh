@@ -50,7 +50,10 @@ TMP="$(mktemp -d)"
 PORT=$((4200 + RANDOM % 400))
 BASE="http://127.0.0.1:${PORT}"
 
-O_DB="$TMP/o.db" O_PORT="$PORT" O_NO_OPEN=1 ./bin/swarmd >"$TMP/daemon.log" 2>&1 &
+# HOME is redirected into $TMP so the daemon's per-issue git worktrees
+# (created under $HOME/.o/workspaces by the verify gate below) land in the
+# throwaway dir and never touch the operator's live ~/.o state.
+HOME="$TMP" O_DB="$TMP/o.db" O_PORT="$PORT" O_NO_OPEN=1 ./bin/swarmd >"$TMP/daemon.log" 2>&1 &
 DAEMON_PID=$!
 
 up=""
@@ -225,6 +228,126 @@ verbs = [r.get("verb") for r in rows]
 assert "budget.reset" in verbs, verbs
 PY
 pass "GET /api/activity contains budget.reset"
+
+# ---- stage g: VERIFY GATE — grounded verifier -----------------
+# A scratch project repo whose verify.sh (a) fails when BREAK_VERIFY is
+# present and (b) fails when `boom` exists without PROMPT.txt (the phase-3
+# regression trap — green in the worktree where PROMPT.txt sits untracked).
+# A company points at it (repo + verify_cmd + protected_paths) with a sim
+# agent, and the repo-aware sim drives every verdict branch off the issue
+# title marker.
+SCRATCH="$TMP/proj"
+mkdir -p "$SCRATCH"
+git -C "$SCRATCH" init -q -b main
+git -C "$SCRATCH" config user.email "o@example.com"
+git -C "$SCRATCH" config user.name "O Test"
+cat > "$SCRATCH/verify.sh" <<'SH'
+#!/bin/sh
+if [ -f BREAK_VERIFY ]; then echo "BREAK_VERIFY present"; exit 1; fi
+if [ -f boom ] && [ ! -f PROMPT.txt ]; then echo "regression: boom without PROMPT.txt"; exit 1; fi
+exit 0
+SH
+echo "scratch verify-gate project" > "$SCRATCH/README.md"
+git -C "$SCRATCH" add -A
+git -C "$SCRATCH" commit -q -m "seed verify project"
+
+# company wired to the scratch repo + verify command + a protected prefix
+resp="$(curl -s -w $'\n%{http_code}' -X POST "$BASE/api/companies" \
+  -H 'Content-Type: application/json' \
+  -d "{\"name\":\"Verify Co\",\"issue_prefix\":\"VER\",\"budget_monthly_cents\":1000000,\"repo\":\"$SCRATCH\",\"verify_cmd\":\"sh verify.sh\",\"protected_paths\":\"protected/\"}")"
+sc="$(printf '%s' "$resp" | tail -n1)"
+body="$(printf '%s' "$resp" | sed '$d')"
+[ "$sc" = "201" ] || { echo "$body"; fail "POST verify-gate company expected 201, got $sc"; }
+CID3="$(jget "$body" 'd["id"]')"
+python3 - "$body" "$SCRATCH" <<'PY' || fail "verify-gate company fields wrong"
+import sys, json
+d = json.loads(sys.argv[1])
+assert d["repo"] == sys.argv[2], d.get("repo")
+assert d["verify_cmd"] == "sh verify.sh", d.get("verify_cmd")
+assert d["protected_paths"] == "protected/", d.get("protected_paths")
+PY
+pass "POST /api/companies verify-gate -> 201 (id $CID3, repo wired)"
+
+curl -s -X POST "$BASE/api/companies/$CID3/agents" \
+  -H 'Content-Type: application/json' -d '{"name":"Versim","runtime":"sim"}' >/dev/null
+pass "verify-gate sim agent hired"
+
+# fire all four marker issues up front so they process concurrently
+mk_issue() {
+  local resp
+  resp="$(curl -s -X POST "$BASE/api/companies/$CID3/issues" \
+    -H 'Content-Type: application/json' -d "{\"title\":\"$1\"}")"
+  jget "$resp" 'd["id"]'
+}
+IID_GOOD="$(mk_issue '[sim:good] add file')"
+IID_NC="$(mk_issue '[sim:no-commit] nothing')"
+IID_PROT="$(mk_issue '[sim:protected] sneaky')"
+IID_BAD="$(mk_issue '[sim:bad-verify] break')"
+for x in "$IID_GOOD" "$IID_NC" "$IID_PROT" "$IID_BAD"; do
+  [ -n "$x" ] || fail "verify-gate issue id missing"
+done
+pass "verify-gate issues created (good/no-commit/protected/bad-verify)"
+
+# wait_status <iid> <want> <max-seconds>
+wait_status() {
+  local st=""
+  for _i in $(seq 1 "$3"); do
+    st="$(jget "$(curl -s "$BASE/api/issues/$1")" 'd["status"]' 2>/dev/null || true)"
+    if [ "$st" = "$2" ]; then return 0; fi
+    sleep 1
+  done
+  echo "  last status of $1: ${st:-none}"
+  return 1
+}
+
+# last run's verify_state for an issue, read straight from the control plane
+last_verify_state() {
+  sqlite3 "$TMP/o.db" "SELECT verify_state FROM run WHERE issue_id='$1' ORDER BY started_at DESC LIMIT 1"
+}
+
+# [sim:good] — a real commit that passes verify.sh -> Done
+if wait_status "$IID_GOOD" "Done" 90; then
+  pass "verify-gate: [sim:good] reached Done"
+else
+  cat "$TMP/daemon.log" || true; fail "[sim:good] never reached Done"
+fi
+
+# [sim:no-commit] — 3 attempts, each red_no_commit, then Failed
+if wait_status "$IID_NC" "Failed" 120; then
+  vs="$(last_verify_state "$IID_NC")"
+  [ "$vs" = "red_no_commit" ] || fail "[sim:no-commit] last verify_state expected red_no_commit, got '$vs'"
+  pass "verify-gate: [sim:no-commit] Failed with verify_state=red_no_commit"
+else
+  cat "$TMP/daemon.log" || true; fail "[sim:no-commit] never reached Failed"
+fi
+
+# [sim:protected] — commit under protected/ -> red_protected, Failed
+if wait_status "$IID_PROT" "Failed" 120; then
+  vs="$(last_verify_state "$IID_PROT")"
+  [ "$vs" = "red_protected" ] || fail "[sim:protected] last verify_state expected red_protected, got '$vs'"
+  pass "verify-gate: [sim:protected] Failed with verify_state=red_protected"
+else
+  cat "$TMP/daemon.log" || true; fail "[sim:protected] never reached Failed"
+fi
+
+# [sim:bad-verify] — commit BREAK_VERIFY -> verify.sh fails -> red_tests, Failed
+if wait_status "$IID_BAD" "Failed" 120; then
+  vs="$(last_verify_state "$IID_BAD")"
+  [ "$vs" = "red_tests" ] || fail "[sim:bad-verify] last verify_state expected red_tests, got '$vs'"
+  pass "verify-gate: [sim:bad-verify] Failed with verify_state=red_tests"
+else
+  cat "$TMP/daemon.log" || true; fail "[sim:bad-verify] never reached Failed"
+fi
+
+# activity records both a pass and a fail
+body="$(curl -s "$BASE/api/activity")"
+python3 - "$body" <<'PY' || fail "verify-gate activity missing verify.pass / verify.fail"
+import sys, json
+verbs = [r.get("verb") for r in json.loads(sys.argv[1])]
+assert "verify.pass" in verbs, verbs
+assert "verify.fail" in verbs, verbs
+PY
+pass "GET /api/activity contains verify.pass and verify.fail"
 
 echo
 echo "ALL GREEN"

@@ -13,7 +13,7 @@ export [next_id, companies, company_row, company_create, company_update,
         company_add_spend, enforce_budget, rollover_day, company_mark_green, global_spent_today,
         issues_for, issue_row, issue_create, issue_set_status, issue_assign, issue_update,
         log_activity, activity_recent, candidate_issues,
-        run_create, run_finish, runs_all, run_row,
+        run_create, run_finish, run_set_state, run_set_verify, last_run_for_issue, runs_all, run_row,
         agents_for, agent_row, agent_first_active, agent_create,
         agent_set_session, agent_set_chat_session,
         message_create, messages_for,
@@ -176,7 +176,7 @@ fun issue_assign(db, id, agent_id) {
 # Non-terminal issues belonging to ACTIVE companies (a paused company
 # — budget hard-stop — yields no candidates). Priority, then age.
 fun candidate_issues(db) {
-    db_query(db, "SELECT id, company_id, identifier, title, body, status, priority, assignee_agent_id, sort_order, origin, fingerprint FROM issue WHERE status NOT IN ('Done', 'Canceled', 'Failed') AND company_id IN (SELECT id FROM company WHERE status = 'active') ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, created_at ASC", [])
+    db_query(db, "SELECT id, company_id, identifier, title, body, status, priority, assignee_agent_id, sort_order, origin, fingerprint FROM issue WHERE status NOT IN ('Done', 'Canceled', 'Failed', 'Reverted') AND company_id IN (SELECT id FROM company WHERE status = 'active') ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, created_at ASC", [])
 }
 
 # Partial update of the operator-editable issue fields.
@@ -245,6 +245,29 @@ fun run_create(db, issue_id, agent_id, attempt, state, workspace_path) {
 fun run_finish(db, run_id, state, cost_cents) {
     _u = db_query(db, "UPDATE run SET state = ?, ended_at = ?, cost_cents = CAST(ROUND(?) AS INTEGER) WHERE id = ?", [state, timestamp(), cost_cents, run_id])
     run_id
+}
+
+# Set ONLY the run's lifecycle state — never touches cost_cents. Used to
+# advance a run out of "Verifying" (whose cost was already written when it
+# entered the verify phase) without run_finish clobbering that cost to 0.
+fun run_set_state(db, run_id, state) {
+    _u = db_query(db, "UPDATE run SET state = ? WHERE id = ?", [state, run_id])
+    run_id
+}
+
+# Record the grounded verifier's verdict + a tail of its output. Output is
+# hard-truncated to ~4KB so a runaway test log can't bloat the control plane.
+fun run_set_verify(db, run_id, state, output) {
+    tail = string_truncate(output, 4096)
+    _u = db_query(db, "UPDATE run SET verify_state = ?, verify_output = ? WHERE id = ?", [state, tail, run_id])
+    run_id
+}
+
+# The latest run for an issue by start time — carries the verify verdict +
+# output the next attempt's structured-retry prompt reads. nil if none.
+fun last_run_for_issue(db, issue_id) {
+    rows = db_query(db, "SELECT id, issue_id, agent_id, attempt, state, verify_state, verify_output, started_at FROM run WHERE issue_id = ? ORDER BY started_at DESC LIMIT 1", [issue_id])
+    if (length(rows) == 0) { nil } else { hd(rows) }
 }
 
 fun runs_all(db) {
