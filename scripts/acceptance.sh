@@ -259,7 +259,13 @@ fi
 # ============================================================
 stage "stage 5: regression -> auto-revert -> fix issue ranked first"
 # In real mode we need a deterministic sim agent to inject a known regression.
+# The claude Builder must be retired FIRST: pick_agent falls back to the
+# company's first active agent, so an unassigned [sim:regress] issue would
+# otherwise dispatch to claude (which can't act out the sim marker — burns
+# real tokens, never reverts). Retiring via the temp DB is race-free against
+# the 5s tick, unlike create-then-assign.
 if [ "$MODE" = "real" ]; then
+  sqlite3 "$TMP/o.db" "UPDATE agent SET status='retired' WHERE company_id='$CID' AND runtime='claude-code';"
   ocurl -s -X POST "$BASE/api/companies/$CID/agents" \
     -H 'Content-Type: application/json' \
     -d '{"name":"Regressor","runtime":"sim","repo":"'"$SCRATCH"'"}' >/dev/null
