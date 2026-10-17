@@ -15,12 +15,12 @@ fi
 
 extract_id() { sed -n 's/.*"id":"\([^"]*\)".*/\1/p'; }
 
-CO=$(curl -s -X POST "$API/api/companies" \
+CO=$(curl -s -X POST "$API/api/companies" -H "Content-Type: application/json" ${O_API_TOKEN:+-H "Authorization: Bearer $O_API_TOKEN"} \
   -d '{"name":"Demo Co","mission":"prove O v4 runs a company end to end","issue_prefix":"DEMO","budget_monthly_cents":100000}' \
   | extract_id)
 echo "created company  Demo Co  ($CO)"
 
-curl -s -X POST "$API/api/companies/$CO/agents" \
+curl -s -X POST "$API/api/companies/$CO/agents" -H "Content-Type: application/json" ${O_API_TOKEN:+-H "Authorization: Bearer $O_API_TOKEN"} \
   -d '{"name":"Pilot","role":"engineer","runtime":"sim"}' >/dev/null
 echo "hired agent      Pilot (sim runtime)"
 
@@ -32,7 +32,7 @@ for title in \
   "Fix the flaky checkout test" \
   "Plan the launch announcement"
 do
-  curl -s -X POST "$API/api/companies/$CO/issues" \
+  curl -s -X POST "$API/api/companies/$CO/issues" -H "Content-Type: application/json" ${O_API_TOKEN:+-H "Authorization: Bearer $O_API_TOKEN"} \
     -d "{\"title\":\"$title\",\"priority\":\"medium\"}" >/dev/null
   echo "filed issue      $title"
 done

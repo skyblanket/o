@@ -35,8 +35,8 @@ export [serve]
 # not be shared across processes).
 fun serve(db, dbpath) {
     receive {
-        {'http_request', conn, method, path, _hdrs, body} ->
-            dispatch(db, dbpath, conn, method, path, body)
+        {'http_request', conn, method, path, hdrs, body} ->
+            dispatch(db, dbpath, conn, method, path, hdrs, body)
             serve(db, dbpath)
     }
 }
@@ -80,11 +80,74 @@ fun orch_snapshot(conn) {
 
 # ---- dispatch ------------------------------------------------
 
-fun dispatch(db, dbpath, conn, method, path, body) {
+# Write guards, in order:
+#   OPTIONS — a CORS preflight is answered only for a loopback Origin, so a
+#             random web page in the operator's browser can't get a JSON write
+#             through (the UI and the feedback widget run on localhost).
+#   415     — every write must be Content-Type: application/json. That forces
+#             a browser preflight, closing the "simple request" (text/plain
+#             form post) hole that skips CORS entirely.
+#   401     — when O_API_TOKEN is set, company + agent + approval writes need
+#             `Authorization: Bearer <token>`. Agent runs never see the token
+#             (it is stripped from their env), so an agent cannot rewrite the
+#             verify_cmd / protected_paths that gate its own merges. Filing
+#             issues and feedback stays open: that is how reflection reports.
+fun dispatch(db, dbpath, conn, method, path, hdrs, body) {
     if (method == 'OPTIONS') {
-        http_respond(conn, 204, json_headers(), "")
+        if (loopback_origin(hdr(hdrs, "origin")) == 'true') {
+            http_respond(conn, 204, json_headers(), "")
+        } else {
+            http_respond(conn, 403, "Content-Type: application/json\r\n", err_json("cross-origin request refused"))
+        }
     } else {
-        route(db, dbpath, conn, method, path, body)
+        if (method == 'GET') {
+            route(db, dbpath, conn, method, path, body)
+        } else {
+            if (string_starts_with(hdr(hdrs, "content-type"), "application/json") == 'false') {
+                respond(conn, 415, err_json("writes require Content-Type: application/json"))
+            } else {
+                if (token_ok(path, hdrs) == 'false') {
+                    respond(conn, 401, err_json("this write requires Authorization: Bearer $O_API_TOKEN"))
+                } else {
+                    route(db, dbpath, conn, method, path, body)
+                }
+            }
+        }
+    }
+}
+
+# Header lookup (keys arrive lowercased); missing -> "".
+fun hdr(hdrs, k) {
+    v = if (hdrs == nil) { nil } else { map_get(hdrs, k) }
+    if (v == nil) { "" } else { v }
+}
+
+# No Origin (curl, the reflection worker) or a loopback one.
+fun loopback_origin(o) {
+    if (string_length(o) == 0) { 'true' }
+    else { if (string_starts_with(o, "http://localhost") == 'true') { 'true' }
+    else { if (string_starts_with(o, "http://127.0.0.1") == 'true') { 'true' }
+    else { 'false' }}}
+}
+
+# Writes that stay open even with a token set: filing issues and feedback.
+fun open_write(path) {
+    if (string_ends_with(path, "/issues") == 'true') { 'true' }
+    else { if (string_ends_with(path, "/feedback") == 'true') { 'true' }
+    else { if (string_ends_with(path, "/chat") == 'true') { 'true' }
+    else { 'false' }}}
+}
+
+fun token_ok(path, hdrs) {
+    tok = getenv("O_API_TOKEN")
+    if (tok == nil) {
+        'true'
+    } else {
+        if (open_write(path) == 'true') {
+            'true'
+        } else {
+            if (hdr(hdrs, "authorization") == "Bearer " ++ tok) { 'true' } else { 'false' }
+        }
     }
 }
 

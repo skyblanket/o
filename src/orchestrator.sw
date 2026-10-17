@@ -222,6 +222,26 @@ fun dispatch_prompt(db, iid, title, body, repo, attempt) {
     }
 }
 
+# A run killed on its wall-clock cap never emits its final result event, so
+# its real cost is unknowable — yet it is usually the MOST expensive kind of
+# run. Charge a pessimistic flat estimate so the budget guard still sees it.
+# O_TIMEOUT_FLAT_CENTS overrides; default 300.
+fun timeout_flat_cents() {
+    v = getenv("O_TIMEOUT_FLAT_CENTS")
+    if (v == nil) {
+        300
+    } else {
+        n = to_int(v)
+        if (n == nil) { 300 } else { n }
+    }
+}
+
+# The cost a finished worker reports: the parsed cost, unless the run was
+# killed (exit 124) and reported none.
+fun run_cost(code, parsed) {
+    if (code == 124 && parsed == 0) { timeout_flat_cents() } else { parsed }
+}
+
 # sim runtime reports a fixed fake cost so budget enforcement can be
 # exercised without real spend. claude-code reports its true cost.
 fun sim_cost() { 300 }
@@ -402,7 +422,7 @@ fun dispatch_slots(db, running_size) {
 # phase-3 merge gets 20 min. A missing phase (legacy entry) reads as 'agent'.
 fun phase_timeout(phase) {
     if (phase == 'verify') { verify_timeout_ms() }
-    else { if (phase == 'merge') { 1200000 } else { stall_timeout() } }
+    else { if (phase == 'merge') { 1200000 } else { stall_timeout() + 60000 } }
 }
 
 fun default_phase(p) {
@@ -449,8 +469,12 @@ fun sweep_stalls(db, ids, running, retry, now) {
             # zeroes cost_cents) is correct. A stalled verify/merge run already
             # had its cost written on entering that phase — use a state-only
             # update so the sweep never clobbers that recorded spend to 0.
+            # A wedged agent worker (it outlived its own shell_managed cap plus
+            # slack) is charged the timeout estimate so the spend isn't invisible.
             _m = if (phase == 'agent') {
-                Store.run_finish(db, run_id, "Stalled", 0)
+                est = timeout_flat_cents()
+                _f = Store.run_finish(db, run_id, "Stalled", est)
+                account_cost(db, company_id, est)
             } else {
                 Store.run_set_state(db, run_id, "Stalled")
             }
@@ -595,21 +619,33 @@ fun run_claude_code(orch, run_id, issue_id, prompt, workspace, repo, session_id)
     # stream-json: one JSON event per turn so the UI can watch the
     # agent work live. The final {type:"result"} event carries cost
     # and session — parse_stream_* find it after the run.
-    turns = max_turns()
-    cmd = f"cd {workspace} && cat PROMPT.txt | {bin} -p{resume} --max-turns {turns} --dangerously-skip-permissions --verbose --output-format stream-json > stream.jsonl 2> err.log"
-    # shell_managed, NOT shell: plain shell() hard-caps at 120s and ORPHANS the
-    # child — a real agent run (minutes) would "crash" at 2min while claude kept
-    # working unsupervised. shell_managed owns the process group, enforces the
-    # timeout in C, and killpg's on expiry (exit 124), aligned with the sweeper.
-    result = shell_managed(cmd, stall_timeout())
+    first = claude_once(workspace, bin, resume)
+    # Claude sessions are scoped to the directory they were created in, and
+    # every issue gets its own worktree — so resuming the agent's session from
+    # a previous issue can fail outright ("No conversation found"). A resumed
+    # run that dies without producing a session is retried once fresh, so a
+    # stale id can't crash every run the agent is handed.
+    stale = string_length(resume) > 0 && elem(first, 0) != 0 && elem(first, 0) != 124 && string_length(parse_stream_session(f"{workspace}/stream.jsonl")) == 0
+    result = if (stale) { claude_once(workspace, bin, "") } else { first }
     code = elem(result, 0)
-    cost = parse_stream_cost(f"{workspace}/stream.jsonl")
+    cost = run_cost(code, parse_stream_cost(f"{workspace}/stream.jsonl"))
     new_session = parse_stream_session(f"{workspace}/stream.jsonl")
     if (code == 0) {
         send(orch, {'run_done', run_id, issue_id, 'succeeded', cost, new_session})
     } else {
         send(orch, {'run_done', run_id, issue_id, 'crashed', cost, new_session})
     }
+}
+
+# One headless claude run in the workspace, streaming events to stream.jsonl.
+# shell_managed, NOT shell: plain shell() hard-caps at 120s and ORPHANS the
+# child — a real agent run (minutes) would "crash" at 2min while claude kept
+# working unsupervised. shell_managed owns the process group, enforces the
+# timeout in C, and killpg's on expiry (exit 124), ahead of the sweeper.
+fun claude_once(workspace, bin, resume) {
+    turns = max_turns()
+    cmd = f"cd {workspace} && cat PROMPT.txt | env -u O_API_TOKEN {bin} -p{resume} --max-turns {turns} --dangerously-skip-permissions --verbose --output-format stream-json > stream.jsonl 2> err.log"
+    shell_managed(cmd, stall_timeout())
 }
 
 # Parse total_cost_usd from a claude-code result.json -> cents.
@@ -708,11 +744,11 @@ fun run_swarm_code(orch, run_id, issue_id, prompt, workspace, repo) {
     }
     _w = file_write(f"{workspace}/PROMPT.txt", prompt)
     bin = swarm_bin()
-    cmd = f"cd {workspace} && cat PROMPT.txt | SWARM_CODE_CWD={workspace} {bin} -p --json > result.json 2> err.log"
+    cmd = f"cd {workspace} && cat PROMPT.txt | env -u O_API_TOKEN SWARM_CODE_CWD={workspace} {bin} -p --json > result.json 2> err.log"
     # shell_managed: see run_claude_code — plain shell() caps at 120s + orphans.
     result = shell_managed(cmd, stall_timeout())
     code = elem(result, 0)
-    cost = swarm_flat_cents()
+    cost = if (code == 124) { timeout_flat_cents() } else { swarm_flat_cents() }
     if (code == 0) {
         send(orch, {'run_done', run_id, issue_id, 'succeeded', cost, ""})
     } else {
@@ -779,17 +815,17 @@ fun chat_worker(dbpath, agent_id, message) {
 fun chat_invoke(runtime, workspace, session_id) {
     if (runtime == "swarm-code") {
         bin = swarm_bin()
-        _r = shell_managed(f"cd {workspace} && cat CHAT.txt | SWARM_CODE_CWD={workspace} {bin} -p --json > reply.json 2> err.log", 300000)
+        _r = shell_managed(f"cd {workspace} && cat CHAT.txt | env -u O_API_TOKEN SWARM_CODE_CWD={workspace} {bin} -p --json > reply.json 2> err.log", 300000)
         %{reply: chat_reply_swarm(f"{workspace}/reply.json"), session: ""}
     } else {
         bin = claude_bin()
         resume = if (string_length(session_id) > 0) { f" --resume {session_id}" } else { "" }
-        _r = shell_managed(f"cd {workspace} && cat CHAT.txt | {bin} -p{resume} --dangerously-skip-permissions --output-format json > reply.json 2> err.log", 300000)
+        _r = shell_managed(f"cd {workspace} && cat CHAT.txt | env -u O_API_TOKEN {bin} -p{resume} --dangerously-skip-permissions --output-format json > reply.json 2> err.log", 300000)
         reply = chat_reply_claude(f"{workspace}/reply.json")
         if (reply == "(no reply)") {
             # the stored session was stale / not found in this dir —
             # retry once with a fresh session so chat never dead-ends.
-            _r2 = shell_managed(f"cd {workspace} && cat CHAT.txt | {bin} -p --dangerously-skip-permissions --output-format json > reply.json 2> err.log", 300000)
+            _r2 = shell_managed(f"cd {workspace} && cat CHAT.txt | env -u O_API_TOKEN {bin} -p --dangerously-skip-permissions --output-format json > reply.json 2> err.log", 300000)
             %{reply: chat_reply_claude(f"{workspace}/reply.json"), session: parse_session(f"{workspace}/reply.json")}
         } else {
             %{reply: reply, session: parse_session(f"{workspace}/reply.json")}
@@ -870,7 +906,7 @@ fun reflect_worker(dbpath, company_id, port) {
         _mk = shell(f"mkdir -p {dir}")
         _w = file_write(f"{dir}/PROMPT.txt", prompt)
         bin = claude_bin()
-        cmd = f"cd {dir} && cat PROMPT.txt | {bin} -p --dangerously-skip-permissions --max-turns 15 --verbose --output-format stream-json > stream.jsonl 2> err.log"
+        cmd = f"cd {dir} && cat PROMPT.txt | env -u O_API_TOKEN {bin} -p --dangerously-skip-permissions --max-turns 15 --verbose --output-format stream-json > stream.jsonl 2> err.log"
         # shell_managed: see run_claude_code — plain shell() caps at 120s + orphans.
         _r = shell_managed(cmd, 600000)
         cost = parse_stream_cost(f"{dir}/stream.jsonl")
@@ -988,8 +1024,9 @@ fun sim_marker(title) {
     if (string_contains(title, "[sim:no-commit]") == 'true') { "no-commit" }
     else { if (string_contains(title, "[sim:bad-verify]") == 'true') { "bad-verify" }
     else { if (string_contains(title, "[sim:protected]") == 'true') { "protected" }
+    else { if (string_contains(title, "[sim:protected-rename]") == 'true') { "protected-rename" }
     else { if (string_contains(title, "[sim:regress]") == 'true') { "regress" }
-    else { "good" }}}}
+    else { "good" }}}}}
 }
 
 # Carry out the marker's action in the worktree. Every case except no-commit
@@ -1005,10 +1042,16 @@ fun sim_act(workspace, issue_id, marker, protected) {
             if (marker == "protected") {
                 sim_commit(workspace, f"{first_prefix(protected)}sneak.txt", "sneak")
             } else {
+                if (marker == "protected-rename") {
+                    # move an EXISTING protected file out of the fence
+                    _mv = shell(f"cd {workspace} && git mv {first_prefix(protected)}keep.txt moved.txt && git commit -q -m sim-rename")
+                    ""
+                } else {
                 if (marker == "regress") {
                     sim_commit(workspace, "boom", "boom")
                 } else {
                     sim_commit(workspace, f"sim_{issue_id}.txt", "ok")
+                }
                 }
             }
         }
@@ -1140,7 +1183,10 @@ fun run_verify(orch, run_id, issue_id, ws, repo, base, verify_cmd, protected) {
     if (count == "0") {
         send(orch, {'verify_done', run_id, issue_id, "red_no_commit", ""})
     } else {
-        rd = shell(f"git -C {ws} diff --name-only {base}...HEAD")
+        # --no-renames: with rename detection on (git's default), a moved file
+        # lists only its NEW path, so `git mv tests/heldout/x y` would slip a
+        # protected file out of the fence. Report both sides as delete + add.
+        rd = shell(f"git -C {ws} diff --no-renames --name-only {base}...HEAD")
         files = string_split(string_trim(elem(rd, 1)), "\n")
         if (any_protected(files, protected) == 'true') {
             send(orch, {'verify_done', run_id, issue_id, "red_protected", ""})

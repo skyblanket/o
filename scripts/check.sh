@@ -113,6 +113,19 @@ CID="$(jget "$body" 'd["id"]')"
 [ -n "$CID" ] || fail "company id missing in create response"
 pass "POST /api/companies -> 201 (id $CID)"
 
+# write guards: a non-JSON write is refused (it would skip the browser's CORS
+# preflight), and a preflight is only answered for a loopback Origin.
+sc="$(ocurl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/companies/$CID" \
+  -H 'Content-Type: text/plain' -d '{"verify_cmd":"true"}')"
+[ "$sc" = "415" ] || fail "text/plain write expected 415, got $sc"
+sc="$(ocurl -s -o /dev/null -w '%{http_code}' -X OPTIONS "$BASE/api/companies/$CID" \
+  -H 'Origin: https://evil.example')"
+[ "$sc" = "403" ] || fail "foreign-origin preflight expected 403, got $sc"
+sc="$(ocurl -s -o /dev/null -w '%{http_code}' -X OPTIONS "$BASE/api/companies/$CID" \
+  -H 'Origin: http://localhost:5173')"
+[ "$sc" = "204" ] || fail "loopback preflight expected 204, got $sc"
+pass "write guards: 415 non-JSON, 403 foreign preflight, 204 loopback preflight"
+
 # create agent (sim runtime)
 resp="$(ocurl -s -w $'\n%{http_code}' -X POST "$BASE/api/companies/$CID/agents" \
   -H 'Content-Type: application/json' \
@@ -347,6 +360,8 @@ if [ -f boom ] && [ ! -f PROMPT.txt ]; then echo "regression: boom without PROMP
 exit 0
 SH
 echo "scratch verify-gate project" > "$SCRATCH/README.md"
+mkdir -p "$SCRATCH/protected"
+echo "fenced" > "$SCRATCH/protected/keep.txt"
 git -C "$SCRATCH" add -A
 git -C "$SCRATCH" commit -q -m "seed verify project"
 
@@ -382,7 +397,8 @@ IID_GOOD="$(mk_issue '[sim:good] add file')"
 IID_NC="$(mk_issue '[sim:no-commit] nothing')"
 IID_PROT="$(mk_issue '[sim:protected] sneaky')"
 IID_BAD="$(mk_issue '[sim:bad-verify] break')"
-for x in "$IID_GOOD" "$IID_NC" "$IID_PROT" "$IID_BAD"; do
+IID_REN="$(mk_issue '[sim:protected-rename] move it out')"
+for x in "$IID_GOOD" "$IID_NC" "$IID_PROT" "$IID_BAD" "$IID_REN"; do
   [ -n "$x" ] || fail "verify-gate issue id missing"
 done
 pass "verify-gate issues created (good/no-commit/protected/bad-verify)"
@@ -463,6 +479,16 @@ if wait_status "$IID_PROT" "Failed" 120; then
   pass "verify-gate: [sim:protected] Failed with verify_state=red_protected"
 else
   cat "$TMP/daemon.log" || true; fail "[sim:protected] never reached Failed"
+fi
+
+# [sim:protected-rename] — git mv a protected file OUT of the fence. Rename
+# detection would list only the new path; the gate must still see the delete.
+if wait_status "$IID_REN" "Failed" 120; then
+  vs="$(last_verify_state "$IID_REN")"
+  [ "$vs" = "red_protected" ] || fail "[sim:protected-rename] last verify_state expected red_protected, got '$vs'"
+  pass "verify-gate: [sim:protected-rename] Failed with verify_state=red_protected"
+else
+  cat "$TMP/daemon.log" || true; fail "[sim:protected-rename] never reached Failed"
 fi
 
 # [sim:bad-verify] — commit BREAK_VERIFY -> verify.sh fails -> red_tests, Failed
