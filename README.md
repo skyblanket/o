@@ -82,6 +82,11 @@ The control plane lives at `~/.o/o.db`; per-issue worktrees live under
 
 O edits real repositories on its own. The guard rails are the point.
 
+- **Agent sandbox (Linux, `O_SANDBOX=bwrap`).** Agent and reviewer runs see a
+  read-only filesystem. They can write only their own worktree, the repo's
+  `.git` (with `config` and `hooks` kept read-only, since both can make git run
+  commands), `~/.claude` and `/tmp`. `~/.o` is hidden, and a private PID
+  namespace keeps the daemon's environment (and `O_API_TOKEN`) out of reach.
 - **Grounded verifier.** A change is judged only by running the company's real
   `verify_cmd` in the worktree — never by the agent's own claim of success. A run
   that makes no commit, that touches a protected path, or whose verify command
@@ -234,6 +239,8 @@ The daemon reads its configuration from the environment. All are optional.
 | `O_GH_POLL_S` | `60` | GitHub issue poll interval. |
 | `O_CI_POLL_S` / `O_CI_TIMEOUT_S` | `30` / `3600` | PR check poll interval / give-up deadline (`red_timeout`). |
 | `O_CI_SETTLE_S` | `30` | how long a PR with no checks reported waits before counting as "no CI, green". |
+| `O_SANDBOX` | unset | `bwrap` confines agent + reviewer runs with bubblewrap (Linux). |
+| `O_SANDBOX_RW` | unset | extra comma-separated paths the sandbox keeps writable, if your agent CLI needs them. |
 | `O_VERIFY_RERUNS` | `1` | post-merge verify re-runs before a red result counts as a regression. |
 
 ## API
@@ -259,14 +266,15 @@ curl http://localhost:4100/api/activity       # activity log
 
 - **Single-node.** One daemon, one SQLite control plane, one machine. There is no
   clustering and no multi-writer coordination.
-- **The machine is the trust boundary.** Agents run with
-  `--dangerously-skip-permissions` inside their worktrees — they can run arbitrary
-  commands as your user. Protected paths and the verify gate constrain what
-  *merges*, not what an agent may *do* while working. Run O only against repos and
-  on machines where that is acceptable.
-- **The API token is a same-user guard, not a sandbox.** Agents run as your user,
-  so a determined agent could read the token from the daemon's environment.
-  Bind the API to localhost and set `O_API_TOKEN`.
+- **Without `O_SANDBOX` the machine is the trust boundary.** Agents run with
+  `--dangerously-skip-permissions`, so they can run arbitrary commands as your
+  user. Protected paths and the verify gate constrain what *merges*, not what an
+  agent may *do* while working. Turn on `O_SANDBOX=bwrap` on Linux. Even then
+  network access stays open (the agent needs the model API), and macOS has no
+  sandbox backend yet.
+- **The API token needs the sandbox to be airtight.** Unsandboxed agents run as
+  your user and could read the token out of the daemon's environment. With
+  `O_SANDBOX=bwrap` they can't. Either way, bind the API to localhost.
 - **swarm-code cost is estimated.** swarm-code emits no usage telemetry yet, so
   its runs are metered at a flat per-run estimate (`O_SWARM_FLAT_CENTS`) rather
   than true token cost.

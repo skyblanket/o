@@ -14,6 +14,8 @@ export interface Company {
   repo: string; verify_cmd: string; protected_paths: string;
   budget_daily_cents: number; spent_today_cents: number; budget_day: number;
   pause_reason: string; greens_today: number; no_signal_days: number;
+  // GitHub in/out: issues imported from github_repo; ship "merge" | "pr"
+  github_repo: string; ship: string;
 }
 export interface Issue {
   id: string; company_id: string; identifier: string; title: string; body: string;

@@ -95,6 +95,50 @@ fun agent_env() {
     "env -u O_API_TOKEN -u CLAUDECODE -u CLAUDE_CODE_SESSION_ID -u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_REMOTE_SESSION_ID"
 }
 
+# ---- agent sandbox (O_SANDBOX=bwrap) --------------------------
+# Without a sandbox an agent runs as your user and can touch anything you can.
+# With O_SANDBOX=bwrap every agent and reviewer run gets:
+#   - a read-only view of the whole filesystem;
+#   - write access only to its own worktree, the repo's .git (commits from a
+#     worktree land there), ~/.claude (the CLI's session state) and /tmp;
+#   - .git/config and .git/hooks re-mounted READ-ONLY on top: both can make
+#     git run commands (hooks, core.fsmonitor, aliases), which O's own git
+#     calls on the main repo would otherwise execute outside the sandbox;
+#   - ~/.o (control-plane DB, other issues' worktrees) hidden behind a tmpfs;
+#   - a private PID namespace, so swarmd's environment (O_API_TOKEN) is not
+#     readable through /proc.
+# Mount order matters: /tmp and O_SANDBOX_RW go first, then the repo is
+# re-mounted read-only (it may live under /tmp), then .git is opened back up.
+# Network stays on: the agent needs the model API. Returns a command prefix
+# ("" when sandboxing is off), spliced in AFTER agent_env(): bwrap's own init
+# process lives inside the PID namespace, so it must already be scrubbed.
+# O_SANDBOX_RW: extra comma-separated paths to keep writable (for whatever a
+# given machine's agent CLI needs, e.g. a cgroup path); missing paths are
+# skipped.
+fun extra_rw_binds(v) {
+    if (v == nil) { "" } else { rw_each(clean_prefixes(string_split(v, ","))) }
+}
+
+fun rw_each(paths) {
+    if (length(paths) == 0) { "" } else {
+        p = hd(paths)
+        f" --bind-try {sq(p)} {sq(p)}" ++ rw_each(tl(paths))
+    }
+}
+
+fun sandbox_prefix(ws, repo) {
+    if (getenv("O_SANDBOX") == "bwrap" && string_length(repo) > 0) {
+        home = getenv("HOME")
+        git = f"{repo}/.git"
+        "bwrap --die-with-parent --unshare-pid --ro-bind / / --dev /dev --proc /proc --bind /tmp /tmp" ++ extra_rw_binds(getenv("O_SANDBOX_RW")) ++
+            f" --ro-bind {sq(repo)} {sq(repo)} --tmpfs {sq(home)}/.o --bind {sq(ws)} {sq(ws)}" ++
+            f" --bind {sq(git)} {sq(git)} --ro-bind-try {sq(git)}/config {sq(git)}/config --ro-bind-try {sq(git)}/hooks {sq(git)}/hooks" ++
+            f" --bind-try {sq(home)}/.claude {sq(home)}/.claude --bind-try {sq(home)}/.claude.json {sq(home)}/.claude.json -- "
+    } else {
+        ""
+    }
+}
+
 # Per-run cost ceiling for claude-code: --max-turns caps how many
 # agent turns a single issue run may take. O_MAX_TURNS overrides.
 fun max_turns() {
@@ -680,7 +724,8 @@ fun run_claude_code(orch, run_id, issue_id, prompt, workspace, repo, session_id,
     # stream-json: one JSON event per turn so the UI can watch the
     # agent work live. The final {type:"result"} event carries cost
     # and session — parse_stream_* find it after the run.
-    first = claude_once(workspace, bin, resume)
+    sbx = sandbox_prefix(workspace, repo)
+    first = claude_once(workspace, bin, resume, sbx)
     # A stored session id can go stale (session pruned, CLI or machine
     # changed, or an inherited parent id — see agent_env), and `--resume`
     # then fails before doing any work: "No conversation found". Retry once
@@ -688,7 +733,7 @@ fun run_claude_code(orch, run_id, issue_id, prompt, workspace, repo, session_id,
     # failed resume still emits a result event echoing the bad id, so the
     # stderr message — not a missing session — is the signal.)
     stale = string_length(resume) > 0 && elem(first, 0) != 0 && string_contains(file_read(f"{workspace}/err.log"), "No conversation found") == 'true'
-    result = if (stale) { claude_once(workspace, bin, "") } else { first }
+    result = if (stale) { claude_once(workspace, bin, "", sbx) } else { first }
     code = elem(result, 0)
     cost = run_cost(code, parse_stream_cost(f"{workspace}/stream.jsonl"))
     new_session = parse_stream_session(f"{workspace}/stream.jsonl")
@@ -704,9 +749,9 @@ fun run_claude_code(orch, run_id, issue_id, prompt, workspace, repo, session_id,
 # child — a real agent run (minutes) would "crash" at 2min while claude kept
 # working unsupervised. shell_managed owns the process group, enforces the
 # timeout in C, and killpg's on expiry (exit 124), ahead of the sweeper.
-fun claude_once(workspace, bin, resume) {
+fun claude_once(workspace, bin, resume, sbx) {
     turns = max_turns()
-    cmd = f"cd {workspace} && cat PROMPT.txt | {agent_env()} {bin} -p{resume} --max-turns {turns} --dangerously-skip-permissions --verbose --output-format stream-json > stream.jsonl 2> err.log"
+    cmd = f"cd {workspace} && cat PROMPT.txt | {agent_env()} {sbx}{bin} -p{resume} --max-turns {turns} --dangerously-skip-permissions --verbose --output-format stream-json > stream.jsonl 2> err.log"
     shell_managed(cmd, stall_timeout())
 }
 
@@ -806,7 +851,7 @@ fun run_swarm_code(orch, run_id, issue_id, prompt, workspace, repo, start) {
     }
     _w = file_write(f"{workspace}/PROMPT.txt", prompt)
     bin = swarm_bin()
-    cmd = f"cd {workspace} && cat PROMPT.txt | {agent_env()} SWARM_CODE_CWD={workspace} {bin} -p --json > result.json 2> err.log"
+    cmd = f"cd {workspace} && cat PROMPT.txt | {agent_env()} SWARM_CODE_CWD={workspace} {sandbox_prefix(workspace, repo)}{bin} -p --json > result.json 2> err.log"
     # shell_managed: see run_claude_code — plain shell() caps at 120s + orphans.
     result = shell_managed(cmd, stall_timeout())
     code = elem(result, 0)
@@ -1473,7 +1518,7 @@ fun start_review(db, running, retry, info, run_id, issue_id, now) {
     ws = map_get(info, "workspace")
     base = company_base(company, repo)
     _a = Store.log_activity(db, company_id, "orchestrator", "review.start", issue_id)
-    rpid = spawn(review_worker(self(), run_id, issue_id, ws, base, title, body))
+    rpid = spawn(review_worker(self(), run_id, issue_id, ws, repo, base, title, body))
     info2 = %{run_id: run_id, worker_pid: rpid, started_at: now, attempt: map_get(info, "attempt"), company_id: company_id, agent_id: map_get(info, "agent_id"), phase: 'review', workspace: ws}
     %{running: map_put(running, issue_id, info2), retry: map_remove(retry, issue_id)}
 }
@@ -1499,7 +1544,7 @@ fun handle_review_done(db, running, retry, run_id, issue_id, approved, reason, c
 # Read-only reviewer: the diff vs base + the issue go in REVIEW.txt; claude
 # runs in the worktree with only read tools allowed, and must answer with a
 # first line of APPROVE or REJECT: <reason>.
-fun review_worker(orch, run_id, issue_id, ws, base, title, body) {
+fun review_worker(orch, run_id, issue_id, ws, repo, base, title, body) {
     rd = shell(f"git -C {ws} diff --no-renames {base}...HEAD")
     raw = elem(rd, 1)
     diff = if (string_length(raw) > 60000) { string_sub(raw, 0, 60000) ++ "\n[diff truncated]" } else { raw }
@@ -1507,7 +1552,7 @@ fun review_worker(orch, run_id, issue_id, ws, base, title, body) {
     bin = claude_bin()
     model = getenv("O_REVIEW_MODEL")
     mflag = if (model == nil) { "" } else { f" --model {sq(model)}" }
-    cmd = f"cd {ws} && cat REVIEW.txt | {agent_env()} {bin} -p{mflag} --max-turns 10 --allowedTools Read,Grep,Glob --output-format json > review.json 2> review.err"
+    cmd = f"cd {ws} && cat REVIEW.txt | {agent_env()} {sandbox_prefix(ws, repo)}{bin} -p{mflag} --max-turns 10 --allowedTools Read,Grep,Glob --output-format json > review.json 2> review.err"
     r = shell_managed(cmd, stall_timeout())
     cost = run_cost(elem(r, 0), parse_cost(f"{ws}/review.json"))
     verdict = string_trim(chat_reply_claude(f"{ws}/review.json"))

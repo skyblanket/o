@@ -23,6 +23,8 @@ DAEMON3_PID=""
 TMP3=""
 DAEMON4_PID=""
 TMP4=""
+DAEMON5_PID=""
+TMP5=""
 
 cleanup() {
   if [ -n "$DAEMON_PID" ]; then
@@ -46,6 +48,13 @@ cleanup() {
   if [ -n "$DAEMON4_PID" ]; then
     kill "$DAEMON4_PID" 2>/dev/null || true
     wait "$DAEMON4_PID" 2>/dev/null || true
+  fi
+  if [ -n "$DAEMON5_PID" ]; then
+    kill "$DAEMON5_PID" 2>/dev/null || true
+    wait "$DAEMON5_PID" 2>/dev/null || true
+  fi
+  if [ -n "$TMP5" ]; then
+    rm -rf "$TMP5" 2>/dev/null || true
   fi
   if [ -n "$TMP4" ]; then
     rm -rf "$TMP4" 2>/dev/null || true
@@ -1147,6 +1156,73 @@ wait_status_at "$BASE4" "$IID_BLK" "In Review" 90 || { tail -40 "$TMP4/daemon.lo
 sleep 6
 [ "$(sqlite3 "$TMP4/o.db" "SELECT status FROM issue WHERE id='$IID_BLK'")" = "In Review" ] || fail "github: In Review issue was re-dispatched"
 pass "github: merge refused by branch policy -> parked In Review, not re-dispatched"
+
+# ============================================================
+# Agent sandbox — 5th daemon, O_SANDBOX=bwrap + O_API_TOKEN
+# ============================================================
+# A stub claude-code agent probes its own confinement and commits the results.
+# Expected: the main checkout, the control-plane DB, .git/hooks and .git/config
+# are not writable, ~/.o is hidden, and no process it can see carries
+# O_API_TOKEN, yet its commit in the worktree still lands and merges. The
+# daemon runs with O_API_TOKEN set, so the token guard is exercised for real.
+# Skipped (with a note) where unprivileged bwrap can't run.
+if command -v bwrap >/dev/null 2>&1 && bwrap --ro-bind / / --unshare-pid --proc /proc true 2>/dev/null; then
+TMP5="$(mktemp -d)"
+PORT5=$((5650 + RANDOM % 300))
+BASE5="http://127.0.0.1:${PORT5}"
+TOK="sbx-test-token"
+SCRATCHS="$TMP5/projs"
+mkdir -p "$SCRATCHS" "$TMP5/.o"
+git -C "$SCRATCHS" init -q -b main
+git -C "$SCRATCHS" config user.email "o@example.com"; git -C "$SCRATCHS" config user.name "O Test"
+cp "$SCRATCH/verify.sh" "$SCRATCHS/verify.sh"; echo "sandbox project" > "$SCRATCHS/README.md"
+git -C "$SCRATCHS" add -A; git -C "$SCRATCHS" commit -q -m "seed sandbox project"
+cat > "$TMP5/agent-stub" <<'STUB'
+#!/bin/sh
+cat >/dev/null
+p=""
+if echo x >> "$SBX_REPO/README.md" 2>/dev/null; then p="$p repo:WRITABLE"; else p="$p repo:denied"; fi
+if [ -e "$HOME/.o/o.db" ]; then p="$p db:VISIBLE"; else p="$p db:hidden"; fi
+if echo x >> "$SBX_REPO/.git/hooks/post-merge" 2>/dev/null; then p="$p hooks:WRITABLE"; else p="$p hooks:denied"; fi
+if git config core.fsmonitor "touch /tmp/pwned" 2>/dev/null; then p="$p config:WRITABLE"; else p="$p config:denied"; fi
+n="$(cat /proc/*/environ 2>/dev/null | tr '\0' '\n' | grep -c '^O_API_TOKEN=')"
+p="$p token_procs:$n"
+echo "$p" > probes.txt
+git add probes.txt && git commit -q -m "sandbox probes"
+printf '%s\n' '{"type":"result","total_cost_usd":0.01,"session_id":"sbx-1"}'
+STUB
+chmod +x "$TMP5/agent-stub"
+HOME="$TMP5" O_DB="$TMP5/.o/o.db" O_PORT="$PORT5" O_NO_OPEN=1 O_SANDBOX=bwrap O_API_TOKEN="$TOK" \
+  O_CLAUDE_BIN="$TMP5/agent-stub" SBX_REPO="$SCRATCHS" ./bin/swarmd >"$TMP5/daemon.log" 2>&1 &
+DAEMON5_PID=$!
+up5=""
+for _i in $(seq 1 30); do
+  code="$(ocurl -s -o /dev/null -w '%{http_code}' "$BASE5/api/health" 2>/dev/null || true)"
+  if [ "$code" = "200" ]; then up5="1"; break; fi
+  sleep 0.5
+done
+[ -n "$up5" ] || { cat "$TMP5/daemon.log" || true; fail "sandbox daemon never came up"; }
+CO_JSON="{\"name\":\"Sandbox Co\",\"issue_prefix\":\"SBX\",\"budget_monthly_cents\":1000000,\"repo\":\"$SCRATCHS\",\"verify_cmd\":\"sh verify.sh\",\"protected_paths\":\"protected/\"}"
+sc="$(ocurl -s -o /dev/null -w '%{http_code}' -X POST "$BASE5/api/companies" -H 'Content-Type: application/json' -d "$CO_JSON")"
+[ "$sc" = "401" ] || fail "token: company create without bearer expected 401, got $sc"
+CIDS="$(jget "$(ocurl -s -X POST "$BASE5/api/companies" -H 'Content-Type: application/json' -H "Authorization: Bearer $TOK" -d "$CO_JSON")" 'd["id"]')"
+[ -n "$CIDS" ] || fail "token: company create with bearer failed"
+sc="$(ocurl -s -o /dev/null -w '%{http_code}' -X POST "$BASE5/api/companies/$CIDS" -H 'Content-Type: application/json' -d '{"verify_cmd":"true"}')"
+[ "$sc" = "401" ] || fail "token: verify_cmd rewrite without bearer expected 401, got $sc"
+ocurl -s -X POST "$BASE5/api/companies/$CIDS/agents" -H 'Content-Type: application/json' -H "Authorization: Bearer $TOK" \
+  -d '{"name":"Boxed","runtime":"claude-code"}' >/dev/null
+IID_SBX="$(jget "$(ocurl -s -X POST "$BASE5/api/companies/$CIDS/issues" -H 'Content-Type: application/json' -d '{"title":"probe the sandbox"}')" 'd["id"]')"
+[ -n "$IID_SBX" ] || fail "token: issue filing must stay open without a bearer"
+pass "token: 401 on company writes without bearer (incl. verify_cmd rewrite), issue filing stays open"
+wait_status_at "$BASE5" "$IID_SBX" "Done" 90 || { tail -30 "$TMP5/daemon.log"; fail "sandbox: boxed agent's issue never Done"; }
+probes="$(git -C "$SCRATCHS" show main:probes.txt)"
+[ "$probes" = " repo:denied db:hidden hooks:denied config:denied token_procs:0" ] \
+  || fail "sandbox: unexpected probe results: '$probes'"
+[ "$(cat "$SCRATCHS/README.md")" = "sandbox project" ] || fail "sandbox: main checkout was modified"
+pass "sandbox: repo/hooks/config not writable, ~/.o hidden, token not visible in /proc; worktree commit merged"
+else
+  echo "SKIP: agent sandbox stage (unprivileged bwrap unavailable here)"
+fi
 
 # ============================================================
 # Held-out invariant suite — the frozen core (tests/heldout/core.sh)
