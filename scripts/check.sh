@@ -1007,7 +1007,50 @@ case "$in" in
 esac
 STUB
 chmod +x "$TMP4/claude-stub"
+# gh stub: a bare repo stands in for GitHub. `pr merge` really merges the
+# branch into the bare repo's main; checks fail for branches listed in
+# $GHS/fail_ci; merges are refused for branches listed in $GHS/block_merge.
+cat > "$TMP4/gh-stub" <<'STUB'
+#!/bin/sh
+sub="$1 $2"; shift 2
+branch=""; json=""; bodyf=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -R|--base|--title|--label|--state|--limit) shift ;;
+    --head) branch="$2"; shift ;;
+    --json) json="$2"; shift ;;
+    --body-file) bodyf="$2"; shift ;;
+    --*) ;;
+    *) [ -z "$branch" ] && branch="$1" ;;
+  esac
+  shift
+done
+key="$(printf '%s' "$branch" | tr '/' '_')"
+listed() { [ -f "$GHS/$1" ] && grep -qx "$branch" "$GHS/$1"; }
+case "$sub" in
+  "issue list") cat "$GHS/issues.json" ;;
+  "pr create") cp "$bodyf" "$GHS/body_$key"; echo "https://example.test/pr/$key" ;;
+  "pr merge")
+    listed block_merge && { echo "base branch policy prohibits the merge" >&2; exit 1; }
+    tmp="$(mktemp -d)"; git clone -q "$GHS/remote.git" "$tmp/c" && cd "$tmp/c" \
+      && git -c user.email=gh@x -c user.name=gh merge -q --no-ff --no-edit "origin/$branch" \
+      && git push -q origin main && git push -q origin --delete "$branch" && touch "$GHS/merged_$key" ;;
+  "pr view")
+    case "$json" in
+      number,url) [ -f "$GHS/body_$key" ] || exit 1; echo '{"number":1,"url":"https://example.test/pr"}' ;;
+      mergeCommit) echo '{"mergeCommit":{"oid":"0000000"}}' ;;
+      *) if listed fail_ci; then c='"FAILURE"'; else c='"SUCCESS"'; fi
+         echo "{\"state\":\"OPEN\",\"mergeable\":\"MERGEABLE\",\"statusCheckRollup\":[{\"name\":\"build\",\"status\":\"COMPLETED\",\"conclusion\":$c}]}" ;;
+    esac ;;
+  *) echo "gh-stub: unhandled $sub" >&2; exit 2 ;;
+esac
+STUB
+chmod +x "$TMP4/gh-stub"
+# The same daemon also carries the GitHub stub (stage below): fast polls, no
+# CI settle wait. GHS is the stub's state dir.
+GHS="$TMP4/ghs"; mkdir -p "$GHS"; echo '[]' > "$GHS/issues.json"
 HOME="$TMP4" O_DB="$TMP4/o.db" O_PORT="$PORT4" O_NO_OPEN=1 O_REVIEW=1 O_CLAUDE_BIN="$TMP4/claude-stub" \
+  O_GH_BIN="$TMP4/gh-stub" GHS="$GHS" O_GH_POLL_S=2 O_CI_POLL_S=1 O_CI_SETTLE_S=0 \
   ./bin/swarmd >"$TMP4/daemon.log" 2>&1 &
 DAEMON4_PID=$!
 up4=""
@@ -1047,6 +1090,63 @@ npass="$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='review.
 nrej="$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='review.reject' AND target='$IID_REJ'")"
 [ "$npass" = "1" ] && [ "$nrej" = "3" ] || fail "review: expected 1 review.pass + 3 review.reject, got $npass + $nrej"
 pass "review gate: approve -> merged Done; reject x3 -> Failed red_review with reason, never merged"
+
+# ---- GitHub in/out (same daemon: review gate + gh stub) --------
+# ship=pr against a bare repo standing in for GitHub. GitHub issue #7 is
+# imported once (even across many polls), shipped as a PR whose body says
+# "Closes #7", and merged on green checks into the bare repo's main. A branch
+# whose checks fail goes red_ci on every attempt -> Failed, never merged. A
+# branch GitHub refuses to merge parks in "In Review".
+git init -q --bare -b main "$GHS/remote.git"
+SEEDGH="$TMP4/seedgh"
+git clone -q "$GHS/remote.git" "$SEEDGH"
+git -C "$SEEDGH" config user.email "o@example.com"; git -C "$SEEDGH" config user.name "O Test"
+cp "$SCRATCH/verify.sh" "$SEEDGH/verify.sh"; echo "gh project" > "$SEEDGH/README.md"
+git -C "$SEEDGH" add -A; git -C "$SEEDGH" commit -q -m "seed gh project"; git -C "$SEEDGH" push -q origin main
+GHREPO="$TMP4/ghclone"
+git clone -q "$GHS/remote.git" "$GHREPO"
+git -C "$GHREPO" config user.email "o@example.com"; git -C "$GHREPO" config user.name "O Test"
+resp="$(ocurl -s -w $'\n%{http_code}' -X POST "$BASE4/api/companies" -H 'Content-Type: application/json' \
+  -d "{\"name\":\"GH Co\",\"issue_prefix\":\"GH\",\"budget_monthly_cents\":1000000,\"repo\":\"$GHREPO\",\"verify_cmd\":\"sh verify.sh\",\"protected_paths\":\"protected/\",\"github_repo\":\"acme/widgets\",\"ship\":\"pr\"}")"
+sc="$(printf '%s' "$resp" | tail -n1)"; body="$(printf '%s' "$resp" | sed '$d')"
+[ "$sc" = "201" ] || { echo "$body"; fail "POST gh company expected 201, got $sc"; }
+CIDG="$(jget "$body" 'd["id"]')"
+[ "$(jget "$body" 'd["ship"]')" = "pr" ] && [ "$(jget "$body" 'd["github_repo"]')" = "acme/widgets" ] || fail "gh company fields not stored"
+sc="$(ocurl -s -o /dev/null -w '%{http_code}' -X POST "$BASE4/api/companies/$CIDG" -H 'Content-Type: application/json' -d '{"ship":"yolo"}')"
+[ "$sc" = "400" ] || fail "invalid ship value expected 400, got $sc"
+# issues whose ids we need up front go in BEFORE the agent is hired
+IID_CIF="$(jget "$(ocurl -s -X POST "$BASE4/api/companies/$CIDG/issues" -H 'Content-Type: application/json' -d '{"title":"[sim:good] ci goes red"}')" 'd["id"]')"
+IID_BLK="$(jget "$(ocurl -s -X POST "$BASE4/api/companies/$CIDG/issues" -H 'Content-Type: application/json' -d '{"title":"[sim:good] needs a human"}')" 'd["id"]')"
+echo "o/$IID_CIF" > "$GHS/fail_ci"
+echo "o/$IID_BLK" > "$GHS/block_merge"
+echo '[{"number":7,"title":"[sim:good] from github","body":"filed on GitHub"}]' > "$GHS/issues.json"
+ocurl -s -X POST "$BASE4/api/companies/$CIDG/agents" \
+  -H 'Content-Type: application/json' -d '{"name":"Ghsim","runtime":"sim"}' >/dev/null
+IID_GH=""
+for _i in $(seq 1 30); do
+  IID_GH="$(sqlite3 "$TMP4/o.db" "SELECT id FROM issue WHERE company_id='$CIDG' AND fingerprint='gh:7'")"
+  [ -n "$IID_GH" ] && break; sleep 1
+done
+[ -n "$IID_GH" ] || { tail -30 "$TMP4/daemon.log"; fail "github: issue #7 never imported"; }
+[ "$(sqlite3 "$TMP4/o.db" "SELECT origin FROM issue WHERE id='$IID_GH'")" = "github" ] || fail "github: imported issue origin != github"
+wait_status_at "$BASE4" "$IID_GH" "Done" 120 || { tail -40 "$TMP4/daemon.log"; fail "github: imported issue never Done"; }
+git -C "$GHS/remote.git" log --oneline main | grep -q "o/$IID_GH" || { git -C "$GHS/remote.git" log --oneline main; fail "github: PR was not merged into the remote main"; }
+grep -q "Closes #7" "$GHS/body_o_$IID_GH" || fail "github: PR body lacks 'Closes #7'"
+[ -z "$(git -C "$GHREPO" branch --list "o/$IID_GH")" ] || fail "github: local branch not cleaned up after merge"
+sleep 4  # more polls: #7 is still "open" on the stub and must not be re-imported
+[ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM issue WHERE company_id='$CIDG' AND fingerprint='gh:7'")" = "1" ] || fail "github: issue #7 imported more than once"
+pass "github: #7 imported once, shipped as a PR (Closes #7), merged on green checks"
+wait_status_at "$BASE4" "$IID_CIF" "Failed" 150 || { tail -40 "$TMP4/daemon.log"; fail "github: red-CI issue never Failed"; }
+vs="$(sqlite3 "$TMP4/o.db" "SELECT verify_state FROM run WHERE issue_id='$IID_CIF' ORDER BY started_at DESC LIMIT 1")"
+[ "$vs" = "red_ci" ] || fail "github: expected red_ci, got '$vs'"
+sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_CIF' ORDER BY started_at DESC LIMIT 1" | grep -q "build" \
+  || fail "github: failing check name not passed to the retry prompt"
+[ ! -f "$GHS/merged_o_$IID_CIF" ] || fail "github: red-CI PR was merged"
+pass "github: failing checks -> red_ci x3 -> Failed (check names in the retry tail), never merged"
+wait_status_at "$BASE4" "$IID_BLK" "In Review" 90 || { tail -40 "$TMP4/daemon.log"; fail "github: merge-refused issue never parked In Review"; }
+sleep 6
+[ "$(sqlite3 "$TMP4/o.db" "SELECT status FROM issue WHERE id='$IID_BLK'")" = "In Review" ] || fail "github: In Review issue was re-dispatched"
+pass "github: merge refused by branch policy -> parked In Review, not re-dispatched"
 
 # ============================================================
 # Held-out invariant suite — the frozen core (tests/heldout/core.sh)

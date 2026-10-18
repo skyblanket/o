@@ -282,9 +282,15 @@ fun create_company(db, conn, body) {
                 verify_cmd = default_str(map_get(data, "verify_cmd"), "")
                 protected_paths = default_str(map_get(data, "protected_paths"), "")
                 budget_daily = default_num(map_get(data, "budget_daily_cents"), 0)
-                id = Store.company_create(db, name, mission, prefix, budget, repo, verify_cmd, protected_paths, budget_daily)
-                _l = Store.log_activity(db, id, "operator", "company.create", id)
-                respond(conn, 201, json_encode(Store.company_row(db, id)))
+                ship = default_str(map_get(data, "ship"), "merge")
+                if (ship != "merge" && ship != "pr") {
+                    respond(conn, 400, err_json("ship must be \"merge\" or \"pr\""))
+                } else {
+                    id = Store.company_create(db, name, mission, prefix, budget, repo, verify_cmd, protected_paths, budget_daily)
+                    _g = Store.company_set_github(db, id, default_str(map_get(data, "github_repo"), ""), ship)
+                    _l = Store.log_activity(db, id, "operator", "company.create", id)
+                    respond(conn, 201, json_encode(Store.company_row(db, id)))
+                }
             }
         }
     }
@@ -348,8 +354,14 @@ fun update_company(db, conn, id, body) {
             verify_cmd = default_str(map_get(data, "verify_cmd"), map_get(cur, "verify_cmd"))
             protected_paths = default_str(map_get(data, "protected_paths"), map_get(cur, "protected_paths"))
             budget_daily = default_num(map_get(data, "budget_daily_cents"), map_get(cur, "budget_daily_cents"))
-            _u = Store.company_update(db, id, budget, status, repo, verify_cmd, protected_paths, budget_daily)
-            respond(conn, 200, json_encode(Store.company_row(db, id)))
+            ship = default_str(map_get(data, "ship"), default_str(map_get(cur, "ship"), "merge"))
+            if (ship != "merge" && ship != "pr") {
+                respond(conn, 400, err_json("ship must be \"merge\" or \"pr\""))
+            } else {
+                _u = Store.company_update(db, id, budget, status, repo, verify_cmd, protected_paths, budget_daily)
+                _g = Store.company_set_github(db, id, default_str(map_get(data, "github_repo"), default_str(map_get(cur, "github_repo"), "")), ship)
+                respond(conn, 200, json_encode(Store.company_row(db, id)))
+            }
         }
     }
 }

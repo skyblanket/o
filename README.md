@@ -119,6 +119,33 @@ O edits real repositories on its own. The guard rails are the point.
   a red loop can't fork-bomb), **fingerprint dedup** (one open issue per failure
   fingerprint), and a **daily cap** per company.
 
+## GitHub in / out
+
+Point a company at a GitHub repo and O works its issue tracker and ships
+through its CI. `repo` must be a local clone whose `origin` is that repo; the
+`gh` CLI must be authenticated.
+
+```sh
+curl -s -X POST localhost:4100/api/companies -H 'Content-Type: application/json' -d '{
+  "name": "Widgets", "issue_prefix": "WID",
+  "repo": "/path/to/widgets-clone", "verify_cmd": "make test",
+  "protected_paths": "tests/,.github/",
+  "github_repo": "acme/widgets", "ship": "pr",
+  "budget_daily_cents": 2000 }'
+```
+
+- **In:** every `O_GH_POLL_S` O imports open issues labelled `O_GH_LABEL`
+  (default `o`) as `origin: "github"` work items, each exactly once.
+- **Out (`ship: "pr"`):** each issue branch forks from `origin/<base>`. Once it
+  passes `verify_cmd` (and the review gate, if on), O pushes it and opens a PR
+  (`Closes #n` for imported issues). The repo's own CI is the merge gate: all
+  checks green means `gh pr merge`. A failing check (`red_ci`) or a conflict
+  goes back to the agent, and its next push updates the same PR. If GitHub
+  refuses the merge (required reviews, say), the issue parks in **In Review**
+  with the PR open for a human.
+- `ship: "merge"` (the default) keeps the local serialized merge, with
+  post-merge verify and auto-revert.
+
 ## Feedback widget
 
 `feedback/o-feedback.js` is a dependency-free annotation layer for your dev app.
@@ -164,7 +191,7 @@ An agent does real work through a pluggable runtime, chosen per agent:
 ## Issue lifecycle
 
 ```
-Backlog ─▶ In Progress ─▶ Verifying ─▶ Done
+Backlog ─▶ In Progress ─▶ Verifying ─▶ Done        (ship=pr: ─▶ In Review when GitHub wants a human)
                 │              │
                 │              ├─▶ Failed     (verify red, attempts exhausted)
                 │              └─▶ Reverted   (regressed the base after merge)
@@ -202,6 +229,11 @@ The daemon reads its configuration from the environment. All are optional.
 | `O_TIMEOUT_FLAT_CENTS` | `300` | cost charged for an agent run killed on its wall-clock cap. |
 | `O_REVIEW` | unset | set `1` to require a reviewer model's APPROVE before any green change merges. |
 | `O_REVIEW_MODEL` | claude default | model for the reviewer (e.g. a stronger one than the builder). |
+| `O_GH_BIN` | `gh` on `PATH` | GitHub CLI used for issue import and PRs. |
+| `O_GH_LABEL` | `o` | only open GitHub issues with this label are imported. |
+| `O_GH_POLL_S` | `60` | GitHub issue poll interval. |
+| `O_CI_POLL_S` / `O_CI_TIMEOUT_S` | `30` / `3600` | PR check poll interval / give-up deadline (`red_timeout`). |
+| `O_CI_SETTLE_S` | `30` | how long a PR with no checks reported waits before counting as "no CI, green". |
 | `O_VERIFY_RERUNS` | `1` | post-merge verify re-runs before a red result counts as a regression. |
 
 ## API
