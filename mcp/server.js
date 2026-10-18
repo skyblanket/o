@@ -14,7 +14,11 @@ async function j(path, opts = {}) {
   try {
     r = await fetch(API + path, {
       ...opts,
-      headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
+      headers: {
+        "Content-Type": "application/json",
+        ...(process.env.O_API_TOKEN ? { Authorization: `Bearer ${process.env.O_API_TOKEN}` } : {}),
+        ...(opts.headers || {}),
+      },
     });
   } catch (e) {
     throw new Error(`O daemon unreachable at ${API} — is swarmd running?  (${e.message})`);

@@ -66,6 +66,13 @@ fun migrate(db) {
     _c_nosig  = db_exec(db, "ALTER TABLE company ADD COLUMN no_signal_days INTEGER DEFAULT 0")
     _c_lrefl  = db_exec(db, "ALTER TABLE company ADD COLUMN last_reflect_day INTEGER DEFAULT 0")
 
+    # ---- GitHub in/out ----------------------------------------
+    # github_repo "owner/name": open issues labelled O_GH_LABEL are imported.
+    # ship: "merge" (local serialized merge, the default) or "pr" (push the
+    # branch, open a PR, let the repo's CI gate it, merge via gh).
+    _c_gh     = db_exec(db, "ALTER TABLE company ADD COLUMN github_repo TEXT DEFAULT ''")
+    _c_ship   = db_exec(db, "ALTER TABLE company ADD COLUMN ship TEXT DEFAULT 'merge'")
+
     _i_orig   = db_exec(db, "ALTER TABLE issue ADD COLUMN origin TEXT DEFAULT 'operator'")
     _i_fp     = db_exec(db, "ALTER TABLE issue ADD COLUMN fingerprint TEXT DEFAULT ''")
 

@@ -21,6 +21,10 @@ DAEMON2_PID=""
 TMP2=""
 DAEMON3_PID=""
 TMP3=""
+DAEMON4_PID=""
+TMP4=""
+DAEMON5_PID=""
+TMP5=""
 
 cleanup() {
   if [ -n "$DAEMON_PID" ]; then
@@ -40,6 +44,20 @@ cleanup() {
   fi
   if [ -n "$TMP2" ]; then
     rm -rf "$TMP2" 2>/dev/null || true
+  fi
+  if [ -n "$DAEMON4_PID" ]; then
+    kill "$DAEMON4_PID" 2>/dev/null || true
+    wait "$DAEMON4_PID" 2>/dev/null || true
+  fi
+  if [ -n "$DAEMON5_PID" ]; then
+    kill "$DAEMON5_PID" 2>/dev/null || true
+    wait "$DAEMON5_PID" 2>/dev/null || true
+  fi
+  if [ -n "$TMP5" ]; then
+    rm -rf "$TMP5" 2>/dev/null || true
+  fi
+  if [ -n "$TMP4" ]; then
+    rm -rf "$TMP4" 2>/dev/null || true
   fi
   if [ -n "$TMP3" ]; then
     rm -rf "$TMP3" 2>/dev/null || true
@@ -112,6 +130,19 @@ body="$(printf '%s' "$resp" | sed '$d')"
 CID="$(jget "$body" 'd["id"]')"
 [ -n "$CID" ] || fail "company id missing in create response"
 pass "POST /api/companies -> 201 (id $CID)"
+
+# write guards: a non-JSON write is refused (it would skip the browser's CORS
+# preflight), and a preflight is only answered for a loopback Origin.
+sc="$(ocurl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/companies/$CID" \
+  -H 'Content-Type: text/plain' -d '{"verify_cmd":"true"}')"
+[ "$sc" = "415" ] || fail "text/plain write expected 415, got $sc"
+sc="$(ocurl -s -o /dev/null -w '%{http_code}' -X OPTIONS "$BASE/api/companies/$CID" \
+  -H 'Origin: https://evil.example')"
+[ "$sc" = "403" ] || fail "foreign-origin preflight expected 403, got $sc"
+sc="$(ocurl -s -o /dev/null -w '%{http_code}' -X OPTIONS "$BASE/api/companies/$CID" \
+  -H 'Origin: http://localhost:5173')"
+[ "$sc" = "204" ] || fail "loopback preflight expected 204, got $sc"
+pass "write guards: 415 non-JSON, 403 foreign preflight, 204 loopback preflight"
 
 # create agent (sim runtime)
 resp="$(ocurl -s -w $'\n%{http_code}' -X POST "$BASE/api/companies/$CID/agents" \
@@ -347,6 +378,8 @@ if [ -f boom ] && [ ! -f PROMPT.txt ]; then echo "regression: boom without PROMP
 exit 0
 SH
 echo "scratch verify-gate project" > "$SCRATCH/README.md"
+mkdir -p "$SCRATCH/protected"
+echo "fenced" > "$SCRATCH/protected/keep.txt"
 git -C "$SCRATCH" add -A
 git -C "$SCRATCH" commit -q -m "seed verify project"
 
@@ -382,7 +415,8 @@ IID_GOOD="$(mk_issue '[sim:good] add file')"
 IID_NC="$(mk_issue '[sim:no-commit] nothing')"
 IID_PROT="$(mk_issue '[sim:protected] sneaky')"
 IID_BAD="$(mk_issue '[sim:bad-verify] break')"
-for x in "$IID_GOOD" "$IID_NC" "$IID_PROT" "$IID_BAD"; do
+IID_REN="$(mk_issue '[sim:protected-rename] move it out')"
+for x in "$IID_GOOD" "$IID_NC" "$IID_PROT" "$IID_BAD" "$IID_REN"; do
   [ -n "$x" ] || fail "verify-gate issue id missing"
 done
 pass "verify-gate issues created (good/no-commit/protected/bad-verify)"
@@ -463,6 +497,16 @@ if wait_status "$IID_PROT" "Failed" 120; then
   pass "verify-gate: [sim:protected] Failed with verify_state=red_protected"
 else
   cat "$TMP/daemon.log" || true; fail "[sim:protected] never reached Failed"
+fi
+
+# [sim:protected-rename] — git mv a protected file OUT of the fence. Rename
+# detection would list only the new path; the gate must still see the delete.
+if wait_status "$IID_REN" "Failed" 120; then
+  vs="$(last_verify_state "$IID_REN")"
+  [ "$vs" = "red_protected" ] || fail "[sim:protected-rename] last verify_state expected red_protected, got '$vs'"
+  pass "verify-gate: [sim:protected-rename] Failed with verify_state=red_protected"
+else
+  cat "$TMP/daemon.log" || true; fail "[sim:protected-rename] never reached Failed"
 fi
 
 # [sim:bad-verify] — commit BREAK_VERIFY -> verify.sh fails -> red_tests, Failed
@@ -559,7 +603,7 @@ pass "self-file: revert auto-filed exactly one origin=auto high issue (revert:$R
 # ---- stage i: SERIALIZED merges -------------------------------
 # Two [sim:good] issues filed together must BOTH reach Done, leaving TWO merge
 # commits on main — proving the single merger serializes across concurrent greens.
-SCRATCH3="$TMP/proj3"
+SCRATCH3="$TMP/serial proj"  # a space: every git/verify call must quote the repo path
 mkdir -p "$SCRATCH3"
 git -C "$SCRATCH3" init -q -b main
 git -C "$SCRATCH3" config user.email "o@example.com"
@@ -571,7 +615,7 @@ git -C "$SCRATCH3" commit -q -m "seed serialize project"
 
 resp="$(ocurl -s -w $'\n%{http_code}' -X POST "$BASE/api/companies" \
   -H 'Content-Type: application/json' \
-  -d "{\"name\":\"Serial Co\",\"issue_prefix\":\"SER\",\"budget_monthly_cents\":1000000,\"repo\":\"$SCRATCH3\",\"verify_cmd\":\"sh verify.sh\",\"protected_paths\":\"protected/\"}")"
+  -d "{\"name\":\"Serial Co\",\"issue_prefix\":\"SER\",\"budget_monthly_cents\":1000000,\"repo\":\"$SCRATCH3\",\"verify_cmd\":\"sh verify.sh && [ 'x y' = 'x y' ]\",\"protected_paths\":\"protected/\"}")"
 sc="$(printf '%s' "$resp" | tail -n1)"; body="$(printf '%s' "$resp" | sed '$d')"
 [ "$sc" = "201" ] || { echo "$body"; fail "POST serial company expected 201, got $sc"; }
 CID5="$(jget "$body" 'd["id"]')"
@@ -589,7 +633,36 @@ wait_status "$IID_S1" "Done" 120 || { cat "$TMP/daemon.log"; fail "serial issue 
 wait_status "$IID_S2" "Done" 120 || { cat "$TMP/daemon.log"; fail "serial issue 2 never Done"; }
 nmerge="$(git -C "$SCRATCH3" log --oneline main | grep -c "Merge branch" || true)"
 [ "$nmerge" = "2" ] || { git -C "$SCRATCH3" log --oneline main; fail "serial: expected 2 merge commits, got $nmerge"; }
-pass "serialization: two concurrent [sim:good] both Done, 2 merge commits on main"
+pass "serialization: two concurrent [sim:good] both Done, 2 merge commits on main (repo path has a space, verify_cmd has quotes)"
+
+# ---- stage i2: FLAKY post-merge verify re-runs before reverting ---
+# verify.sh fails exactly ONCE on main (no PROMPT.txt there; the flag file
+# lives outside the repo). The worktree verify is green, the first post-merge
+# verify is red, the re-run is green -> Done (not Reverted) + merge.flaky.
+SCRATCHF="$TMP/projf"
+mkdir -p "$SCRATCHF"
+git -C "$SCRATCHF" init -q -b main
+git -C "$SCRATCHF" config user.email "o@example.com"
+git -C "$SCRATCHF" config user.name "O Test"
+cat > "$SCRATCHF/verify.sh" <<SH
+#!/bin/sh
+if [ ! -f PROMPT.txt ] && [ ! -f "$TMP/flaked" ]; then touch "$TMP/flaked"; echo "flake"; exit 1; fi
+exit 0
+SH
+echo "flaky project" > "$SCRATCHF/README.md"
+git -C "$SCRATCHF" add -A
+git -C "$SCRATCHF" commit -q -m "seed flaky project"
+resp="$(ocurl -s -X POST "$BASE/api/companies" -H 'Content-Type: application/json' \
+  -d "{\"name\":\"Flaky Co\",\"issue_prefix\":\"FLK\",\"budget_monthly_cents\":1000000,\"repo\":\"$SCRATCHF\",\"verify_cmd\":\"sh verify.sh\",\"protected_paths\":\"protected/\"}")"
+CIDF="$(jget "$resp" 'd["id"]')"
+ocurl -s -X POST "$BASE/api/companies/$CIDF/agents" \
+  -H 'Content-Type: application/json' -d '{"name":"Flksim","runtime":"sim"}' >/dev/null
+IID_FLK="$(jget "$(ocurl -s -X POST "$BASE/api/companies/$CIDF/issues" -H 'Content-Type: application/json' -d '{"title":"[sim:good] survives a flake"}')" 'd["id"]')"
+wait_status "$IID_FLK" "Done" 120 || { cat "$TMP/daemon.log"; fail "flaky: issue never Done (reverted on a single flake?)"; }
+[ -f "$TMP/flaked" ] || fail "flaky: the post-merge verify never flaked (test is not exercising the re-run)"
+nfl="$(sqlite3 "$TMP/o.db" "SELECT COUNT(*) FROM activity WHERE verb='merge.flaky' AND target='$IID_FLK'")"
+[ "$nfl" = "1" ] || fail "flaky: expected one merge.flaky, got $nfl"
+pass "flaky: one red post-merge verify re-runs green -> Done + merge.flaky (no revert)"
 
 # ---- stage j: DIRTY repo re-queues (no attempt consumed) ------
 # Chosen "dirty" semantics: if the repo working tree has TRACKED changes when a
@@ -648,6 +721,43 @@ if wait_status "$IID_DRT" "Done" 60; then
 else
   cat "$TMP/daemon.log" || true; fail "dirty: issue never reached Done after cleaning repo"
 fi
+
+# ---- stage j2: CRASH RECOVERY keeps attempt counts -------------
+# The retry map is in memory. Simulate a daemon dying mid-run: stop it, plant
+# two issues stuck "In Progress" with orphaned Running runs, restart on the
+# same DB. One already spent all 3 attempts -> Failed without re-running; one
+# spent 1 -> re-dispatched as attempt 2 (not 1) and finishes Done.
+kill "$DAEMON_PID" 2>/dev/null || true; wait "$DAEMON_PID" 2>/dev/null || true
+AG1="$(sqlite3 "$TMP/o.db" "SELECT id FROM agent WHERE company_id='$CID' LIMIT 1")"
+now_ms="$(($(date +%s) * 1000))"
+sqlite3 "$TMP/o.db" <<SQL
+INSERT INTO issue (id, company_id, identifier, title, body, status, priority, sort_order, created_at, updated_at, origin)
+  VALUES ('iss_rec_spent', '$CID', 'TST-R1', 'recovered spent', '', 'In Progress', 'medium', 101, $now_ms, $now_ms, 'operator'),
+         ('iss_rec_one',   '$CID', 'TST-R2', 'recovered one',   '', 'In Progress', 'medium', 103, $now_ms, $now_ms, 'operator');
+INSERT INTO run (id, issue_id, agent_id, attempt, state, started_at) VALUES
+  ('run_rec_a', 'iss_rec_spent', '$AG1', 1, 'Failed',  $now_ms - 3),
+  ('run_rec_b', 'iss_rec_spent', '$AG1', 2, 'Failed',  $now_ms - 2),
+  ('run_rec_c', 'iss_rec_spent', '$AG1', 3, 'Running', $now_ms - 1),
+  ('run_rec_d', 'iss_rec_one',   '$AG1', 1, 'Running', $now_ms - 1);
+SQL
+HOME="$TMP" O_DB="$TMP/o.db" O_PORT="$PORT" O_NO_OPEN=1 ./bin/swarmd >>"$TMP/daemon.log" 2>&1 &
+DAEMON_PID=$!
+up=""
+for _i in $(seq 1 40); do
+  code="$(ocurl -s -o /dev/null -w '%{http_code}' "$BASE/api/health" 2>/dev/null || true)"
+  if [ "$code" = "200" ]; then up="1"; break; fi
+  sleep 0.5
+done
+[ -n "$up" ] || { tail -20 "$TMP/daemon.log"; fail "restarted daemon never came up"; }
+wait_status "iss_rec_spent" "Failed" 30 || fail "recovery: issue with 3 spent attempts was not Failed"
+[ "$(sqlite3 "$TMP/o.db" "SELECT COUNT(*) FROM run WHERE issue_id='iss_rec_spent'")" = "3" ] \
+  || fail "recovery: exhausted issue was re-run after restart"
+[ "$(sqlite3 "$TMP/o.db" "SELECT state FROM run WHERE id='run_rec_c'")" = "Abandoned" ] \
+  || fail "recovery: orphaned Running run not marked Abandoned"
+wait_status "iss_rec_one" "Done" 60 || { tail -20 "$TMP/daemon.log"; fail "recovery: issue with 1 spent attempt never Done"; }
+[ "$(sqlite3 "$TMP/o.db" "SELECT MIN(attempt) FROM run WHERE issue_id='iss_rec_one' AND id != 'run_rec_d'")" = "2" ] \
+  || fail "recovery: re-dispatch did not continue at attempt 2"
+pass "recovery: restart keeps attempt counts (exhausted -> Failed, partial -> attempt 2), orphan run Abandoned"
 
 # ============================================================
 # Phase-4 stages — self-feedback loop (2nd daemon, tight breakers)
@@ -885,6 +995,240 @@ sleep 6
 nsp2="$(sqlite3 "$TMP3/o.db" "SELECT COUNT(*) FROM activity WHERE company_id='$CID_R' AND verb='reflect.spawn'")"
 [ "$nsp2" = "1" ] || fail "reflect: expected exactly 1 reflect.spawn (at-most-once/day), got ${nsp2}"
 pass "reflect: at-most-once per day (single reflect.spawn after extra ticks)"
+
+# ============================================================
+# Review gate — 4th daemon, O_REVIEW=1, stub reviewer
+# ============================================================
+# The stub stands in for `claude -p`: it reads the review prompt on stdin and
+# REJECTs when the issue title carries [review:reject], else APPROVEs, always
+# reporting $0.01. A [sim:good] change passes verify either way, so the
+# reviewer alone decides: approve -> merged Done; reject -> red_review on every
+# attempt -> Failed, with the reviewer's reason recorded as the verify tail.
+TMP4="$(mktemp -d)"
+PORT4=$((5300 + RANDOM % 300))
+BASE4="http://127.0.0.1:${PORT4}"
+cat > "$TMP4/claude-stub" <<'STUB'
+#!/bin/sh
+in="$(cat)"
+case "$in" in
+  *"[review:reject]"*) printf '%s' '{"type":"result","result":"REJECT: stub reviewer says the change is wrong","total_cost_usd":0.01}' ;;
+  *) printf '%s' '{"type":"result","result":"APPROVE","total_cost_usd":0.01}' ;;
+esac
+STUB
+chmod +x "$TMP4/claude-stub"
+# gh stub: a bare repo stands in for GitHub. `pr merge` really merges the
+# branch into the bare repo's main; checks fail for branches listed in
+# $GHS/fail_ci; merges are refused for branches listed in $GHS/block_merge.
+cat > "$TMP4/gh-stub" <<'STUB'
+#!/bin/sh
+sub="$1 $2"; shift 2
+branch=""; json=""; bodyf=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -R|--base|--title|--label|--state|--limit) shift ;;
+    --head) branch="$2"; shift ;;
+    --json) json="$2"; shift ;;
+    --body-file) bodyf="$2"; shift ;;
+    --*) ;;
+    *) [ -z "$branch" ] && branch="$1" ;;
+  esac
+  shift
+done
+key="$(printf '%s' "$branch" | tr '/' '_')"
+listed() { [ -f "$GHS/$1" ] && grep -qx "$branch" "$GHS/$1"; }
+case "$sub" in
+  "issue list") cat "$GHS/issues.json" ;;
+  "pr create") cp "$bodyf" "$GHS/body_$key"; echo "https://example.test/pr/$key" ;;
+  "pr merge")
+    listed block_merge && { echo "base branch policy prohibits the merge" >&2; exit 1; }
+    tmp="$(mktemp -d)"; git clone -q "$GHS/remote.git" "$tmp/c" && cd "$tmp/c" \
+      && git -c user.email=gh@x -c user.name=gh merge -q --no-ff --no-edit "origin/$branch" \
+      && git push -q origin main && git push -q origin --delete "$branch" && touch "$GHS/merged_$key" ;;
+  "pr view")
+    case "$json" in
+      number,url) [ -f "$GHS/body_$key" ] || exit 1; echo '{"number":1,"url":"https://example.test/pr"}' ;;
+      mergeCommit) echo '{"mergeCommit":{"oid":"0000000"}}' ;;
+      *) if listed fail_ci; then c='"FAILURE"'; else c='"SUCCESS"'; fi
+         echo "{\"state\":\"OPEN\",\"mergeable\":\"MERGEABLE\",\"statusCheckRollup\":[{\"name\":\"build\",\"status\":\"COMPLETED\",\"conclusion\":$c}]}" ;;
+    esac ;;
+  *) echo "gh-stub: unhandled $sub" >&2; exit 2 ;;
+esac
+STUB
+chmod +x "$TMP4/gh-stub"
+# The same daemon also carries the GitHub stub (stage below): fast polls, no
+# CI settle wait. GHS is the stub's state dir.
+GHS="$TMP4/ghs"; mkdir -p "$GHS"; echo '[]' > "$GHS/issues.json"
+HOME="$TMP4" O_DB="$TMP4/o.db" O_PORT="$PORT4" O_NO_OPEN=1 O_REVIEW=1 O_CLAUDE_BIN="$TMP4/claude-stub" \
+  O_GH_BIN="$TMP4/gh-stub" GHS="$GHS" O_GH_POLL_S=2 O_CI_POLL_S=1 O_CI_SETTLE_S=0 \
+  ./bin/swarmd >"$TMP4/daemon.log" 2>&1 &
+DAEMON4_PID=$!
+up4=""
+for _i in $(seq 1 30); do
+  code="$(ocurl -s -o /dev/null -w '%{http_code}' "$BASE4/api/health" 2>/dev/null || true)"
+  if [ "$code" = "200" ]; then up4="1"; break; fi
+  sleep 0.5
+done
+[ -n "$up4" ] || { cat "$TMP4/daemon.log" || true; fail "review daemon never came up"; }
+SCRATCHV="$TMP4/projv"
+mkdir -p "$SCRATCHV"
+git -C "$SCRATCHV" init -q -b main
+git -C "$SCRATCHV" config user.email "o@example.com"
+git -C "$SCRATCHV" config user.name "O Test"
+cp "$SCRATCH/verify.sh" "$SCRATCHV/verify.sh"
+echo "review project" > "$SCRATCHV/README.md"
+git -C "$SCRATCHV" add -A
+git -C "$SCRATCHV" commit -q -m "seed review project"
+resp="$(ocurl -s -X POST "$BASE4/api/companies" -H 'Content-Type: application/json' \
+  -d "{\"name\":\"Review Co\",\"issue_prefix\":\"REV\",\"budget_monthly_cents\":1000000,\"repo\":\"$SCRATCHV\",\"verify_cmd\":\"sh verify.sh\",\"protected_paths\":\"protected/\"}")"
+CIDV="$(jget "$resp" 'd["id"]')"
+ocurl -s -X POST "$BASE4/api/companies/$CIDV/agents" \
+  -H 'Content-Type: application/json' -d '{"name":"Revsim","runtime":"sim"}' >/dev/null
+IID_APP="$(jget "$(ocurl -s -X POST "$BASE4/api/companies/$CIDV/issues" -H 'Content-Type: application/json' -d '{"title":"[sim:good] reviewer approves"}')" 'd["id"]')"
+IID_REJ="$(jget "$(ocurl -s -X POST "$BASE4/api/companies/$CIDV/issues" -H 'Content-Type: application/json' -d '{"title":"[sim:good] [review:reject] reviewer rejects"}')" 'd["id"]')"
+wait_status_at "$BASE4" "$IID_APP" "Done" 90 || { cat "$TMP4/daemon.log"; fail "review: approved change never Done"; }
+git -C "$SCRATCHV" log --oneline main | grep "o/$IID_APP" >/dev/null || fail "review: approved change not merged"
+wait_status_at "$BASE4" "$IID_REJ" "Failed" 150 || { cat "$TMP4/daemon.log"; fail "review: rejected change never Failed"; }
+vs="$(sqlite3 "$TMP4/o.db" "SELECT verify_state FROM run WHERE issue_id='$IID_REJ' ORDER BY started_at DESC LIMIT 1")"
+[ "$vs" = "red_review" ] || fail "review: expected red_review, got '$vs'"
+sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_REJ' ORDER BY started_at DESC LIMIT 1" | grep -q "stub reviewer says" \
+  || fail "review: rejection reason not recorded for the retry prompt"
+git -C "$SCRATCHV" log --oneline main | grep -q "o/$IID_REJ" && fail "review: rejected change was merged"
+# (count per target: the verify-final fix issue auto-filed for the rejected one
+# is itself reviewed and may land review.pass rows of its own)
+npass="$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='review.pass' AND target='$IID_APP'")"
+nrej="$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='review.reject' AND target='$IID_REJ'")"
+[ "$npass" = "1" ] && [ "$nrej" = "3" ] || fail "review: expected 1 review.pass + 3 review.reject, got $npass + $nrej"
+pass "review gate: approve -> merged Done; reject x3 -> Failed red_review with reason, never merged"
+
+# ---- GitHub in/out (same daemon: review gate + gh stub) --------
+# ship=pr against a bare repo standing in for GitHub. GitHub issue #7 is
+# imported once (even across many polls), shipped as a PR whose body says
+# "Closes #7", and merged on green checks into the bare repo's main. A branch
+# whose checks fail goes red_ci on every attempt -> Failed, never merged. A
+# branch GitHub refuses to merge parks in "In Review".
+git init -q --bare -b main "$GHS/remote.git"
+SEEDGH="$TMP4/seedgh"
+git clone -q "$GHS/remote.git" "$SEEDGH"
+git -C "$SEEDGH" config user.email "o@example.com"; git -C "$SEEDGH" config user.name "O Test"
+cp "$SCRATCH/verify.sh" "$SEEDGH/verify.sh"; echo "gh project" > "$SEEDGH/README.md"
+git -C "$SEEDGH" add -A; git -C "$SEEDGH" commit -q -m "seed gh project"; git -C "$SEEDGH" push -q origin main
+GHREPO="$TMP4/ghclone"
+git clone -q "$GHS/remote.git" "$GHREPO"
+git -C "$GHREPO" config user.email "o@example.com"; git -C "$GHREPO" config user.name "O Test"
+resp="$(ocurl -s -w $'\n%{http_code}' -X POST "$BASE4/api/companies" -H 'Content-Type: application/json' \
+  -d "{\"name\":\"GH Co\",\"issue_prefix\":\"GH\",\"budget_monthly_cents\":1000000,\"repo\":\"$GHREPO\",\"verify_cmd\":\"sh verify.sh\",\"protected_paths\":\"protected/\",\"github_repo\":\"acme/widgets\",\"ship\":\"pr\"}")"
+sc="$(printf '%s' "$resp" | tail -n1)"; body="$(printf '%s' "$resp" | sed '$d')"
+[ "$sc" = "201" ] || { echo "$body"; fail "POST gh company expected 201, got $sc"; }
+CIDG="$(jget "$body" 'd["id"]')"
+[ "$(jget "$body" 'd["ship"]')" = "pr" ] && [ "$(jget "$body" 'd["github_repo"]')" = "acme/widgets" ] || fail "gh company fields not stored"
+sc="$(ocurl -s -o /dev/null -w '%{http_code}' -X POST "$BASE4/api/companies/$CIDG" -H 'Content-Type: application/json' -d '{"ship":"yolo"}')"
+[ "$sc" = "400" ] || fail "invalid ship value expected 400, got $sc"
+# issues whose ids we need up front go in BEFORE the agent is hired
+IID_CIF="$(jget "$(ocurl -s -X POST "$BASE4/api/companies/$CIDG/issues" -H 'Content-Type: application/json' -d '{"title":"[sim:good] ci goes red"}')" 'd["id"]')"
+IID_BLK="$(jget "$(ocurl -s -X POST "$BASE4/api/companies/$CIDG/issues" -H 'Content-Type: application/json' -d '{"title":"[sim:good] needs a human"}')" 'd["id"]')"
+# Worktree debris a crashed or contended earlier attempt can leave behind.
+# Both must still get a working worktree: a leftover branch for one issue,
+# and for the other a registered worktree whose directory is gone.
+git -C "$GHREPO" branch "o/$IID_CIF" origin/main
+git -C "$GHREPO" worktree add -q "$TMP4/.o/workspaces/$IID_BLK" -b "o/$IID_BLK" origin/main
+rm -rf "$TMP4/.o/workspaces/$IID_BLK"
+echo "o/$IID_CIF" > "$GHS/fail_ci"
+echo "o/$IID_BLK" > "$GHS/block_merge"
+echo '[{"number":7,"title":"[sim:good] from github","body":"filed on GitHub"}]' > "$GHS/issues.json"
+ocurl -s -X POST "$BASE4/api/companies/$CIDG/agents" \
+  -H 'Content-Type: application/json' -d '{"name":"Ghsim","runtime":"sim"}' >/dev/null
+IID_GH=""
+for _i in $(seq 1 30); do
+  IID_GH="$(sqlite3 "$TMP4/o.db" "SELECT id FROM issue WHERE company_id='$CIDG' AND fingerprint='gh:7'")"
+  [ -n "$IID_GH" ] && break; sleep 1
+done
+[ -n "$IID_GH" ] || { tail -30 "$TMP4/daemon.log"; fail "github: issue #7 never imported"; }
+[ "$(sqlite3 "$TMP4/o.db" "SELECT origin FROM issue WHERE id='$IID_GH'")" = "github" ] || fail "github: imported issue origin != github"
+wait_status_at "$BASE4" "$IID_GH" "Done" 120 || { tail -40 "$TMP4/daemon.log"; fail "github: imported issue never Done"; }
+git -C "$GHS/remote.git" log --oneline main | grep -q "o/$IID_GH" || { git -C "$GHS/remote.git" log --oneline main; fail "github: PR was not merged into the remote main"; }
+grep -q "Closes #7" "$GHS/body_o_$IID_GH" || fail "github: PR body lacks 'Closes #7'"
+[ -z "$(git -C "$GHREPO" branch --list "o/$IID_GH")" ] || fail "github: local branch not cleaned up after merge"
+sleep 4  # more polls: #7 is still "open" on the stub and must not be re-imported
+[ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM issue WHERE company_id='$CIDG' AND fingerprint='gh:7'")" = "1" ] || fail "github: issue #7 imported more than once"
+pass "github: #7 imported once, shipped as a PR (Closes #7), merged on green checks"
+wait_status_at "$BASE4" "$IID_CIF" "Failed" 150 || { tail -40 "$TMP4/daemon.log"; fail "github: red-CI issue never Failed"; }
+vs="$(sqlite3 "$TMP4/o.db" "SELECT verify_state FROM run WHERE issue_id='$IID_CIF' ORDER BY started_at DESC LIMIT 1")"
+[ "$vs" = "red_ci" ] || fail "github: expected red_ci, got '$vs'"
+sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_CIF' ORDER BY started_at DESC LIMIT 1" | grep -q "build" \
+  || fail "github: failing check name not passed to the retry prompt"
+[ ! -f "$GHS/merged_o_$IID_CIF" ] || fail "github: red-CI PR was merged"
+pass "github: failing checks -> red_ci x3 -> Failed (check names in the retry tail), never merged"
+wait_status_at "$BASE4" "$IID_BLK" "In Review" 90 || { tail -40 "$TMP4/daemon.log"; fail "github: merge-refused issue never parked In Review"; }
+sleep 6
+[ "$(sqlite3 "$TMP4/o.db" "SELECT status FROM issue WHERE id='$IID_BLK'")" = "In Review" ] || fail "github: In Review issue was re-dispatched"
+pass "github: merge refused by branch policy -> parked In Review, not re-dispatched"
+
+# ============================================================
+# Agent sandbox — 5th daemon, O_SANDBOX=bwrap + O_API_TOKEN
+# ============================================================
+# A stub claude-code agent probes its own confinement and commits the results.
+# Expected: the main checkout, the control-plane DB, .git/hooks and .git/config
+# are not writable, ~/.o is hidden, and no process it can see carries
+# O_API_TOKEN, yet its commit in the worktree still lands and merges. The
+# daemon runs with O_API_TOKEN set, so the token guard is exercised for real.
+# Skipped (with a note) where unprivileged bwrap can't run.
+if command -v bwrap >/dev/null 2>&1 && bwrap --ro-bind / / --unshare-pid --proc /proc true 2>/dev/null; then
+TMP5="$(mktemp -d)"
+PORT5=$((5650 + RANDOM % 300))
+BASE5="http://127.0.0.1:${PORT5}"
+TOK="sbx-test-token"
+SCRATCHS="$TMP5/projs"
+mkdir -p "$SCRATCHS" "$TMP5/.o"
+git -C "$SCRATCHS" init -q -b main
+git -C "$SCRATCHS" config user.email "o@example.com"; git -C "$SCRATCHS" config user.name "O Test"
+cp "$SCRATCH/verify.sh" "$SCRATCHS/verify.sh"; echo "sandbox project" > "$SCRATCHS/README.md"
+git -C "$SCRATCHS" add -A; git -C "$SCRATCHS" commit -q -m "seed sandbox project"
+cat > "$TMP5/agent-stub" <<'STUB'
+#!/bin/sh
+cat >/dev/null
+p=""
+if echo x >> "$SBX_REPO/README.md" 2>/dev/null; then p="$p repo:WRITABLE"; else p="$p repo:denied"; fi
+if [ -e "$HOME/.o/o.db" ]; then p="$p db:VISIBLE"; else p="$p db:hidden"; fi
+if echo x >> "$SBX_REPO/.git/hooks/post-merge" 2>/dev/null; then p="$p hooks:WRITABLE"; else p="$p hooks:denied"; fi
+if git config core.fsmonitor "touch /tmp/pwned" 2>/dev/null; then p="$p config:WRITABLE"; else p="$p config:denied"; fi
+n="$(cat /proc/*/environ 2>/dev/null | tr '\0' '\n' | grep -c '^O_API_TOKEN=')"
+p="$p token_procs:$n"
+echo "$p" > probes.txt
+git add probes.txt && git commit -q -m "sandbox probes"
+printf '%s\n' '{"type":"result","total_cost_usd":0.01,"session_id":"sbx-1"}'
+STUB
+chmod +x "$TMP5/agent-stub"
+HOME="$TMP5" O_DB="$TMP5/.o/o.db" O_PORT="$PORT5" O_NO_OPEN=1 O_SANDBOX=bwrap O_API_TOKEN="$TOK" \
+  O_CLAUDE_BIN="$TMP5/agent-stub" SBX_REPO="$SCRATCHS" ./bin/swarmd >"$TMP5/daemon.log" 2>&1 &
+DAEMON5_PID=$!
+up5=""
+for _i in $(seq 1 30); do
+  code="$(ocurl -s -o /dev/null -w '%{http_code}' "$BASE5/api/health" 2>/dev/null || true)"
+  if [ "$code" = "200" ]; then up5="1"; break; fi
+  sleep 0.5
+done
+[ -n "$up5" ] || { cat "$TMP5/daemon.log" || true; fail "sandbox daemon never came up"; }
+CO_JSON="{\"name\":\"Sandbox Co\",\"issue_prefix\":\"SBX\",\"budget_monthly_cents\":1000000,\"repo\":\"$SCRATCHS\",\"verify_cmd\":\"sh verify.sh\",\"protected_paths\":\"protected/\"}"
+sc="$(ocurl -s -o /dev/null -w '%{http_code}' -X POST "$BASE5/api/companies" -H 'Content-Type: application/json' -d "$CO_JSON")"
+[ "$sc" = "401" ] || fail "token: company create without bearer expected 401, got $sc"
+CIDS="$(jget "$(ocurl -s -X POST "$BASE5/api/companies" -H 'Content-Type: application/json' -H "Authorization: Bearer $TOK" -d "$CO_JSON")" 'd["id"]')"
+[ -n "$CIDS" ] || fail "token: company create with bearer failed"
+sc="$(ocurl -s -o /dev/null -w '%{http_code}' -X POST "$BASE5/api/companies/$CIDS" -H 'Content-Type: application/json' -d '{"verify_cmd":"true"}')"
+[ "$sc" = "401" ] || fail "token: verify_cmd rewrite without bearer expected 401, got $sc"
+ocurl -s -X POST "$BASE5/api/companies/$CIDS/agents" -H 'Content-Type: application/json' -H "Authorization: Bearer $TOK" \
+  -d '{"name":"Boxed","runtime":"claude-code"}' >/dev/null
+IID_SBX="$(jget "$(ocurl -s -X POST "$BASE5/api/companies/$CIDS/issues" -H 'Content-Type: application/json' -d '{"title":"probe the sandbox"}')" 'd["id"]')"
+[ -n "$IID_SBX" ] || fail "token: issue filing must stay open without a bearer"
+pass "token: 401 on company writes without bearer (incl. verify_cmd rewrite), issue filing stays open"
+wait_status_at "$BASE5" "$IID_SBX" "Done" 90 || { tail -30 "$TMP5/daemon.log"; fail "sandbox: boxed agent's issue never Done"; }
+probes="$(git -C "$SCRATCHS" show main:probes.txt)"
+[ "$probes" = " repo:denied db:hidden hooks:denied config:denied token_procs:0" ] \
+  || fail "sandbox: unexpected probe results: '$probes'"
+[ "$(cat "$SCRATCHS/README.md")" = "sandbox project" ] || fail "sandbox: main checkout was modified"
+pass "sandbox: repo/hooks/config not writable, ~/.o hidden, token not visible in /proc; worktree commit merged"
+else
+  echo "SKIP: agent sandbox stage (unprivileged bwrap unavailable here)"
+fi
 
 # ============================================================
 # Held-out invariant suite — the frozen core (tests/heldout/core.sh)

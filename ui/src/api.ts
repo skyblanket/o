@@ -3,6 +3,8 @@
 // the Vite dev server and talk to it directly.
 
 const BASE = (import.meta.env.VITE_O_API as string) || "http://localhost:4100/api";
+// Matches the daemon's O_API_TOKEN, when one is set (guards company/agent writes).
+const TOKEN = import.meta.env.VITE_O_TOKEN as string | undefined;
 
 export interface Company {
   id: string; name: string; mission: string; issue_prefix: string; status: string;
@@ -12,6 +14,8 @@ export interface Company {
   repo: string; verify_cmd: string; protected_paths: string;
   budget_daily_cents: number; spent_today_cents: number; budget_day: number;
   pause_reason: string; greens_today: number; no_signal_days: number;
+  // GitHub in/out: issues imported from github_repo; ship "merge" | "pr"
+  github_repo: string; ship: string;
 }
 export interface Issue {
   id: string; company_id: string; identifier: string; title: string; body: string;
@@ -45,7 +49,11 @@ export interface Message {
 async function req<T>(path: string, opts?: RequestInit): Promise<T> {
   const r = await fetch(BASE + path, {
     ...opts,
-    headers: { "Content-Type": "application/json", ...(opts?.headers || {}) },
+    headers: {
+      "Content-Type": "application/json",
+      ...(TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {}),
+      ...(opts?.headers || {}),
+    },
   });
   if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
   return r.json() as Promise<T>;

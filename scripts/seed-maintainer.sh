@@ -39,14 +39,14 @@ curl -s "$API/api/health" >/dev/null 2>&1 || { echo "error: daemon not reachable
 [ -d "$REPO/.git" ] || { echo "error: $REPO is not a git repo (set O_REPO)"; exit 1; }
 extract_id() { sed -n 's/.*"id":"\([^"]*\)".*/\1/p'; }
 
-CO=$(curl -s -X POST "$API/api/companies" \
+CO=$(curl -s -X POST "$API/api/companies" -H "Content-Type: application/json" ${O_API_TOKEN:+-H "Authorization: Bearer $O_API_TOKEN"} \
   -d "{\"name\":\"O Core\",\"mission\":\"keep O healthy and improving\",\"issue_prefix\":\"CORE\",\"repo\":\"$REPO\",\"verify_cmd\":\"make check\",\"protected_paths\":\"scripts/check.sh,tests/heldout/\",\"budget_daily_cents\":$DAILY,\"budget_monthly_cents\":200000}" \
   | extract_id)
 echo "company   O Core  ($CO)"
 echo "          repo=$REPO  verify='make check'  daily=${DAILY}c"
 echo "          protected=scripts/check.sh,tests/heldout/"
 
-curl -s -X POST "$API/api/companies/$CO/agents" \
+curl -s -X POST "$API/api/companies/$CO/agents" -H "Content-Type: application/json" ${O_API_TOKEN:+-H "Authorization: Bearer $O_API_TOKEN"} \
   -d "{\"name\":\"Maintainer\",\"role\":\"engineer\",\"runtime\":\"claude-code\",\"repo\":\"$REPO\"}" >/dev/null
 echo "agent     Maintainer  (claude-code · repo $REPO)"
 

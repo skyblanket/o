@@ -11,12 +11,12 @@ module Store
 
 export [next_id, companies, company_row, company_create, company_update,
         company_add_spend, enforce_budget, rollover_day, company_mark_green, global_spent_today,
-        company_touch_reflect, companies_to_reflect,
-        issues_for, issue_row, issue_create, issue_create_auto, issue_create_with_origin, issue_open_fp_count,
+        company_touch_reflect, companies_to_reflect, company_set_github, companies_with_github,
+        issues_for, issue_row, issue_create, issue_create_auto, issue_create_with_origin, issue_open_fp_count, issue_import_github,
         issue_set_status, issue_assign, issue_update, open_issue_titles,
         log_activity, activity_recent, activity_since, candidate_issues,
         failed_runs_for,
-        run_create, run_finish, run_set_state, run_set_verify, run_set_merge, last_run_for_issue, runs_all, run_row,
+        run_create, run_finish, run_set_state, run_set_verify, run_set_merge, last_run_for_issue, run_count_for_issue, runs_all, run_row,
         agents_for, agent_row, agent_first_active, agent_create,
         agent_set_session, agent_set_chat_session,
         message_create, messages_for,
@@ -33,11 +33,11 @@ fun next_id(prefix) {
 # ---- companies ------------------------------------------------
 
 fun companies(db) {
-    db_query(db, "SELECT id, name, mission, issue_prefix, status, budget_monthly_cents, spent_cents, issue_counter, created_at, updated_at, repo, verify_cmd, protected_paths, budget_daily_cents, spent_today_cents, budget_day, pause_reason, greens_today, no_signal_days, last_reflect_day FROM company ORDER BY created_at DESC", [])
+    db_query(db, "SELECT id, name, mission, issue_prefix, status, budget_monthly_cents, spent_cents, issue_counter, created_at, updated_at, repo, verify_cmd, protected_paths, budget_daily_cents, spent_today_cents, budget_day, pause_reason, greens_today, no_signal_days, last_reflect_day, github_repo, ship FROM company ORDER BY created_at DESC", [])
 }
 
 fun company_row(db, id) {
-    rows = db_query(db, "SELECT id, name, mission, issue_prefix, status, budget_monthly_cents, spent_cents, issue_counter, created_at, updated_at, repo, verify_cmd, protected_paths, budget_daily_cents, spent_today_cents, budget_day, pause_reason, greens_today, no_signal_days, last_reflect_day FROM company WHERE id = ?", [id])
+    rows = db_query(db, "SELECT id, name, mission, issue_prefix, status, budget_monthly_cents, spent_cents, issue_counter, created_at, updated_at, repo, verify_cmd, protected_paths, budget_daily_cents, spent_today_cents, budget_day, pause_reason, greens_today, no_signal_days, last_reflect_day, github_repo, ship FROM company WHERE id = ?", [id])
     if (length(rows) == 0) { nil } else { hd(rows) }
 }
 
@@ -51,6 +51,16 @@ fun company_create(db, name, mission, prefix, budget, repo, verify_cmd, protecte
 fun company_update(db, id, budget, status, repo, verify_cmd, protected_paths, budget_daily) {
     _u = db_query(db, "UPDATE company SET budget_monthly_cents = ?, status = ?, repo = ?, verify_cmd = ?, protected_paths = ?, budget_daily_cents = ?, updated_at = ? WHERE id = ?", [budget, status, repo, verify_cmd, protected_paths, budget_daily, timestamp(), id])
     id
+}
+
+fun company_set_github(db, id, github_repo, ship) {
+    _u = db_query(db, "UPDATE company SET github_repo = ?, ship = ?, updated_at = ? WHERE id = ?", [github_repo, ship, timestamp(), id])
+    id
+}
+
+# Active companies wired to a GitHub repo — the issue-import poll set.
+fun companies_with_github(db) {
+    db_query(db, "SELECT id, github_repo FROM company WHERE status = 'active' AND github_repo != ''", [])
 }
 
 fun company_add_spend(db, id, cents) {
@@ -287,6 +297,28 @@ fun issue_create_with_origin(db, company_id, title, body, priority, origin) {
     }
 }
 
+# Import GitHub issue #number exactly once per company, ever: the fingerprint
+# gh:<number> is checked across ALL statuses, so a closed-out O issue is never
+# re-imported while its GitHub issue stays open. Returns the new id or nil.
+fun issue_import_github(db, company_id, number, title, body) {
+    fp = f"gh:{number}"
+    rows = db_query(db, "SELECT COUNT(*) AS n FROM issue WHERE company_id = ? AND fingerprint = ?", [company_id, fp])
+    seen = if (length(rows) == 0) { 0 } else { map_get(hd(rows), "n") }
+    crow = company_row(db, company_id)
+    if (seen > 0 || crow == nil) {
+        nil
+    } else {
+        prefix = map_get(crow, "issue_prefix")
+        n = map_get(crow, "issue_counter") + 1
+        identifier = f"{prefix}-{n}"
+        id = next_id("iss")
+        now = timestamp()
+        _upd = db_query(db, "UPDATE company SET issue_counter = ?, updated_at = ? WHERE id = ?", [n, now, company_id])
+        _ins = db_query(db, "INSERT INTO issue (id, company_id, identifier, title, body, status, priority, sort_order, created_at, updated_at, origin, fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [id, company_id, identifier, title, body, "Backlog", "medium", now, now, now, "github", fp])
+        id
+    }
+}
+
 fun issue_set_status(db, id, status) {
     _u = db_query(db, "UPDATE issue SET status = ?, updated_at = ? WHERE id = ?", [status, timestamp(), id])
     id
@@ -307,7 +339,7 @@ fun issue_assign(db, id, agent_id) {
 # id already in running, so no double-dispatch occurs. Only "Reverted" (a phase-3
 # terminal state) joins Done/Canceled/Failed in the exclusion list.
 fun candidate_issues(db) {
-    db_query(db, "SELECT id, company_id, identifier, title, body, status, priority, assignee_agent_id, sort_order, origin, fingerprint FROM issue WHERE status NOT IN ('Done', 'Canceled', 'Failed', 'Reverted') AND company_id IN (SELECT id FROM company WHERE status = 'active') ORDER BY CASE WHEN origin = 'auto' THEN 0 ELSE 1 END, CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, created_at ASC", [])
+    db_query(db, "SELECT id, company_id, identifier, title, body, status, priority, assignee_agent_id, sort_order, origin, fingerprint FROM issue WHERE status NOT IN ('Done', 'Canceled', 'Failed', 'Reverted', 'In Review') AND company_id IN (SELECT id FROM company WHERE status = 'active') ORDER BY CASE WHEN origin = 'auto' THEN 0 ELSE 1 END, CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, created_at ASC", [])
 }
 
 # Partial update of the operator-editable issue fields.
@@ -409,6 +441,11 @@ fun run_set_merge(db, run_id, sha) {
 
 # The latest run for an issue by start time — carries the verify verdict +
 # output the next attempt's structured-retry prompt reads. nil if none.
+fun run_count_for_issue(db, issue_id) {
+    rows = db_query(db, "SELECT COUNT(*) AS n FROM run WHERE issue_id = ?", [issue_id])
+    if (length(rows) == 0) { 0 } else { map_get(hd(rows), "n") }
+}
+
 fun last_run_for_issue(db, issue_id) {
     rows = db_query(db, "SELECT id, issue_id, agent_id, attempt, state, verify_state, verify_output, started_at FROM run WHERE issue_id = ? ORDER BY started_at DESC LIMIT 1", [issue_id])
     if (length(rows) == 0) { nil } else { hd(rows) }
