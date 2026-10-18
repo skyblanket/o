@@ -16,7 +16,7 @@ export [next_id, companies, company_row, company_create, company_update,
         issue_set_status, issue_assign, issue_update, open_issue_titles,
         log_activity, activity_recent, activity_since, candidate_issues,
         failed_runs_for,
-        run_create, run_finish, run_set_state, run_set_verify, run_set_merge, last_run_for_issue, runs_all, run_row,
+        run_create, run_finish, run_set_state, run_set_verify, run_set_merge, last_run_for_issue, run_count_for_issue, runs_all, run_row,
         agents_for, agent_row, agent_first_active, agent_create,
         agent_set_session, agent_set_chat_session,
         message_create, messages_for,
@@ -409,6 +409,11 @@ fun run_set_merge(db, run_id, sha) {
 
 # The latest run for an issue by start time — carries the verify verdict +
 # output the next attempt's structured-retry prompt reads. nil if none.
+fun run_count_for_issue(db, issue_id) {
+    rows = db_query(db, "SELECT COUNT(*) AS n FROM run WHERE issue_id = ?", [issue_id])
+    if (length(rows) == 0) { 0 } else { map_get(hd(rows), "n") }
+}
+
 fun last_run_for_issue(db, issue_id) {
     rows = db_query(db, "SELECT id, issue_id, agent_id, attempt, state, verify_state, verify_output, started_at FROM run WHERE issue_id = ? ORDER BY started_at DESC LIMIT 1", [issue_id])
     if (length(rows) == 0) { nil } else { hd(rows) }

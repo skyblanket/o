@@ -173,6 +173,13 @@ fun str_or(v, d) {
     if (v == nil) { d } else { v }
 }
 
+# Single-quote a value for splicing into a shell command: wraps it in '...'
+# and turns any embedded ' into '\'' — so a repo path with spaces, or a
+# verify_cmd like `grep 'ok' out.txt`, survives intact as one argument.
+fun sq(v) {
+    "'" ++ string_replace(v, "'", "'\\''") ++ "'"
+}
+
 # ---- verify tunables -----------------------------------------
 # Wall-clock cap on a single verify command, in SECONDS (string, since it
 # is spliced into the perl alarm wrapper) and in MILLISECONDS (int, for the
@@ -527,13 +534,43 @@ fun dispatch_batch(db, cands, slots, running, retry, now) {
                 if (is_cooling(retry, iid, now) == 'true') {
                     dispatch_batch(db, tl(cands), slots, running, retry, now)
                 } else {
-                    attempt = attempt_for(retry, iid)
-                    running2 = dispatch_one(db, issue, iid, attempt, running, now)
-                    retry2 = map_remove(retry, iid)
-                    dispatch_batch(db, tl(cands), slots - 1, running2, retry2, now)
+                    attempt = if (map_has_key(retry, iid) == 'true') { attempt_for(retry, iid) } else { recovered_attempt(db, issue, iid) }
+                    if (attempt > max_attempts()) {
+                        # Crash recovery found an issue that already spent every
+                        # attempt before the restart — terminate it, don't re-run.
+                        cid = map_get(issue, "company_id")
+                        _is = Store.issue_set_status(db, iid, "Failed")
+                        _a = Store.log_activity(db, cid, "orchestrator", "run.failed_final", iid)
+                        dispatch_batch(db, tl(cands), slots, running, map_remove(retry, iid), now)
+                    } else {
+                        running2 = dispatch_one(db, issue, iid, attempt, running, now)
+                        retry2 = map_remove(retry, iid)
+                        dispatch_batch(db, tl(cands), slots - 1, running2, retry2, now)
+                    }
                 }
             }
         }
+    }
+}
+
+# The attempt number for an issue that is NOT in the in-memory retry map.
+# Normally 1 — but an issue already "In Progress"/"Verifying" with no running
+# entry can only mean the daemon restarted mid-run (the maps are in memory).
+# Then its attempt count comes from the DB, so restarts can't hand a failing
+# issue unlimited retries; the orphaned run row is marked Abandoned.
+fun recovered_attempt(db, issue, iid) {
+    st = str_or(map_get(issue, "status"), "")
+    if (st == "In Progress" || st == "Verifying") {
+        last = Store.last_run_for_issue(db, iid)
+        if (last == nil) {
+            1
+        } else {
+            lst = str_or(map_get(last, "state"), "")
+            _ab = if (lst == "Running" || lst == "Verifying") { Store.run_set_state(db, map_get(last, "id"), "Abandoned") } else { "" }
+            Store.run_count_for_issue(db, iid) + 1
+        }
+    } else {
+        1
     }
 }
 
@@ -990,7 +1027,7 @@ fun prepare_worktree(repo, workspace, issue_id) {
 # worktrees on the same repo in the same tick can collide. Retry a few times
 # with a short backoff; give up (or stop) as soon as the worktree exists.
 fun wt_add(repo, workspace, branch, tries) {
-    r = shell(f"git -C {repo} worktree add {workspace} -b {branch}")
+    r = shell(f"git -C {sq(repo)} worktree add {workspace} -b {branch}")
     if (elem(r, 0) == 0) {
         ""
     } else {
@@ -1225,7 +1262,7 @@ fun run_verify(orch, run_id, issue_id, ws, repo, base, verify_cmd, protected) {
 # The base branch a worktree is diffed/rebased against: the repo's current
 # checked-out branch, else "main".
 fun detect_base(repo) {
-    b = string_trim(elem(shell(f"git -C {repo} symbolic-ref --short HEAD"), 1))
+    b = string_trim(elem(shell(f"git -C {sq(repo)} symbolic-ref --short HEAD"), 1))
     if (string_length(b) == 0) { "main" } else { b }
 }
 
@@ -1240,7 +1277,7 @@ fun timeout_cmd(secs, verify_cmd, ws, logpath) {
 # phase-3 merger re-verifies on the repo's MAIN checkout (cwd = repo), writing
 # its log outside the repo (inside the issue worktree).
 fun timeout_cmd_in(dir, secs, verify_cmd, logpath) {
-    f"cd {dir} && perl -e 'alarm shift; exec @ARGV' {secs} sh -c '{verify_cmd}' > {logpath} 2>&1"
+    f"cd {sq(dir)} && perl -e 'alarm shift; exec @ARGV' {secs} sh -c {sq(verify_cmd)} > {sq(logpath)} 2>&1"
 }
 
 # Last ~4KB of the verify log — the tail the retry prompt (and the run row)
@@ -1422,7 +1459,7 @@ fun do_merge(job) {
     ws = map_get(job, "ws")
     verify_cmd = map_get(job, "verify_cmd")
     timeout_s = map_get(job, "timeout_s")
-    st = shell(f"git -C {repo} status --porcelain --untracked-files=no")
+    st = shell(f"git -C {sq(repo)} status --porcelain --untracked-files=no")
     dirty = string_trim(elem(st, 1))
     if (string_length(dirty) > 0) {
         # Repo mid-operation / dirty tracked tree — leave it entirely untouched
@@ -1433,34 +1470,56 @@ fun do_merge(job) {
         _s = sleep(1500)
         %{outcome: "dirty", sha: "", tail: ""}
     } else {
-        co = shell(f"git -C {repo} checkout {base}")
+        co = shell(f"git -C {sq(repo)} checkout {base}")
         if (elem(co, 0) != 0) {
             _s = sleep(1500)
             %{outcome: "dirty", sha: "", tail: string_trim(elem(co, 1))}
         } else {
-            mg = shell(f"git -C {repo} merge --no-ff --no-edit {branch}")
+            mg = shell(f"git -C {sq(repo)} merge --no-ff --no-edit {branch}")
             if (elem(mg, 0) != 0) {
-                uf = shell(f"git -C {repo} diff --name-only --diff-filter=U")
+                uf = shell(f"git -C {sq(repo)} diff --name-only --diff-filter=U")
                 files = string_trim(elem(uf, 1))
-                _ab = shell(f"git -C {repo} merge --abort")
+                _ab = shell(f"git -C {sq(repo)} merge --abort")
                 %{outcome: "conflict", sha: "", tail: files}
             } else {
-                sha = string_trim(elem(shell(f"git -C {repo} rev-parse HEAD"), 1))
+                sha = string_trim(elem(shell(f"git -C {sq(repo)} rev-parse HEAD"), 1))
                 logpath = f"{ws}/merge-verify.log"
                 # shell_managed: see run_verify — plain shell() caps at 120s.
                 # timeout_s is the STRING seconds for the perl splice; the C-level
                 # backstop uses the int ms variant (perl alarm + 60s grace).
                 vr = shell_managed(timeout_cmd_in(repo, timeout_s, verify_cmd, logpath), verify_timeout_ms())
+                # Red on main once could be a flaky test, not a regression:
+                # re-run (O_VERIFY_RERUNS times, default 1) before reverting, so
+                # one flake doesn't cost a revert + a high-priority fix issue.
+                again = if (elem(vr, 0) == 0) { 0 } else { rerun_verify(repo, timeout_s, verify_cmd, logpath, verify_reruns()) }
                 if (elem(vr, 0) == 0) {
                     %{outcome: "merged", sha: sha, tail: ""}
+                } else { if (again == 0) {
+                    %{outcome: "merged", sha: sha, tail: "flaky"}
                 } else {
                     # green in the worktree but RED on main — regression. Undo the
                     # merge commit (-m 1 keeps main's first parent) and report it.
-                    _rv = shell(f"git -C {repo} revert -m 1 --no-edit {sha}")
+                    _rv = shell(f"git -C {sq(repo)} revert -m 1 --no-edit {sha}")
                     %{outcome: "reverted", sha: sha, tail: tail_log(logpath)}
-                }
+                }}
             }
         }
+    }
+}
+
+fun verify_reruns() {
+    v = getenv("O_VERIFY_RERUNS")
+    if (v == nil) { 1 } else { n = to_int(v); if (n == nil) { 1 } else { n } }
+}
+
+# Re-run the post-merge verify up to n times; 0 as soon as one passes, else
+# the last nonzero exit code.
+fun rerun_verify(repo, timeout_s, verify_cmd, logpath, n) {
+    if (n <= 0) {
+        1
+    } else {
+        r = shell_managed(timeout_cmd_in(repo, timeout_s, verify_cmd, logpath), verify_timeout_ms())
+        if (elem(r, 0) == 0) { 0 } else { rerun_verify(repo, timeout_s, verify_cmd, logpath, n - 1) }
     }
 }
 
@@ -1478,13 +1537,14 @@ fun handle_merge_done(db, running, retry, run_id, issue_id, outcome, merge_sha, 
         branch = f"o/{issue_id}"
         if (outcome == "merged") {
             _arch = archive_run(db, run_id, ws)
-            _wr = shell(f"git -C {repo} worktree remove {ws} --force")
-            _bd = shell(f"git -C {repo} branch -d {branch}")
+            _wr = shell(f"git -C {sq(repo)} worktree remove {ws} --force")
+            _bd = shell(f"git -C {sq(repo)} branch -d {branch}")
             _st = Store.run_set_state(db, run_id, "Succeeded")
             _ms = Store.run_set_merge(db, run_id, merge_sha)
             _is = Store.issue_set_status(db, issue_id, "Done")
             _g = Store.company_mark_green(db, company_id)
             _a = Store.log_activity(db, company_id, "orchestrator", "merge.done", issue_id)
+            _fl = if (tail == "flaky") { Store.log_activity(db, company_id, "orchestrator", "merge.flaky", issue_id) } else { "" }
             %{running: map_remove(running, issue_id), retry: map_remove(retry, issue_id)}
         } else {
             if (outcome == "conflict") {
@@ -1515,7 +1575,7 @@ fun handle_merge_done(db, running, retry, run_id, issue_id, outcome, merge_sha, 
                     _st = Store.run_set_state(db, run_id, "Reverted")
                     _is = Store.issue_set_status(db, issue_id, "Reverted")
                     _arch = archive_run(db, run_id, ws)
-                    _wr = shell(f"git -C {repo} worktree remove {ws} --force")
+                    _wr = shell(f"git -C {sq(repo)} worktree remove {ws} --force")
                     _a = Store.log_activity(db, company_id, "orchestrator", "merge.revert", issue_id)
                     # Auto-file the regression fix, pointing at the kept branch.
                     _sf = file_revert(db, company_id, issue_id, merge_sha, branch, tail)
@@ -1577,7 +1637,7 @@ fun final_fail_cleanup(db, company_id, ws, run_id) {
     company = Store.company_row(db, company_id)
     repo = str_or(map_get(company, "repo"), "")
     _wr = if (string_length(repo) > 0) {
-        shell(f"git -C {repo} worktree remove {ws} --force")
+        shell(f"git -C {sq(repo)} worktree remove {ws} --force")
     } else {
         shell(f"rm -rf {ws}")
     }

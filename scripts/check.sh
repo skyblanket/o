@@ -585,7 +585,7 @@ pass "self-file: revert auto-filed exactly one origin=auto high issue (revert:$R
 # ---- stage i: SERIALIZED merges -------------------------------
 # Two [sim:good] issues filed together must BOTH reach Done, leaving TWO merge
 # commits on main — proving the single merger serializes across concurrent greens.
-SCRATCH3="$TMP/proj3"
+SCRATCH3="$TMP/serial proj"  # a space: every git/verify call must quote the repo path
 mkdir -p "$SCRATCH3"
 git -C "$SCRATCH3" init -q -b main
 git -C "$SCRATCH3" config user.email "o@example.com"
@@ -597,7 +597,7 @@ git -C "$SCRATCH3" commit -q -m "seed serialize project"
 
 resp="$(ocurl -s -w $'\n%{http_code}' -X POST "$BASE/api/companies" \
   -H 'Content-Type: application/json' \
-  -d "{\"name\":\"Serial Co\",\"issue_prefix\":\"SER\",\"budget_monthly_cents\":1000000,\"repo\":\"$SCRATCH3\",\"verify_cmd\":\"sh verify.sh\",\"protected_paths\":\"protected/\"}")"
+  -d "{\"name\":\"Serial Co\",\"issue_prefix\":\"SER\",\"budget_monthly_cents\":1000000,\"repo\":\"$SCRATCH3\",\"verify_cmd\":\"sh verify.sh && [ 'x y' = 'x y' ]\",\"protected_paths\":\"protected/\"}")"
 sc="$(printf '%s' "$resp" | tail -n1)"; body="$(printf '%s' "$resp" | sed '$d')"
 [ "$sc" = "201" ] || { echo "$body"; fail "POST serial company expected 201, got $sc"; }
 CID5="$(jget "$body" 'd["id"]')"
@@ -615,7 +615,36 @@ wait_status "$IID_S1" "Done" 120 || { cat "$TMP/daemon.log"; fail "serial issue 
 wait_status "$IID_S2" "Done" 120 || { cat "$TMP/daemon.log"; fail "serial issue 2 never Done"; }
 nmerge="$(git -C "$SCRATCH3" log --oneline main | grep -c "Merge branch" || true)"
 [ "$nmerge" = "2" ] || { git -C "$SCRATCH3" log --oneline main; fail "serial: expected 2 merge commits, got $nmerge"; }
-pass "serialization: two concurrent [sim:good] both Done, 2 merge commits on main"
+pass "serialization: two concurrent [sim:good] both Done, 2 merge commits on main (repo path has a space, verify_cmd has quotes)"
+
+# ---- stage i2: FLAKY post-merge verify re-runs before reverting ---
+# verify.sh fails exactly ONCE on main (no PROMPT.txt there; the flag file
+# lives outside the repo). The worktree verify is green, the first post-merge
+# verify is red, the re-run is green -> Done (not Reverted) + merge.flaky.
+SCRATCHF="$TMP/projf"
+mkdir -p "$SCRATCHF"
+git -C "$SCRATCHF" init -q -b main
+git -C "$SCRATCHF" config user.email "o@example.com"
+git -C "$SCRATCHF" config user.name "O Test"
+cat > "$SCRATCHF/verify.sh" <<SH
+#!/bin/sh
+if [ ! -f PROMPT.txt ] && [ ! -f "$TMP/flaked" ]; then touch "$TMP/flaked"; echo "flake"; exit 1; fi
+exit 0
+SH
+echo "flaky project" > "$SCRATCHF/README.md"
+git -C "$SCRATCHF" add -A
+git -C "$SCRATCHF" commit -q -m "seed flaky project"
+resp="$(ocurl -s -X POST "$BASE/api/companies" -H 'Content-Type: application/json' \
+  -d "{\"name\":\"Flaky Co\",\"issue_prefix\":\"FLK\",\"budget_monthly_cents\":1000000,\"repo\":\"$SCRATCHF\",\"verify_cmd\":\"sh verify.sh\",\"protected_paths\":\"protected/\"}")"
+CIDF="$(jget "$resp" 'd["id"]')"
+ocurl -s -X POST "$BASE/api/companies/$CIDF/agents" \
+  -H 'Content-Type: application/json' -d '{"name":"Flksim","runtime":"sim"}' >/dev/null
+IID_FLK="$(jget "$(ocurl -s -X POST "$BASE/api/companies/$CIDF/issues" -H 'Content-Type: application/json' -d '{"title":"[sim:good] survives a flake"}')" 'd["id"]')"
+wait_status "$IID_FLK" "Done" 120 || { cat "$TMP/daemon.log"; fail "flaky: issue never Done (reverted on a single flake?)"; }
+[ -f "$TMP/flaked" ] || fail "flaky: the post-merge verify never flaked (test is not exercising the re-run)"
+nfl="$(sqlite3 "$TMP/o.db" "SELECT COUNT(*) FROM activity WHERE verb='merge.flaky' AND target='$IID_FLK'")"
+[ "$nfl" = "1" ] || fail "flaky: expected one merge.flaky, got $nfl"
+pass "flaky: one red post-merge verify re-runs green -> Done + merge.flaky (no revert)"
 
 # ---- stage j: DIRTY repo re-queues (no attempt consumed) ------
 # Chosen "dirty" semantics: if the repo working tree has TRACKED changes when a
@@ -674,6 +703,43 @@ if wait_status "$IID_DRT" "Done" 60; then
 else
   cat "$TMP/daemon.log" || true; fail "dirty: issue never reached Done after cleaning repo"
 fi
+
+# ---- stage j2: CRASH RECOVERY keeps attempt counts -------------
+# The retry map is in memory. Simulate a daemon dying mid-run: stop it, plant
+# two issues stuck "In Progress" with orphaned Running runs, restart on the
+# same DB. One already spent all 3 attempts -> Failed without re-running; one
+# spent 1 -> re-dispatched as attempt 2 (not 1) and finishes Done.
+kill "$DAEMON_PID" 2>/dev/null || true; wait "$DAEMON_PID" 2>/dev/null || true
+AG1="$(sqlite3 "$TMP/o.db" "SELECT id FROM agent WHERE company_id='$CID' LIMIT 1")"
+now_ms="$(($(date +%s) * 1000))"
+sqlite3 "$TMP/o.db" <<SQL
+INSERT INTO issue (id, company_id, identifier, title, body, status, priority, sort_order, created_at, updated_at, origin)
+  VALUES ('iss_rec_spent', '$CID', 'TST-R1', 'recovered spent', '', 'In Progress', 'medium', 101, $now_ms, $now_ms, 'operator'),
+         ('iss_rec_one',   '$CID', 'TST-R2', 'recovered one',   '', 'In Progress', 'medium', 103, $now_ms, $now_ms, 'operator');
+INSERT INTO run (id, issue_id, agent_id, attempt, state, started_at) VALUES
+  ('run_rec_a', 'iss_rec_spent', '$AG1', 1, 'Failed',  $now_ms - 3),
+  ('run_rec_b', 'iss_rec_spent', '$AG1', 2, 'Failed',  $now_ms - 2),
+  ('run_rec_c', 'iss_rec_spent', '$AG1', 3, 'Running', $now_ms - 1),
+  ('run_rec_d', 'iss_rec_one',   '$AG1', 1, 'Running', $now_ms - 1);
+SQL
+HOME="$TMP" O_DB="$TMP/o.db" O_PORT="$PORT" O_NO_OPEN=1 ./bin/swarmd >>"$TMP/daemon.log" 2>&1 &
+DAEMON_PID=$!
+up=""
+for _i in $(seq 1 40); do
+  code="$(ocurl -s -o /dev/null -w '%{http_code}' "$BASE/api/health" 2>/dev/null || true)"
+  if [ "$code" = "200" ]; then up="1"; break; fi
+  sleep 0.5
+done
+[ -n "$up" ] || { tail -20 "$TMP/daemon.log"; fail "restarted daemon never came up"; }
+wait_status "iss_rec_spent" "Failed" 30 || fail "recovery: issue with 3 spent attempts was not Failed"
+[ "$(sqlite3 "$TMP/o.db" "SELECT COUNT(*) FROM run WHERE issue_id='iss_rec_spent'")" = "3" ] \
+  || fail "recovery: exhausted issue was re-run after restart"
+[ "$(sqlite3 "$TMP/o.db" "SELECT state FROM run WHERE id='run_rec_c'")" = "Abandoned" ] \
+  || fail "recovery: orphaned Running run not marked Abandoned"
+wait_status "iss_rec_one" "Done" 60 || { tail -20 "$TMP/daemon.log"; fail "recovery: issue with 1 spent attempt never Done"; }
+[ "$(sqlite3 "$TMP/o.db" "SELECT MIN(attempt) FROM run WHERE issue_id='iss_rec_one' AND id != 'run_rec_d'")" = "2" ] \
+  || fail "recovery: re-dispatch did not continue at attempt 2"
+pass "recovery: restart keeps attempt counts (exhausted -> Failed, partial -> attempt 2), orphan run Abandoned"
 
 # ============================================================
 # Phase-4 stages — self-feedback loop (2nd daemon, tight breakers)
