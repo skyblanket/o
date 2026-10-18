@@ -1,37 +1,58 @@
+<p align="center">
+  <img src="docs/banner.svg" alt="O: the autonomous software loop" width="100%">
+</p>
+
+<p align="center">
+  <a href="https://github.com/skyblanket/o/actions/workflows/check.yml"><img src="https://github.com/skyblanket/o/actions/workflows/check.yml/badge.svg" alt="check"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
+  <img src="https://img.shields.io/badge/built%20on-swarmrt-7cf3c4.svg" alt="built on swarmrt">
+  <img src="https://img.shields.io/badge/control%20plane-one%20SQLite%20file-5b8cff.svg" alt="one SQLite file">
+</p>
+
 # O
 
-An autonomous software loop. O watches its own issue board, dispatches coding
-agents into isolated git worktrees, verifies their work with your real test
-suite, auto-merges what passes, auto-reverts what regresses, budgets itself by
-the day, and files its own follow-up issues — from failures it catches and from
-a daily pass where it reflects on its own recent work. It runs as one native
-daemon (`swarmd`) built on [swarmrt](https://github.com/skyblanket/swarmrt).
-There is no queue, no Postgres, no container — an embedded SQLite file is the
-whole control plane.
+**An autonomous software loop.** O watches an issue board, which can be its
+own or your GitHub issues, and dispatches coding agents into isolated git
+worktrees. It judges their work by your real test suite, a reviewer model and
+your CI, merges what passes and reverts what regresses. It budgets itself by
+the day and files its own follow-up work, from the failures it catches and from
+a daily pass where it reflects on what it shipped.
+
+It runs as one native daemon (`swarmd`) built on
+[swarmrt](https://github.com/skyblanket/swarmrt). There is no queue, no
+Postgres and no container: an embedded SQLite file is the whole control plane.
+
+### What a merge has to get through
+
+| Gate | What it checks |
+|---|---|
+| **Grounded verify** | Your `verify_cmd` passes in the agent's worktree. The agent's own claim of success counts for nothing. |
+| **Protected paths** | Nothing in the fence was touched, renamed or deleted. The tests that judge the agent sit behind it. |
+| **Review gate** | A second, read-only model approves the diff against the issue (`O_REVIEW=1`). |
+| **CI** | In PR mode, your repo's own checks go green on the PR (`ship: "pr"`). |
+| **Post-merge verify** | Still green on main after the merge. If not, O auto-reverts and files a fix. |
+
+Every red verdict goes back to the agent with the actual failure output, so it
+retries against the real breakage. Agents can run sandboxed with bubblewrap
+(`O_SANDBOX=bwrap`). Spend is metered against daily and monthly caps, and a
+no-signal breaker pauses any company that burns budget without shipping.
 
 ```
-                 ┌──────────────────────────────────────────────┐
-                 │                   swarmd                      │
-                 │                                               │
-   issue board ──┼─▶ tick ─▶ dispatch ─▶ agent in git worktree  │
-        ▲        │             (claude-code / swarm-code / sim)  │
-        │        │                       │                       │
-        │        │                       ▼                       │
-        │        │            verify (your test suite)           │
-        │        │              │              │                 │
-        │        │         green│              │red              │
-        │        │              ▼              ▼                 │
-        │        │      --no-ff merge      retry ─▶ Failed        │
-        │        │              │                    │           │
-        │        │       post-merge verify           │           │
-        │        │          │         │              │           │
-        │        │      ok  │         │ regressed    │           │
-        │        │          ▼         ▼              ▼           │
-        │        │        Done     revert +      file follow-up  │
-        └────────┼──────────────── fix issue ◀──── issue (auto)  │
-                 │                                               │
-                 │   daily: rollover budgets · reflection pass   │
-                 └──────────────────────────────────────────────┘
+   GitHub issues ─┐                ┌──────────────────── swarmd ────────────────────┐
+   operator / UI ─┼─▶ issue board ─┼─▶ dispatch ─▶ agent in git worktree (sandboxed) │
+   feedback widget┘       ▲        │                 │                              │
+                          │        │                 ▼                              │
+                          │        │   verify ─▶ review ─▶ ship ──┬─ merge: local   │
+                          │        │     │red      │reject        │  --no-ff merge  │
+                          │        │     ▼         ▼              │  + post-merge   │
+                          │        │   retry with the failure     │    verify       │
+                          │        │   (attempts exhausted:       └─ pr: push + PR, │
+                          │        │    Failed + fix issue)          CI-gated merge │
+                          │        │                                     │          │
+                          │        │                regressed ─▶ revert  │  green   │
+                          └────────┼──── auto-filed fix issues ◀─────────┘  ▼ Done  │
+                                   │   daily: budget rollover · reflection pass     │
+                                   └────────────────────────────────────────────────┘
 ```
 
 ## Quick start
