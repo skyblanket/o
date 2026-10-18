@@ -1,13 +1,7 @@
-<p align="center">
-  <img src="docs/banner.svg" alt="O: the autonomous software loop" width="100%">
-</p>
+<img src="docs/assets/banner.png" alt="O: software that ships itself. Issues in, verified merges out. Built on swarmrt. MIT." width="100%"/>
 
-<p align="center">
-  <a href="https://github.com/skyblanket/o/actions/workflows/check.yml"><img src="https://github.com/skyblanket/o/actions/workflows/check.yml/badge.svg" alt="check"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
-  <img src="https://img.shields.io/badge/built%20on-swarmrt-7cf3c4.svg" alt="built on swarmrt">
-  <img src="https://img.shields.io/badge/control%20plane-one%20SQLite%20file-5b8cff.svg" alt="one SQLite file">
-</p>
+[![check](https://github.com/skyblanket/o/actions/workflows/check.yml/badge.svg)](https://github.com/skyblanket/o/actions/workflows/check.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-C81E0F.svg)](LICENSE)
 
 # O
 
