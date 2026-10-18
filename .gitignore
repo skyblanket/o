@@ -5,3 +5,4 @@ bin/
 .DS_Store
 ui/node_modules/
 ui/dist/
+mcp/node_modules/

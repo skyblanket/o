@@ -36,15 +36,22 @@ whole control plane.
 
 ## Quick start
 
+Prerequisites: a C toolchain (`cc`, `make`), `git`, `perl`, `python3` and the
+`sqlite3` CLI (the test suites query the control plane with it); Node for the UI
+and the MCP server; `claude` on `PATH` for real agent runs.
+
 O builds with the swarmrt toolchain. Clone swarmrt as a sibling of this repo
-(the default the Makefile expects), then build:
+(the default the Makefile expects), build its compiler, then build O:
 
 ```sh
 git clone https://github.com/skyblanket/swarmrt   # sibling of this repo
+(cd swarmrt && make swc libswarmrt)
 git clone https://github.com/skyblanket/o
 cd o
 make                 # -> bin/swarmd   (or: make SWARMRT=/path/to/swarmrt)
-make check           # hermetic end-to-end test suite
+make check           # hermetic end-to-end test suite (sim runtime, no tokens)
+./scripts/acceptance.sh                  # whole-loop acceptance, stub agent
+O_ACCEPT_REAL=1 ./scripts/acceptance.sh  # same, with a real claude agent (spends tokens)
 ```
 
 Run the daemon and the web UI together:
@@ -61,6 +68,13 @@ Point O at a repo it should maintain — including itself:
 ./scripts/seed-example.sh             # a sim-runtime demo company, no tokens spent
 ```
 
+Drive O from Claude Code over MCP (`mcp/node_modules` is not committed):
+
+```sh
+(cd mcp && npm install)
+claude mcp add o -- node "$PWD/mcp/server.js"
+```
+
 The control plane lives at `~/.o/o.db`; per-issue worktrees live under
 `~/.o/workspaces/`. Nothing else is created.
 
@@ -75,14 +89,23 @@ O edits real repositories on its own. The guard rails are the point.
   `red_protected`, `red_tests`, and so on.
 - **Protected paths.** Each company declares `protected_paths`. An agent may not
   change them; a commit that does is rejected (`red_protected`) before it can
-  merge. The test harness and this loop's own invariants live behind this fence,
-  so an agent maintaining O cannot edit the checks that gate its merges.
+  merge. Renames count as touching both paths, and the agent's prompt lists the
+  fence. The test harness and this loop's own invariants live behind it, so an
+  agent maintaining O cannot edit the checks that gate its merges.
+- **Guarded control plane.** Writes must be `Content-Type: application/json` and
+  CORS preflights are answered only for loopback origins, so a web page can't
+  drive the API. Set `O_API_TOKEN` to require `Authorization: Bearer` on
+  company / agent / approval writes (filing issues and feedback stays open);
+  agent subprocesses never receive the token, so an agent can't rewrite its own
+  `verify_cmd` or `protected_paths` through the API.
 - **Everything on a branch.** Each issue runs on `o/<issue>` in its own worktree.
   Green work lands with a `--no-ff` merge that names the branch. If the merge
-  regresses the base (post-merge verify goes red), O reverts the merge on the
-  base branch and **keeps the branch** for forensics.
+  regresses the base (post-merge verify goes red, and stays red on a re-run so a
+  single flaky test doesn't count), O reverts the merge on the base branch and
+  **keeps the branch** for forensics.
 - **Budget circuit breakers.** Every run is metered onto the company's daily and
-  monthly budgets. Hitting a cap pauses the company (`budget-daily` /
+  monthly budgets; a run killed on its wall-clock cap (which reports no cost) is
+  charged a flat estimate. Hitting a cap pauses the company (`budget-daily` /
   `budget-monthly`). A separate **no-signal** breaker pauses a company that burns
   budget across days without shipping a single verified-green merge.
 - **Bounded self-filing.** When O files its own follow-up work (a regression to
@@ -170,6 +193,9 @@ The daemon reads its configuration from the environment. All are optional.
 | `O_SWARM_FLAT_CENTS` | `25` | flat per-run cost charged for a swarm-code run (it reports no telemetry yet). |
 | `O_REFLECT` | unset | set `1` to enable the daily reflection pass. |
 | `O_REQUIRE_APPROVALS` | unset | set `1` to route agent hiring through `/api/approvals`. |
+| `O_API_TOKEN` | unset | when set, company / agent / approval writes need `Authorization: Bearer <token>`. The UI reads `VITE_O_TOKEN`, the MCP server `O_API_TOKEN`. |
+| `O_TIMEOUT_FLAT_CENTS` | `300` | cost charged for an agent run killed on its wall-clock cap. |
+| `O_VERIFY_RERUNS` | `1` | post-merge verify re-runs before a red result counts as a regression. |
 
 ## API
 
@@ -199,8 +225,9 @@ curl http://localhost:4100/api/activity       # activity log
   commands as your user. Protected paths and the verify gate constrain what
   *merges*, not what an agent may *do* while working. Run O only against repos and
   on machines where that is acceptable.
-- **No auth on the HTTP API.** Bind it to localhost. Anyone who can reach the port
-  can drive the loop.
+- **The API token is a same-user guard, not a sandbox.** Agents run as your user,
+  so a determined agent could read the token from the daemon's environment.
+  Bind the API to localhost and set `O_API_TOKEN`.
 - **swarm-code cost is estimated.** swarm-code emits no usage telemetry yet, so
   its runs are metered at a flat per-run estimate (`O_SWARM_FLAT_CENTS`) rather
   than true token cost.
