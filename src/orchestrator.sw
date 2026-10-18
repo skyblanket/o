@@ -718,6 +718,14 @@ fun run_claude_code(orch, run_id, issue_id, prompt, workspace, repo, session_id,
     } else {
         _mk = shell(f"mkdir -p {workspace}")
     }
+    if (ws_missing(repo, workspace)) {
+        send(orch, {'run_done', run_id, issue_id, 'crashed', 0, ""})
+    } else {
+        run_claude_code_in(orch, run_id, issue_id, prompt, workspace, repo, session_id)
+    }
+}
+
+fun run_claude_code_in(orch, run_id, issue_id, prompt, workspace, repo, session_id) {
     _w = file_write(f"{workspace}/PROMPT.txt", prompt)
     bin = claude_bin()
     resume = if (string_length(session_id) > 0) { f" --resume {session_id}" } else { "" }
@@ -849,6 +857,14 @@ fun run_swarm_code(orch, run_id, issue_id, prompt, workspace, repo, start) {
     } else {
         _mk = shell(f"mkdir -p {workspace}")
     }
+    if (ws_missing(repo, workspace)) {
+        send(orch, {'run_done', run_id, issue_id, 'crashed', 0, ""})
+    } else {
+        run_swarm_code_in(orch, run_id, issue_id, prompt, workspace, repo)
+    }
+}
+
+fun run_swarm_code_in(orch, run_id, issue_id, prompt, workspace, repo) {
     _w = file_write(f"{workspace}/PROMPT.txt", prompt)
     bin = swarm_bin()
     cmd = f"cd {workspace} && cat PROMPT.txt | {agent_env()} SWARM_CODE_CWD={workspace} {sandbox_prefix(workspace, repo)}{bin} -p --json > result.json 2> err.log"
@@ -1088,8 +1104,15 @@ fun prepare_worktree(repo, workspace, issue_id, start) {
 # `git worktree add` takes a repo-wide lock, so several workers creating
 # worktrees on the same repo in the same tick can collide. Retry a few times
 # with a short backoff; give up (or stop) as soon as the worktree exists.
+#
+# A failed attempt can leave debris that makes every later `-b` fail: the
+# branch already created, or a stale .git/worktrees entry for a directory that
+# never appeared (seen when concurrent PR-mode fetches hold the ref locks). So
+# each retry prunes stale entries and, if the branch exists, checks it out
+# instead of re-creating it.
 fun wt_add(repo, workspace, branch, start, tries) {
-    r = shell(f"git -C {sq(repo)} worktree add {workspace} -b {branch} {start}")
+    have = elem(shell(f"git -C {sq(repo)} rev-parse --verify --quiet refs/heads/{branch}"), 0) == 0
+    r = if (have) { shell(f"git -C {sq(repo)} worktree add {workspace} {branch}") } else { shell(f"git -C {sq(repo)} worktree add {workspace} -b {branch} {start}") }
     if (elem(r, 0) == 0) {
         ""
     } else {
@@ -1100,10 +1123,17 @@ fun wt_add(repo, workspace, branch, start, tries) {
                 ""
             } else {
                 _s = sleep(200)
+                _p = shell(f"git -C {sq(repo)} worktree prune")
                 wt_add(repo, workspace, branch, start, tries - 1)
             }
         }
     }
+}
+
+# A repo-backed run whose worktree could not be created must not run on: it
+# would "succeed" into a missing directory and fail somewhere confusing later.
+fun ws_missing(repo, workspace) {
+    string_length(repo) > 0 && file_exists(workspace) == 'false'
 }
 
 # sim runtime — deterministic stub, no real spend. Reports a fixed fake
@@ -1119,12 +1149,16 @@ fun run_sim(orch, run_id, issue_id, outcome, workspace, repo, title, protected, 
     sleep(1000)
     if (string_length(repo) > 0) {
         _wt = prepare_worktree(repo, workspace, issue_id, start)
-        # PROMPT.txt is written but left UNTRACKED — the [sim:regress] case
-        # relies on it existing in the worktree (green) yet absent on main
-        # (red after merge), so the verify commit must never include it.
-        _p = file_write(f"{workspace}/PROMPT.txt", "sim")
-        _act = sim_act(workspace, issue_id, sim_marker(title), protected)
-        send(orch, {'run_done', run_id, issue_id, 'succeeded', sim_cost(), ""})
+        if (ws_missing(repo, workspace)) {
+            send(orch, {'run_done', run_id, issue_id, 'crashed', 0, ""})
+        } else {
+            # PROMPT.txt is written but left UNTRACKED — the [sim:regress] case
+            # relies on it existing in the worktree (green) yet absent on main
+            # (red after merge), so the verify commit must never include it.
+            _p = file_write(f"{workspace}/PROMPT.txt", "sim")
+            _act = sim_act(workspace, issue_id, sim_marker(title), protected)
+            send(orch, {'run_done', run_id, issue_id, 'succeeded', sim_cost(), ""})
+        }
     } else {
         send(orch, {'run_done', run_id, issue_id, outcome, sim_cost(), ""})
     }

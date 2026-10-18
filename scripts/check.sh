@@ -1126,6 +1126,12 @@ sc="$(ocurl -s -o /dev/null -w '%{http_code}' -X POST "$BASE4/api/companies/$CID
 # issues whose ids we need up front go in BEFORE the agent is hired
 IID_CIF="$(jget "$(ocurl -s -X POST "$BASE4/api/companies/$CIDG/issues" -H 'Content-Type: application/json' -d '{"title":"[sim:good] ci goes red"}')" 'd["id"]')"
 IID_BLK="$(jget "$(ocurl -s -X POST "$BASE4/api/companies/$CIDG/issues" -H 'Content-Type: application/json' -d '{"title":"[sim:good] needs a human"}')" 'd["id"]')"
+# Worktree debris a crashed or contended earlier attempt can leave behind.
+# Both must still get a working worktree: a leftover branch for one issue,
+# and for the other a registered worktree whose directory is gone.
+git -C "$GHREPO" branch "o/$IID_CIF" origin/main
+git -C "$GHREPO" worktree add -q "$TMP4/.o/workspaces/$IID_BLK" -b "o/$IID_BLK" origin/main
+rm -rf "$TMP4/.o/workspaces/$IID_BLK"
 echo "o/$IID_CIF" > "$GHS/fail_ci"
 echo "o/$IID_BLK" > "$GHS/block_merge"
 echo '[{"number":7,"title":"[sim:good] from github","body":"filed on GitHub"}]' > "$GHS/issues.json"
