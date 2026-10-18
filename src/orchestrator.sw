@@ -85,6 +85,16 @@ fun swarm_bin() {
     }
 }
 
+# Env scrub prefix for every agent/chat/reflect subprocess:
+#   O_API_TOKEN       — agents must never hold the API write token.
+#   CLAUDECODE, CLAUDE_CODE_*SESSION* — when swarmd itself was launched from
+#     inside a Claude Code session, the child `claude -p` inherits that
+#     session's id and reports it as its own; O then stores it and every later
+#     `--resume` fails ("No conversation found"). Scrub so agents get their own.
+fun agent_env() {
+    "env -u O_API_TOKEN -u CLAUDECODE -u CLAUDE_CODE_SESSION_ID -u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_REMOTE_SESSION_ID"
+}
+
 # Per-run cost ceiling for claude-code: --max-turns caps how many
 # agent turns a single issue run may take. O_MAX_TURNS overrides.
 fun max_turns() {
@@ -178,9 +188,10 @@ fun verify_timeout_ms() {
     n * 1000 + 60000
 }
 
-fun build_prompt(title, body, repo) {
+fun build_prompt(title, body, repo, protected) {
     if (string_length(repo) > 0) {
-        "You are an autonomous engineer working in a git checkout of a real project. Make the code changes this task needs, then run `git add -A` and `git commit -m` with a clear message. Do NOT commit PROMPT.txt, result.json or err.log. Be focused and correct.\n\nTask: " ++ title ++ "\n\n" ++ body
+        fence = if (string_length(string_trim(protected)) > 0) { " You may NOT modify, rename or delete these protected paths (the verifier rejects any commit touching them): " ++ protected ++ "." } else { "" }
+        "You are an autonomous engineer working in a git checkout of a real project. Make the code changes this task needs, then run `git add -A` and `git commit -m` with a clear message. Do NOT commit PROMPT.txt, result.json or err.log." ++ fence ++ " Be focused and correct.\n\nTask: " ++ title ++ "\n\n" ++ body
     } else {
         "You are an autonomous agent in a fresh working directory. Complete the task below, creating whatever files are needed. Be concise.\n\nTask: " ++ title ++ "\n\n" ++ body
     }
@@ -198,8 +209,8 @@ fun is_retry_verdict(vstate) {
 
 # Structured retry prompt — the grounded failure fed back to the agent so
 # the next attempt is aimed at the actual breakage, not a blind re-run.
-fun build_retry_prompt(title, body, repo, verdict, tail) {
-    bp = build_prompt(title, body, repo)
+fun build_retry_prompt(title, body, repo, protected, verdict, tail) {
+    bp = build_prompt(title, body, repo, protected)
     branch = detect_base(repo)
     bp ++ "\n\nYour previous attempt failed verification (" ++ verdict ++ "). Verify output tail:\n" ++ tail ++ "\nFix the code, run the checks yourself, commit again on this branch. If the failure was a merge conflict, first git rebase " ++ branch ++ " and resolve conflicts."
 }
@@ -207,18 +218,18 @@ fun build_retry_prompt(title, body, repo, verdict, tail) {
 # The prompt for a dispatch: a fresh task prompt, unless this is a retry of
 # a verify-red attempt, in which case the previous verdict + output tail are
 # folded in. Reads the LAST run BEFORE the caller creates the new run row.
-fun dispatch_prompt(db, iid, title, body, repo, attempt) {
+fun dispatch_prompt(db, iid, title, body, repo, protected, attempt) {
     if (attempt > 1) {
         lastrun = Store.last_run_for_issue(db, iid)
         vstate = if (lastrun == nil) { "" } else { str_or(map_get(lastrun, "verify_state"), "") }
         if (is_retry_verdict(vstate) == 'true') {
             vout = if (lastrun == nil) { "" } else { str_or(map_get(lastrun, "verify_output"), "") }
-            build_retry_prompt(title, body, repo, vstate, vout)
+            build_retry_prompt(title, body, repo, protected, vstate, vout)
         } else {
-            build_prompt(title, body, repo)
+            build_prompt(title, body, repo, protected)
         }
     } else {
-        build_prompt(title, body, repo)
+        build_prompt(title, body, repo, protected)
     }
 }
 
@@ -570,7 +581,7 @@ fun dispatch_one(db, issue, iid, attempt, running, now) {
         # Build the prompt BEFORE creating the new run row, so the retry path
         # reads the PREVIOUS run's verify verdict (not the one we're about to
         # insert, which would sort first by started_at).
-        prompt = dispatch_prompt(db, iid, title, body, repo, attempt)
+        prompt = dispatch_prompt(db, iid, title, body, repo, protected, attempt)
         run_id = Store.run_create(db, iid, agent_id, attempt, "Running", workspace)
         _s = Store.issue_set_status(db, iid, "In Progress")
         _as = Store.issue_assign(db, iid, agent_id)
@@ -620,12 +631,13 @@ fun run_claude_code(orch, run_id, issue_id, prompt, workspace, repo, session_id)
     # agent work live. The final {type:"result"} event carries cost
     # and session — parse_stream_* find it after the run.
     first = claude_once(workspace, bin, resume)
-    # Claude sessions are scoped to the directory they were created in, and
-    # every issue gets its own worktree — so resuming the agent's session from
-    # a previous issue can fail outright ("No conversation found"). A resumed
-    # run that dies without producing a session is retried once fresh, so a
-    # stale id can't crash every run the agent is handed.
-    stale = string_length(resume) > 0 && elem(first, 0) != 0 && elem(first, 0) != 124 && string_length(parse_stream_session(f"{workspace}/stream.jsonl")) == 0
+    # A stored session id can go stale (session pruned, CLI or machine
+    # changed, or an inherited parent id — see agent_env), and `--resume`
+    # then fails before doing any work: "No conversation found". Retry once
+    # fresh so a stale id can't crash every run the agent is handed. (The
+    # failed resume still emits a result event echoing the bad id, so the
+    # stderr message — not a missing session — is the signal.)
+    stale = string_length(resume) > 0 && elem(first, 0) != 0 && string_contains(file_read(f"{workspace}/err.log"), "No conversation found") == 'true'
     result = if (stale) { claude_once(workspace, bin, "") } else { first }
     code = elem(result, 0)
     cost = run_cost(code, parse_stream_cost(f"{workspace}/stream.jsonl"))
@@ -644,7 +656,7 @@ fun run_claude_code(orch, run_id, issue_id, prompt, workspace, repo, session_id)
 # timeout in C, and killpg's on expiry (exit 124), ahead of the sweeper.
 fun claude_once(workspace, bin, resume) {
     turns = max_turns()
-    cmd = f"cd {workspace} && cat PROMPT.txt | env -u O_API_TOKEN {bin} -p{resume} --max-turns {turns} --dangerously-skip-permissions --verbose --output-format stream-json > stream.jsonl 2> err.log"
+    cmd = f"cd {workspace} && cat PROMPT.txt | {agent_env()} {bin} -p{resume} --max-turns {turns} --dangerously-skip-permissions --verbose --output-format stream-json > stream.jsonl 2> err.log"
     shell_managed(cmd, stall_timeout())
 }
 
@@ -744,7 +756,7 @@ fun run_swarm_code(orch, run_id, issue_id, prompt, workspace, repo) {
     }
     _w = file_write(f"{workspace}/PROMPT.txt", prompt)
     bin = swarm_bin()
-    cmd = f"cd {workspace} && cat PROMPT.txt | env -u O_API_TOKEN SWARM_CODE_CWD={workspace} {bin} -p --json > result.json 2> err.log"
+    cmd = f"cd {workspace} && cat PROMPT.txt | {agent_env()} SWARM_CODE_CWD={workspace} {bin} -p --json > result.json 2> err.log"
     # shell_managed: see run_claude_code — plain shell() caps at 120s + orphans.
     result = shell_managed(cmd, stall_timeout())
     code = elem(result, 0)
@@ -815,17 +827,17 @@ fun chat_worker(dbpath, agent_id, message) {
 fun chat_invoke(runtime, workspace, session_id) {
     if (runtime == "swarm-code") {
         bin = swarm_bin()
-        _r = shell_managed(f"cd {workspace} && cat CHAT.txt | env -u O_API_TOKEN SWARM_CODE_CWD={workspace} {bin} -p --json > reply.json 2> err.log", 300000)
+        _r = shell_managed(f"cd {workspace} && cat CHAT.txt | {agent_env()} SWARM_CODE_CWD={workspace} {bin} -p --json > reply.json 2> err.log", 300000)
         %{reply: chat_reply_swarm(f"{workspace}/reply.json"), session: ""}
     } else {
         bin = claude_bin()
         resume = if (string_length(session_id) > 0) { f" --resume {session_id}" } else { "" }
-        _r = shell_managed(f"cd {workspace} && cat CHAT.txt | env -u O_API_TOKEN {bin} -p{resume} --dangerously-skip-permissions --output-format json > reply.json 2> err.log", 300000)
+        _r = shell_managed(f"cd {workspace} && cat CHAT.txt | {agent_env()} {bin} -p{resume} --dangerously-skip-permissions --output-format json > reply.json 2> err.log", 300000)
         reply = chat_reply_claude(f"{workspace}/reply.json")
         if (reply == "(no reply)") {
             # the stored session was stale / not found in this dir —
             # retry once with a fresh session so chat never dead-ends.
-            _r2 = shell_managed(f"cd {workspace} && cat CHAT.txt | env -u O_API_TOKEN {bin} -p --dangerously-skip-permissions --output-format json > reply.json 2> err.log", 300000)
+            _r2 = shell_managed(f"cd {workspace} && cat CHAT.txt | {agent_env()} {bin} -p --dangerously-skip-permissions --output-format json > reply.json 2> err.log", 300000)
             %{reply: chat_reply_claude(f"{workspace}/reply.json"), session: parse_session(f"{workspace}/reply.json")}
         } else {
             %{reply: reply, session: parse_session(f"{workspace}/reply.json")}
@@ -906,7 +918,7 @@ fun reflect_worker(dbpath, company_id, port) {
         _mk = shell(f"mkdir -p {dir}")
         _w = file_write(f"{dir}/PROMPT.txt", prompt)
         bin = claude_bin()
-        cmd = f"cd {dir} && cat PROMPT.txt | env -u O_API_TOKEN {bin} -p --dangerously-skip-permissions --max-turns 15 --verbose --output-format stream-json > stream.jsonl 2> err.log"
+        cmd = f"cd {dir} && cat PROMPT.txt | {agent_env()} {bin} -p --dangerously-skip-permissions --max-turns 15 --verbose --output-format stream-json > stream.jsonl 2> err.log"
         # shell_managed: see run_claude_code — plain shell() caps at 120s + orphans.
         _r = shell_managed(cmd, 600000)
         cost = parse_stream_cost(f"{dir}/stream.jsonl")
@@ -1189,7 +1201,10 @@ fun run_verify(orch, run_id, issue_id, ws, repo, base, verify_cmd, protected) {
         rd = shell(f"git -C {ws} diff --no-renames --name-only {base}...HEAD")
         files = string_split(string_trim(elem(rd, 1)), "\n")
         if (any_protected(files, protected) == 'true') {
-            send(orch, {'verify_done', run_id, issue_id, "red_protected", ""})
+            # The changed-file list is the tail, so the retry prompt shows the
+            # agent exactly what tripped the fence.
+            ptail = "Commit touches protected paths (" ++ protected ++ "). Files changed vs base:\n" ++ string_trim(elem(rd, 1))
+            send(orch, {'verify_done', run_id, issue_id, "red_protected", ptail})
         } else {
             logpath = f"{ws}/verify.log"
             # shell_managed (not shell — 120s cap + orphaning) with a grace margin

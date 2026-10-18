@@ -152,7 +152,9 @@ SH
 cat > "$SCRATCH/verify.sh" <<'SH'
 #!/bin/sh
 if [ -f boom ] && [ ! -f PROMPT.txt ]; then echo "regression: boom without PROMPT.txt"; exit 1; fi
-sh tests.sh
+sh tests.sh || exit 1
+# agents add tests as new tests_*.sh files (verify.sh + tests.sh are protected)
+for t in tests_*.sh; do [ -f "$t" ] || continue; sh "$t" || exit 1; done
 SH
 
 echo "scratch acceptance project" > "$SCRATCH/README.md"
@@ -194,7 +196,7 @@ if [ "$MODE" = "real" ]; then
     -d '{"name":"Builder","role":"engineer","runtime":"claude-code","repo":"'"$SCRATCH"'"}' >/dev/null
   resp="$(ocurl -s -X POST "$BASE/api/companies/$CID/issues" \
     -H 'Content-Type: application/json' \
-    -d '{"title":"Add a slugify function to lib.sh with a test in tests.sh","priority":"high"}')"
+    -d '{"title":"Add a slugify function to lib.sh with a test in a new tests_slugify.sh","priority":"high"}')"
   IID_BUILD="$(jget "$resp" 'd["id"]')"
   CAP=900
 else
