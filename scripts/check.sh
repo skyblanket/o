@@ -21,6 +21,8 @@ DAEMON2_PID=""
 TMP2=""
 DAEMON3_PID=""
 TMP3=""
+DAEMON4_PID=""
+TMP4=""
 
 cleanup() {
   if [ -n "$DAEMON_PID" ]; then
@@ -40,6 +42,13 @@ cleanup() {
   fi
   if [ -n "$TMP2" ]; then
     rm -rf "$TMP2" 2>/dev/null || true
+  fi
+  if [ -n "$DAEMON4_PID" ]; then
+    kill "$DAEMON4_PID" 2>/dev/null || true
+    wait "$DAEMON4_PID" 2>/dev/null || true
+  fi
+  if [ -n "$TMP4" ]; then
+    rm -rf "$TMP4" 2>/dev/null || true
   fi
   if [ -n "$TMP3" ]; then
     rm -rf "$TMP3" 2>/dev/null || true
@@ -977,6 +986,67 @@ sleep 6
 nsp2="$(sqlite3 "$TMP3/o.db" "SELECT COUNT(*) FROM activity WHERE company_id='$CID_R' AND verb='reflect.spawn'")"
 [ "$nsp2" = "1" ] || fail "reflect: expected exactly 1 reflect.spawn (at-most-once/day), got ${nsp2}"
 pass "reflect: at-most-once per day (single reflect.spawn after extra ticks)"
+
+# ============================================================
+# Review gate — 4th daemon, O_REVIEW=1, stub reviewer
+# ============================================================
+# The stub stands in for `claude -p`: it reads the review prompt on stdin and
+# REJECTs when the issue title carries [review:reject], else APPROVEs, always
+# reporting $0.01. A [sim:good] change passes verify either way, so the
+# reviewer alone decides: approve -> merged Done; reject -> red_review on every
+# attempt -> Failed, with the reviewer's reason recorded as the verify tail.
+TMP4="$(mktemp -d)"
+PORT4=$((5300 + RANDOM % 300))
+BASE4="http://127.0.0.1:${PORT4}"
+cat > "$TMP4/claude-stub" <<'STUB'
+#!/bin/sh
+in="$(cat)"
+case "$in" in
+  *"[review:reject]"*) printf '%s' '{"type":"result","result":"REJECT: stub reviewer says the change is wrong","total_cost_usd":0.01}' ;;
+  *) printf '%s' '{"type":"result","result":"APPROVE","total_cost_usd":0.01}' ;;
+esac
+STUB
+chmod +x "$TMP4/claude-stub"
+HOME="$TMP4" O_DB="$TMP4/o.db" O_PORT="$PORT4" O_NO_OPEN=1 O_REVIEW=1 O_CLAUDE_BIN="$TMP4/claude-stub" \
+  ./bin/swarmd >"$TMP4/daemon.log" 2>&1 &
+DAEMON4_PID=$!
+up4=""
+for _i in $(seq 1 30); do
+  code="$(ocurl -s -o /dev/null -w '%{http_code}' "$BASE4/api/health" 2>/dev/null || true)"
+  if [ "$code" = "200" ]; then up4="1"; break; fi
+  sleep 0.5
+done
+[ -n "$up4" ] || { cat "$TMP4/daemon.log" || true; fail "review daemon never came up"; }
+SCRATCHV="$TMP4/projv"
+mkdir -p "$SCRATCHV"
+git -C "$SCRATCHV" init -q -b main
+git -C "$SCRATCHV" config user.email "o@example.com"
+git -C "$SCRATCHV" config user.name "O Test"
+cp "$SCRATCH/verify.sh" "$SCRATCHV/verify.sh"
+echo "review project" > "$SCRATCHV/README.md"
+git -C "$SCRATCHV" add -A
+git -C "$SCRATCHV" commit -q -m "seed review project"
+resp="$(ocurl -s -X POST "$BASE4/api/companies" -H 'Content-Type: application/json' \
+  -d "{\"name\":\"Review Co\",\"issue_prefix\":\"REV\",\"budget_monthly_cents\":1000000,\"repo\":\"$SCRATCHV\",\"verify_cmd\":\"sh verify.sh\",\"protected_paths\":\"protected/\"}")"
+CIDV="$(jget "$resp" 'd["id"]')"
+ocurl -s -X POST "$BASE4/api/companies/$CIDV/agents" \
+  -H 'Content-Type: application/json' -d '{"name":"Revsim","runtime":"sim"}' >/dev/null
+IID_APP="$(jget "$(ocurl -s -X POST "$BASE4/api/companies/$CIDV/issues" -H 'Content-Type: application/json' -d '{"title":"[sim:good] reviewer approves"}')" 'd["id"]')"
+IID_REJ="$(jget "$(ocurl -s -X POST "$BASE4/api/companies/$CIDV/issues" -H 'Content-Type: application/json' -d '{"title":"[sim:good] [review:reject] reviewer rejects"}')" 'd["id"]')"
+wait_status_at "$BASE4" "$IID_APP" "Done" 90 || { cat "$TMP4/daemon.log"; fail "review: approved change never Done"; }
+git -C "$SCRATCHV" log --oneline main | grep "o/$IID_APP" >/dev/null || fail "review: approved change not merged"
+wait_status_at "$BASE4" "$IID_REJ" "Failed" 150 || { cat "$TMP4/daemon.log"; fail "review: rejected change never Failed"; }
+vs="$(sqlite3 "$TMP4/o.db" "SELECT verify_state FROM run WHERE issue_id='$IID_REJ' ORDER BY started_at DESC LIMIT 1")"
+[ "$vs" = "red_review" ] || fail "review: expected red_review, got '$vs'"
+sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_REJ' ORDER BY started_at DESC LIMIT 1" | grep -q "stub reviewer says" \
+  || fail "review: rejection reason not recorded for the retry prompt"
+git -C "$SCRATCHV" log --oneline main | grep -q "o/$IID_REJ" && fail "review: rejected change was merged"
+# (count per target: the verify-final fix issue auto-filed for the rejected one
+# is itself reviewed and may land review.pass rows of its own)
+npass="$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='review.pass' AND target='$IID_APP'")"
+nrej="$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='review.reject' AND target='$IID_REJ'")"
+[ "$npass" = "1" ] && [ "$nrej" = "3" ] || fail "review: expected 1 review.pass + 3 review.reject, got $npass + $nrej"
+pass "review gate: approve -> merged Done; reject x3 -> Failed red_review with reason, never merged"
 
 # ============================================================
 # Held-out invariant suite — the frozen core (tests/heldout/core.sh)

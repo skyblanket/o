@@ -87,6 +87,11 @@ O edits real repositories on its own. The guard rails are the point.
   that makes no commit, that touches a protected path, or whose verify command
   fails does not merge. Verdicts are recorded per run: `red_no_commit`,
   `red_protected`, `red_tests`, and so on.
+- **Review gate (opt-in, `O_REVIEW=1`).** Passing tests prove the tests pass,
+  not that the change is right. With the gate on, a second, read-only model
+  reviews each green diff against its issue before merge; a rejection is a
+  `red_review` verdict whose reason feeds the next attempt's prompt. It fails
+  closed: no parseable verdict counts as a rejection.
 - **Protected paths.** Each company declares `protected_paths`. An agent may not
   change them; a commit that does is rejected (`red_protected`) before it can
   merge. Renames count as touching both paths, and the agent's prompt lists the
@@ -195,6 +200,8 @@ The daemon reads its configuration from the environment. All are optional.
 | `O_REQUIRE_APPROVALS` | unset | set `1` to route agent hiring through `/api/approvals`. |
 | `O_API_TOKEN` | unset | when set, company / agent / approval writes need `Authorization: Bearer <token>`. The UI reads `VITE_O_TOKEN`, the MCP server `O_API_TOKEN`. |
 | `O_TIMEOUT_FLAT_CENTS` | `300` | cost charged for an agent run killed on its wall-clock cap. |
+| `O_REVIEW` | unset | set `1` to require a reviewer model's APPROVE before any green change merges. |
+| `O_REVIEW_MODEL` | claude default | model for the reviewer (e.g. a stronger one than the builder). |
 | `O_VERIFY_RERUNS` | `1` | post-merge verify re-runs before a red result counts as a regression. |
 
 ## API
