@@ -1346,7 +1346,9 @@ for _i in $(seq 1 90); do [ -n "$(pr_of "$IID_BH" 2>/dev/null)" ] && break; slee
 [ -n "$(pr_of "$IID_BH")" ] || fail "gate2: held PR never opened"
 tmpb="$(mktemp -d)"; git clone -q "$GHS/remote.git" "$tmpb/c"
 echo moved > "$tmpb/c/main-moved.txt"; git -C "$tmpb/c" add main-moved.txt
-git -C "$tmpb/c" -c user.email=h@x -c user.name=human commit -q -m "main moves on"; git -C "$tmpb/c" push -q origin main
+git -C "$tmpb/c" -c user.email=h@x -c user.name=human commit -q -m "main moves on"
+# Other gate2 PRs may still be landing on main: rebase and retry the push.
+for _i in 1 2 3 4 5; do git -C "$tmpb/c" push -q origin main 2>/dev/null && break; git -C "$tmpb/c" -c user.email=h@x -c user.name=human pull -q --rebase origin main; done
 sed -i "\|o/$IID_BH|d" "$GHS/hold_ci"
 wait_status_at "$BASE4" "$IID_BH" "Done" 120 || { tail -30 "$TMP4/daemon.log"; fail "gate2: PR behind main never merged"; }
 [ -f "$GHS/updated_$(pr_of "$IID_BH")" ] || fail "gate2: O merged a PR that was behind main without updating it"
