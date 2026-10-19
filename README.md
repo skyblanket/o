@@ -165,6 +165,11 @@ curl -s -X POST localhost:4100/api/companies -H 'Content-Type: application/json'
   goes back to the agent, and its next push updates the same PR. If GitHub
   refuses the merge (required reviews, say), the issue parks in **In Review**
   with the PR open for a human.
+- **In Review is watched.** Each poll checks parked PRs. One a human merged
+  becomes Done (`pr.merged`), and one a human closed becomes Canceled
+  (`pr.closed`). With the merge gate on, a PR that PR-only mode parked is
+  adopted by the maintainer (`pr.adopted`). Gate escalations and merges GitHub
+  refused are never re-adopted.
 - `ship: "merge"` (the default) keeps the local serialized merge, with
   post-merge verify and auto-revert.
 

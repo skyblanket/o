@@ -11,7 +11,7 @@ module Store
 
 export [next_id, companies, company_row, company_create, company_update,
         company_add_spend, enforce_budget, rollover_day, company_mark_green, global_spent_today,
-        company_touch_reflect, companies_to_reflect, company_set_github, companies_with_github, company_set_maintainer,
+        company_touch_reflect, companies_to_reflect, company_set_github, companies_with_github, company_set_maintainer, issues_in_review,
         issues_for, issue_row, issue_create, issue_create_auto, issue_create_with_origin, issue_open_fp_count, issue_import_github,
         issue_set_status, issue_assign, issue_update, open_issue_titles,
         log_activity, activity_recent, activity_since, candidate_issues,
@@ -56,6 +56,12 @@ fun company_update(db, id, budget, status, repo, verify_cmd, protected_paths, bu
 fun company_set_github(db, id, github_repo, ship) {
     _u = db_query(db, "UPDATE company SET github_repo = ?, ship = ?, updated_at = ? WHERE id = ?", [github_repo, ship, timestamp(), id])
     id
+}
+
+# Issues parked In Review on a PR-mode company: what the review poller
+# watches for a human merge or close (and, with the merge gate on, adopts).
+fun issues_in_review(db) {
+    db_query(db, "SELECT i.id, i.company_id, c.github_repo FROM issue i JOIN company c ON c.id = i.company_id WHERE i.status = 'In Review' AND c.status = 'active' AND c.ship = 'pr' AND c.github_repo != ''", [])
 }
 
 fun company_set_maintainer(db, id, session, reviews) {
