@@ -1039,6 +1039,9 @@ chmod +x "$TMP4/claude-stub"
 cat > "$TMP4/gh-stub" <<'STUB'
 #!/bin/sh
 [ "$1" = "api" ] || { echo "gh-stub: only 'gh api' is supported, got: $*" >&2; exit 2; }
+# One call at a time, like a real server: concurrent PR creates must not hand
+# out the same number, and concurrent merges must not race the push.
+exec 9>"$GHS/.lock"; flock 9
 shift
 method=GET; path=""; head=""; bodyf=""
 while [ $# -gt 0 ]; do
@@ -1233,7 +1236,12 @@ IID_GX="$(gh_issue '[sim:good] [gate:changes] needs work')"
 IID_GE="$(gh_issue '[sim:good] [gate:escalate] api change')"
 IID_GS="$(gh_issue '[sim:good] [gate:silent] mute reviewer')"
 wait_status_at "$BASE4" "$IID_GM" "Done" 120 || { tail -40 "$TMP4/daemon.log"; fail "gate: MERGE verdict never Done"; }
-git -C "$GHS/remote.git" log --oneline main | grep -q "o/$IID_GM" || fail "gate: MERGE verdict did not merge the PR"
+git -C "$GHS/remote.git" log --oneline main | grep -q "o/$IID_GM" || {
+  echo "--- remote main:"; git -C "$GHS/remote.git" log --oneline main | head -20
+  echo "--- PR map:"; for f in "$GHS"/pr_*; do echo "$(basename "$f") $(cat "$f")"; done; ls "$GHS" | grep merged_
+  echo "--- activity for $IID_GM:"; sqlite3 "$TMP4/o.db" "SELECT verb FROM activity WHERE target='$IID_GM' ORDER BY ts"
+  grep -v "\[orch\] tick" "$TMP4/daemon.log" | tail -25
+  fail "gate: MERGE verdict did not merge the PR"; }
 grep -q "Gate decision" "$GHS/comments_$(pr_of "$IID_GM")" || fail "gate: no review comment posted on the merged PR"
 wait_status_at "$BASE4" "$IID_GE" "In Review" 120 || { tail -40 "$TMP4/daemon.log"; fail "gate: ESCALATE never parked In Review"; }
 wait_status_at "$BASE4" "$IID_GS" "In Review" 120 || fail "gate: missing VERDICT did not fail closed to In Review"
