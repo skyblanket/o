@@ -261,6 +261,14 @@ O acts with your GitHub token, and GitHub won't let a PR's author approve their
 own PR. So the maintainer's review is a comment, and the merge works as long as
 branch protection doesn't require an approving review.
 
+### O on O
+
+O maintains its own repo the same way. This repo's [`.o-review.json`](.o-review.json) splits changes into tiers:
+- **Automatic on APPROVE:** docs, UI, and the API/store code.
+- **Needs a human:** changes to the gate and sandbox (`src/orchestrator.sw`).
+
+Run the company with `verify_cmd: "make && ./tests/heldout/core.sh"` and protected paths `tests/heldout/,scripts/check.sh,.github/,.o-review.json`, and set `SWARMRT=/path/to/swarmrt` in the daemon's environment so agents and the gate can build. A merged change takes effect only when you rebuild and restart the daemon.
+
 ## Personas: simulated users
 
 Tests check what the authors thought of. Personas check what a user hits. Once a
