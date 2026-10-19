@@ -25,7 +25,8 @@ export [next_id, companies, company_row, company_create, company_update,
         companies_persona_due, company_touch_persona, company_add_persona_spend,
         persona_run_create, persona_run_row, persona_runs_for, persona_run_report, persona_run_finish, persona_run_add_report,
         issue_link_persona, issue_open_by_fp, issue_append_body,
-        persona_confirm_due, issue_set_scenario_state, company_set_persona]
+        persona_confirm_due, issue_set_scenario_state, company_set_persona,
+        persona_run_set_issue, persona_runs_reap]
 
 # Ask the registered `idgen` process for a fresh unique id.
 fun next_id(prefix) {
@@ -185,7 +186,7 @@ fun company_mark_green(db, id) {
 # Total daily spend across all companies — the input to the global
 # daily cap the orchestrator enforces before dispatching.
 fun global_spent_today(db) {
-    rows = db_query(db, "SELECT COALESCE(SUM(spent_today_cents), 0) AS total FROM company", [])
+    rows = db_query(db, "SELECT COALESCE(SUM(spent_today_cents + persona_spent_today), 0) AS total FROM company", [])
     if (length(rows) == 0) { 0 } else { map_get(hd(rows), "total") }
 }
 
@@ -612,6 +613,18 @@ fun persona_run_finish(db, run_id, cost, quiet) {
 # (verify_scenario_after_fix: 1 = owed, 2 = running, 3 = settled).
 fun persona_confirm_due(db) {
     db_query(db, "SELECT i.id, i.company_id, i.identifier, i.title, i.persona_id, i.origin, i.fingerprint FROM issue i JOIN company c ON c.id = i.company_id WHERE i.verify_scenario_after_fix = 1 AND i.status = 'Done' AND i.persona_id != '' AND c.status = 'active' LIMIT 4", [])
+}
+
+fun persona_run_set_issue(db, run_id, issue_id) {
+    _u = db_query(db, "UPDATE persona_run SET issue_id = ? WHERE id = ?", [issue_id, run_id])
+    run_id
+}
+
+# A worker that died without reporting back leaves its run "running" forever;
+# anything older than `older_than_ms` is closed out as an error.
+fun persona_runs_reap(db, cutoff) {
+    _u = db_query(db, "UPDATE persona_run SET outcome = 'error', ended_at = ? WHERE ended_at = 0 AND started_at < ?", [timestamp(), cutoff])
+    ""
 }
 
 fun issue_set_scenario_state(db, id, v) {
