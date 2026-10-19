@@ -24,7 +24,7 @@ Postgres and no container: an embedded SQLite file is the whole control plane.
 | **Protected paths** | Nothing in the fence was touched, renamed or deleted. The tests that judge the agent sit behind it. |
 | **Review gate** | A second, read-only model approves the diff against the issue (`O_REVIEW=1`). |
 | **CI** | In PR mode, your repo's own checks go green on the PR (`ship: "pr"`). |
-| **Merge gate** | A long-lived maintainer model (Opus by default), with the whole repo in context, decides MERGE, CHANGES or ESCALATE (`O_MERGE_GATE=1`). |
+| **Merge gate** | O builds and runs the PR merged with main and proves new tests fail without the change. Then a long-lived maintainer (Opus by default) probes it and returns APPROVE, REJECT or UNVERIFIED (`O_MERGE_GATE=1`). |
 | **Post-merge verify** | Still green on main after the merge. If not, O auto-reverts and files a fix. |
 
 Every red verdict goes back to the agent with the actual failure output, so it
@@ -65,7 +65,8 @@ git clone https://github.com/skyblanket/swarmrt   # sibling of this repo
 git clone https://github.com/skyblanket/o
 cd o
 make                 # -> bin/swarmd   (or: make SWARMRT=/path/to/swarmrt)
-make check           # hermetic end-to-end test suite (sim runtime, no tokens)
+make check-fast      # ~10s: build + held-out invariants (run before every push)
+make check           # ~2.5 min: full hermetic end-to-end suite (sim runtime, no tokens)
 ./scripts/acceptance.sh                  # whole-loop acceptance, stub agent
 O_ACCEPT_REAL=1 ./scripts/acceptance.sh  # same, with a real claude agent (spends tokens)
 ```
@@ -93,6 +94,26 @@ claude mcp add o -- node "$PWD/mcp/server.js"
 
 The control plane lives at `~/.o/o.db`; per-issue worktrees live under
 `~/.o/workspaces/`. Nothing else is created.
+
+## Run it 24/7
+
+O is a long-running daemon. Give it a machine that stays up (your Linux box
+or a small VM), and it keeps working its repos:
+
+```sh
+git clone https://github.com/skyblanket/o && cd o
+gh auth login            # GitHub access for issues and PRs
+claude                   # log in once, interactively
+deploy/install.sh        # builds swarmrt + O, installs a systemd user service
+loginctl enable-linger "$USER"   # keep it running after you log out
+```
+
+Settings live in `~/.config/o/o.env` (start from `deploy/o.env.example`: set
+`O_API_TOKEN`, keep `O_SANDBOX=bwrap`, choose `O_MERGE_GATE` or
+`O_PR_AUTOMERGE=0`). Then use `systemctl --user restart o` and
+`journalctl --user -u o -f`. Restarts are safe: in-flight issues are recovered
+with their attempt counts. To add a repo, clone it on the machine and create a
+company with `ship: "pr"`, `github_repo` and a `.o-review.json` in the repo.
 
 ## Safety model
 
@@ -173,34 +194,126 @@ curl -s -X POST localhost:4100/api/companies -H 'Content-Type: application/json'
 - `ship: "merge"` (the default) keeps the local serialized merge, with
   post-merge verify and auto-revert.
 
-### Merge gate: a persistent maintainer
+### Merge gate: a persistent maintainer that runs the code
 
 With `O_MERGE_GATE=1`, a PR whose CI is green isn't merged automatically. It
 goes to one long-lived **maintainer** session per company (`O_MERGE_MODEL`,
-default `claude-opus-5-5`):
+default `claude-opus-5-5`), and nothing merges on reading alone.
 
-- **One session, resumed for every PR.** It learns the repo once and keeps that
-  context, re-reading files when it needs detail (after a compaction, say).
-  It works from `~/.o/maintainer/<company>/`, with each PR's checkout attached
-  read-only by `--add-dir`.
-- **`NOTES.md` is its durable memory.** It records conventions, pitfalls and
-  past decisions there. Every `O_MAINTAINER_ROTATE` reviews (default 25) it
-  starts a fresh session primed from `NOTES.md`, so it never drifts on a stale
-  view of the repo.
-- **Verdicts:**
-  - **MERGE**: O merges the PR.
-  - **CHANGES**: the findings go back to the builder (`red_merge_gate`), and
-    its next push updates the same PR.
-  - **ESCALATE**: the PR parks **In Review** for a human. A missing verdict
-    counts as ESCALATE.
-- PRs touching `O_ESCALATE_PATHS`, or larger than `O_ESCALATE_LINES` (default
-  1000), always go to a human. Every review is posted on its PR.
-- One review at a time: a single maintainer process serializes them, so a
-  session is never resumed twice at once.
+**1. O's own checks run first, with no model involved.** O makes a
+disposable clone of the PR **merged with current base**. It has no git
+remotes, and `GH_TOKEN` is stripped, so nothing in it can push. In that clone
+O runs the commands from `.o-review.json`:
+- the build
+- every new or changed test, which must pass on the PR **and fail on base
+  without the change**, so a test that can't fail is a REJECT
+- the suite
+- the extra commands of the change's risk tier
+
+The first unexpected result is a REJECT, and the model is never asked.
+
+**2. Then the maintainer reviews, building and probing in that clone.** It
+has Bash there, and a rubric that makes it look for reasons the change is
+wrong: kill the caller, check what runs after `fork()`, run concurrent calls,
+try another OS, look for tests that pass by default, and probe cases beyond
+the issue's list. Its session is resumed for every PR. `NOTES.md` in
+`~/.o/maintainer/<company>/` is its durable memory, and every
+`O_MAINTAINER_ROTATE` reviews (default 25) it starts a fresh session primed
+from `NOTES.md`.
+
+**3. The verdict is the last `VERDICT:` line.** The same protocol is used for
+the pre-PR screen.
+
+| Verdict | Result |
+|---|---|
+| `APPROVE` | Merged, unless the change's tier needs a human. |
+| `REJECT: <findings>` | `red_merge_gate`: the findings go to the builder, and its next push updates the same PR. |
+| `UNVERIFIED: <what couldn't run>` | Waits for a human. A missing verdict counts as UNVERIFIED, and so does an APPROVE from a session that ran no command at all. |
+
+**4. Evidence:** every decision is posted on the PR, with O's check log and
+every command the maintainer ran (taken from its tool calls, not its own
+summary).
+
+#### `.o-review.json`
+The file is read from the **base** branch, so a PR can't relax the checks
+that judge it. Protect `.o-review.json` with `protected_paths`. (It is a root file rather than an `.o/` directory because C projects routinely `.gitignore` `*.o`, which would hide `.o/`.)
+
+```json
+{ "build": "make swc libswarmrt",
+  "suite": "make test-sw",
+  "test_runners": [
+    { "paths": ["tests/sw/test_"], "cmd": "./bin/swc build {file} -o /tmp/o-t && /tmp/o-t", "prove_fails": true } ],
+  "required_checks": ["quickstart", "hardening-gates", "macos", "fuzz"],
+  "tiers": [
+    { "name": "docs",     "paths": ["docs/", "README.md"], "merge": "auto" },
+    { "name": "language", "paths": ["src/swarmrt_lang.c", "lib/"], "merge": "auto", "extra": ["make test-sw"] },
+    { "name": "runtime",  "paths": ["src/"], "merge": "human", "extra": ["make test-full"] } ],
+  "default_merge": "human" }
+```
+
+- **CI must be green on the PR merged with current base:** every
+  `required_checks` name has to have reported success, and when base moves on,
+  O updates the PR branch and waits for CI again.
+- **One PR per issue:** when O gives up on an issue, it closes that issue's PR
+  with the reason, so a superseded attempt can't be merged. The follow-up issue
+  carries the `Closes #N` link.
 
 O acts with your GitHub token, and GitHub won't let a PR's author approve their
 own PR. So the maintainer's review is a comment, and the merge works as long as
 branch protection doesn't require an approving review.
+
+### O on O
+
+O maintains its own repo the same way. This repo's [`.o-review.json`](.o-review.json) splits changes into tiers:
+- **Automatic on APPROVE:** docs, UI, and the API/store code.
+- **Needs a human:** changes to the gate and sandbox (`src/orchestrator.sw`).
+
+Run the company with `verify_cmd: "make check-fast"` and protected paths `tests/heldout/,scripts/check.sh,.github/,.o-review.json`, and set `SWARMRT=/path/to/swarmrt` in the daemon's environment so agents and the gate can build. A merged change takes effect only when you rebuild and restart the daemon.
+
+## Personas: simulated users
+
+Tests check what the authors thought of. Personas check what a user hits. Once a
+day (`O_PERSONAS=1`) O sends a few simulated users at the product, each with a
+role, a realistic goal and a starting doc, and lets them try to get there from
+the docs alone. Each one gets a clean export of the base branch: no `.git`, no
+board, no other reports, no fix diffs.
+
+What blocks them comes back as an issue with a verbatim repro:
+
+| severity | what it means | becomes |
+|---|---|---|
+| `blocked` | can't get any further toward the goal | a high-priority issue |
+| `wrong` | the docs say X, the product does Y | a medium issue |
+| `friction` | got there, but had to guess | an entry in the week's digest issue |
+
+- **Repro or nothing.** A report needs `steps` and the verbatim `actual` output,
+  or it's refused with a 400.
+- **Dedup.** Reports are fingerprinted on the first line of `actual` with paths,
+  numbers and addresses stripped (or on doc section + title for `wrong`), so two
+  personas hitting the same error file one issue.
+- **Judge (optional).** With `O_PERSONA_JUDGE=1`, a second cheap pass reads each
+  report against the checkout and drops NOISE, such as the persona's own
+  mistakes and sandbox artifacts.
+- **Confirmation.** When a persona-found issue reaches Done, the same persona
+  re-runs the scenario on the new version. If it passes, O logs
+  `persona.confirmed`. If it fails, O files a fix issue, and depth-1 stops the
+  chain there.
+- **Safety and cost.** Personas run whatever the docs tell them to, so they run
+  only under `O_SANDBOX=bwrap` (or with an explicit `O_PERSONAS_UNSANDBOXED=1`),
+  and their prompt treats everything in the checkout as data, not instructions.
+  They have their own daily budget (`persona_daily_cents`, default $2) and
+  default to a cheaper model (`O_PERSONA_MODEL`, default `haiku`).
+
+```sh
+curl -X POST localhost:4100/api/companies/<id>/personas -H 'Content-Type: application/json' \
+  -d '{"name":"Newcomer","role":"never seen the project","goal":"follow the README quick start",
+       "start":"README.md","done_when":"the tests pass"}'
+curl localhost:4100/api/companies/<id>/persona_runs      # runs, outcomes, reports
+```
+
+[`examples/personas/swarmrt.json`](examples/personas/swarmrt.json) has four
+personas for swarmrt: a newcomer, an eval-runner builder, an Erlang porter and a
+docs-only model.
 
 ## Feedback widget
 
@@ -269,6 +382,8 @@ The daemon reads its configuration from the environment. All are optional.
 
 | variable | default | meaning |
 |---|---|---|
+| `SW_SCHEDULERS` | CPU count | scheduler threads (a swarmrt setting). Each running agent, verify, gate review or persona holds one while its subprocess runs, and when all are held the API and orchestrator stall; set it well above how many can run at once (`deploy/o.env.example` uses 32). |
+| `O_TICK_MS` / `O_BACKOFF_MS` | `5000` / `2000` | orchestrator tick and base retry backoff in ms (the test suite runs at 500 / 300). |
 | `O_DB` | `~/.o/o.db` | control-plane SQLite path. |
 | `O_PORT` | `4100` | HTTP port. |
 | `O_CLAUDE_BIN` | `claude` on `PATH` | claude-code binary for the `claude-code` runtime. |
@@ -285,7 +400,8 @@ The daemon reads its configuration from the environment. All are optional.
 | `O_API_TOKEN` | unset | when set, company / agent / approval writes need `Authorization: Bearer <token>`. The UI reads `VITE_O_TOKEN`, the MCP server `O_API_TOKEN`. |
 | `O_TIMEOUT_FLAT_CENTS` | `300` | cost charged for an agent run killed on its wall-clock cap. |
 | `O_REVIEW` | unset | set `1` to require a reviewer model's APPROVE before any green change merges. |
-| `O_REVIEW_MODEL` | claude default | model for the reviewer (e.g. a stronger one than the builder). |
+| `O_MODEL_LADDER` | `haiku,sonnet,opus` | builder model by attempt: attempt 1 on the first, each retry after a red verdict one rung up, the last rung repeats. An agent's own `model` overrides it; `""` uses the CLI default. |
+| `O_REVIEW_MODEL` | `sonnet` | model for the pre-PR reviewer. |
 | `O_GH_BIN` | `gh` on `PATH` | GitHub CLI used for issue import and PRs. |
 | `O_GH_LABEL` | `o` | only open GitHub issues with this label are imported. |
 | `O_GH_POLL_S` | `60` | GitHub issue poll interval. |
@@ -297,7 +413,12 @@ The daemon reads its configuration from the environment. All are optional.
 | `O_MERGE_GATE` | unset | `1` sends every green PR to the persistent maintainer for MERGE / CHANGES / ESCALATE. |
 | `O_MERGE_MODEL` | `claude-opus-5-5` | the maintainer's model. |
 | `O_MAINTAINER_ROTATE` | `25` | reviews per maintainer session before a fresh one primed from `NOTES.md`. |
-| `O_ESCALATE_PATHS` / `O_ESCALATE_LINES` | unset / `1000` | PRs touching these path prefixes, or bigger than this, always go to a human. |
+| `O_ESCALATE_PATHS` / `O_ESCALATE_LINES` | unset / `1000` | PRs touching these path prefixes, or bigger than this, always go to a human (on top of `.o-review.json` tiers). |
+| `O_GATE_TIMEOUT_S` / `O_GATE_MAX_TURNS` | `3600` / `80` | wall-clock and turn caps for one gate review, checks included. |
+| `O_PERSONAS` | unset | `1` turns on the daily persona pass (needs `O_SANDBOX=bwrap` or `O_PERSONAS_UNSANDBOXED=1`). |
+| `O_PERSONA_MODEL` | `haiku` | default model for personas (a persona's own `model` wins). |
+| `O_PERSONA_MAX_TURNS` / `O_PERSONA_TIMEOUT_S` | `40` / `900` | turn and wall-clock caps for one persona run. |
+| `O_PERSONA_JUDGE` / `O_PERSONA_JUDGE_MODEL` | unset / `haiku` | `1` runs a REAL-or-NOISE judge over each report before it's filed. |
 | `O_VERIFY_RERUNS` | `1` | post-merge verify re-runs before a red result counts as a regression. |
 
 ## API

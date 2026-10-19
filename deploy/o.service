@@ -1,0 +1,22 @@
+# systemd user unit for the O daemon.
+#   install:  deploy/install.sh   (or copy to ~/.config/systemd/user/o.service)
+#   control:  systemctl --user {start|stop|restart|status} o
+#   logs:     journalctl --user -u o -f
+# Keep it running after logout:  loginctl enable-linger "$USER"
+[Unit]
+Description=O, the autonomous software loop (swarmd)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/o/o.env
+ExecStart=%h/.local/bin/swarmd
+Restart=always
+RestartSec=5
+# O restarts cleanly: in-flight runs are recovered with their attempt counts.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

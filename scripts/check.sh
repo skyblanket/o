@@ -12,6 +12,10 @@
 # failing assert can never leak a running daemon.
 set -euo pipefail
 
+# Fast clock for every daemon this suite boots (and the held-out suite):
+# half-second ticks and retry backoff instead of the 5s/2s production values.
+export O_TICK_MS="${O_TICK_MS:-500}" O_BACKOFF_MS="${O_BACKOFF_MS:-300}"
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
@@ -25,6 +29,8 @@ DAEMON4_PID=""
 TMP4=""
 DAEMON5_PID=""
 TMP5=""
+DAEMON6_PID=""
+TMP6=""
 
 cleanup() {
   if [ -n "$DAEMON_PID" ]; then
@@ -55,6 +61,13 @@ cleanup() {
   fi
   if [ -n "$TMP5" ]; then
     rm -rf "$TMP5" 2>/dev/null || true
+  fi
+  if [ -n "$DAEMON6_PID" ]; then
+    kill "$DAEMON6_PID" 2>/dev/null || true
+    wait "$DAEMON6_PID" 2>/dev/null || true
+  fi
+  if [ -n "$TMP6" ]; then
+    rm -rf "$TMP6" 2>/dev/null || true
   fi
   if [ -n "$TMP4" ]; then
     rm -rf "$TMP4" 2>/dev/null || true
@@ -1018,17 +1031,24 @@ case "$in" in
     if [ -n "$sid" ]; then echo "resume $sid" >> "$GHS/gate_calls"
     else n=$(( $(cat "$GHS/gate_ctr" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$GHS/gate_ctr"; sid="maint-$n"; echo "fresh $sid" >> "$GHS/gate_calls"; fi
     case "$in" in
-      *"[gate:changes]"*) v="VERDICT: CHANGES: add a regression test for the new path" ;;
-      *"[gate:escalate]"*) v="VERDICT: ESCALATE: this changes a public API" ;;
+      *"[gate:changes]"*) v="VERDICT: REJECT: add a regression test for the new path" ;;
+      *"[gate:escalate]"*) v="VERDICT: UNVERIFIED: could not run the fuzzer here" ;;
       *"[gate:silent]"*) v="I looked at it." ;;
-      *) v="VERDICT: MERGE" ;;
+      *) v="VERDICT: APPROVE" ;;
     esac
-    printf '{"type":"result","result":"Reviewed in context.\\n%s","total_cost_usd":0.02,"session_id":"%s"}' "$v" "$sid"
+    case "$in" in
+      *"[gate:nobash]"*) ;;
+      *) printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"make test"}}]}}' ;;
+    esac
+    # An interim result first, as the CLI emits when commands are still running
+    # in the background: O must read the LAST result event, not this one.
+    printf '{"type":"result","result":"The suite is still running in the background.","total_cost_usd":0.01,"session_id":"%s"}\n' "$sid"
+    printf '{"type":"result","result":"Reviewed in context.\\n%s","total_cost_usd":0.02,"session_id":"%s"}\n' "$v" "$sid"
     exit 0 ;;
 esac
 case "$in" in
-  *"[review:reject]"*) printf '%s' '{"type":"result","result":"REJECT: stub reviewer says the change is wrong","total_cost_usd":0.01}' ;;
-  *) printf '%s' '{"type":"result","result":"APPROVE","total_cost_usd":0.01}' ;;
+  *"[review:reject]"*) printf '%s' '{"type":"result","result":"Looked at it.\nVERDICT: REJECT: stub reviewer says the change is wrong","total_cost_usd":0.01}' ;;
+  *) printf '%s' '{"type":"result","result":"Looked at it.\nVERDICT: APPROVE","total_cost_usd":0.01}' ;;
 esac
 STUB
 chmod +x "$TMP4/claude-stub"
@@ -1047,7 +1067,7 @@ method=GET; path=""; head=""; bodyf=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -X) method="$2"; shift ;;
-    -f|-F) case "$2" in head=*) head="${2#head=}" ;; body=@*) bodyf="${2#body=@}" ;; esac; shift ;;
+    -f|-F) case "$2" in head=*) head="${2#head=}" ;; body=@*) bodyf="${2#body=@}" ;; state=*) newstate="${2#state=}" ;; esac; shift ;;
     *) path="$1" ;;
   esac
   shift
@@ -1070,6 +1090,16 @@ case "$method $path" in
       && git -c user.email=gh@x -c user.name=gh merge -q --no-ff --no-edit "origin/$b" \
       && git push -q origin main && touch "$GHS/merged_$n" \
       && echo "{\"merged\":true,\"sha\":\"$(git rev-parse HEAD)\"}" ;;
+  "PATCH repos/acme/widgets/pulls/"*)
+    n="${path#repos/acme/widgets/pulls/}"; [ "$newstate" = closed ] && touch "$GHS/closed_$n"; echo "{\"number\":$n}" ;;
+  "GET repos/acme/widgets/compare/"*)
+    spec="${path#repos/acme/widgets/compare/}"; cbase="${spec%%...*}"; csha="${spec#*...}"
+    nb="$(git -C "$GHS/remote.git" rev-list --count "$csha..$cbase" 2>/dev/null || echo 0)"; echo "{\"behind_by\":$nb}" ;;
+  "PUT repos/acme/widgets/pulls/"*/update-branch)
+    n="${path#repos/acme/widgets/pulls/}"; n="${n%/update-branch}"; b="$(cat "$GHS/pr_$n")"
+    tmp="$(mktemp -d)"; git clone -q "$GHS/remote.git" "$tmp/c" && cd "$tmp/c" && git checkout -q "$b" \
+      && git -c user.email=gh@x -c user.name=gh merge -q --no-edit origin/main && git push -q origin "$b" && touch "$GHS/updated_$n"
+    echo '{"message":"Updating pull request branch."}' ;;
   "DELETE repos/acme/widgets/git/refs/heads/"*) git -C "$GHS/remote.git" branch -q -D "${path#repos/acme/widgets/git/refs/heads/}" ;;
   "GET repos/acme/widgets/pulls/"*)
     n="${path#repos/acme/widgets/pulls/}"; b="$(cat "$GHS/pr_$n")"
@@ -1079,7 +1109,9 @@ case "$method $path" in
   "GET repos/acme/widgets/commits/"*/check-runs*)
     sha="${path#repos/acme/widgets/commits/}"; sha="${sha%%/*}"; b="$(cat "$GHS/sha_$sha" 2>/dev/null)"
     if listed fail_ci "$b"; then c=failure; else c=success; fi
-    echo "{\"check_runs\":[{\"name\":\"build\",\"status\":\"completed\",\"conclusion\":\"$c\"}]}" ;;
+    nm=build; listed only_lint "$b" && nm=lint
+    if listed hold_ci "$b"; then echo "{\"check_runs\":[{\"name\":\"$nm\",\"status\":\"in_progress\",\"conclusion\":null}]}"
+    else echo "{\"check_runs\":[{\"name\":\"$nm\",\"status\":\"completed\",\"conclusion\":\"$c\"}]}"; fi ;;
   "GET repos/acme/widgets/commits/"*/status) echo '{"state":"success","statuses":[]}' ;;
   "POST repos/acme/widgets/issues/"*/comments)
     n="${path#repos/acme/widgets/issues/}"; n="${n%/comments}"; cat "$bodyf" >> "$GHS/comments_$n"; echo '{"id":1}' ;;
@@ -1143,6 +1175,15 @@ SEEDGH="$TMP4/seedgh"
 git clone -q "$GHS/remote.git" "$SEEDGH"
 git -C "$SEEDGH" config user.email "o@example.com"; git -C "$SEEDGH" config user.name "O Test"
 cp "$SCRATCH/verify.sh" "$SEEDGH/verify.sh"; echo "gh project" > "$SEEDGH/README.md"
+: # config lives at the repo root
+cat > "$SEEDGH/.o-review.json" <<'JSON'
+{ "build": "true",
+  "suite": "true",
+  "test_runners": [ { "paths": ["tests/"], "cmd": "sh {file}", "prove_fails": true } ],
+  "required_checks": ["build"],
+  "tiers": [ { "name": "docs", "paths": ["docs/", "README.md"], "merge": "auto" },
+             { "name": "runtime", "paths": ["risky/"], "merge": "human", "extra": ["true"] } ] }
+JSON
 git -C "$SEEDGH" add -A; git -C "$SEEDGH" commit -q -m "seed gh project"; git -C "$SEEDGH" push -q origin main
 GHREPO="$TMP4/ghclone"
 git clone -q "$GHS/remote.git" "$GHREPO"
@@ -1168,7 +1209,7 @@ git -C "$GHREPO" worktree add -q "$TMP4/.o/workspaces/$IID_BLK" -b "o/$IID_BLK" 
 rm -rf "$TMP4/.o/workspaces/$IID_BLK"
 echo "o/$IID_CIF" > "$GHS/fail_ci"
 echo "o/$IID_BLK" > "$GHS/block_merge"
-echo '[{"number":7,"title":"[sim:good] from github","body":"filed on GitHub"},{"number":8,"title":"[sim:good] a PR, not an issue","body":"","pull_request":{"url":"x"}}]' > "$GHS/issues.json"
+echo '[{"number":7,"title":"[sim:good] from github","body":"filed on GitHub"},{"number":8,"title":"[sim:good] a PR, not an issue","body":"","pull_request":{"url":"x"}},{"number":9,"title":"[sim:no-commit] from github, never commits","body":"x"}]' > "$GHS/issues.json"
 ocurl -s -X POST "$BASE4/api/companies/$CIDG/agents" \
   -H 'Content-Type: application/json' -d '{"name":"Ghsim","runtime":"sim"}' >/dev/null
 IID_GH=""
@@ -1242,7 +1283,7 @@ git -C "$GHS/remote.git" log --oneline main | grep "o/$IID_GM" >/dev/null || {
   echo "--- activity for $IID_GM:"; sqlite3 "$TMP4/o.db" "SELECT verb FROM activity WHERE target='$IID_GM' ORDER BY ts"
   grep -v "\[orch\] tick" "$TMP4/daemon.log" | tail -25
   fail "gate: MERGE verdict did not merge the PR"; }
-grep -q "Gate decision" "$GHS/comments_$(pr_of "$IID_GM")" || fail "gate: no review comment posted on the merged PR"
+grep "Decision:" "$GHS/comments_$(pr_of "$IID_GM")" >/dev/null || fail "gate: no review comment posted on the merged PR"
 wait_status_at "$BASE4" "$IID_GE" "In Review" 120 || { tail -40 "$TMP4/daemon.log"; fail "gate: ESCALATE never parked In Review"; }
 wait_status_at "$BASE4" "$IID_GS" "In Review" 120 || fail "gate: missing VERDICT did not fail closed to In Review"
 wait_status_at "$BASE4" "$IID_GX" "Failed" 180 || { tail -40 "$TMP4/daemon.log"; fail "gate: CHANGES x3 never Failed"; }
@@ -1255,7 +1296,7 @@ nfresh="$(grep -c '^fresh' "$GHS/gate_calls")"; nres="$(grep -c '^resume' "$GHS/
 while read -r kind sid; do
   [ "$kind" = "resume" ] && ! grep -qx "fresh $sid" "$GHS/gate_calls" && fail "gate: resumed unknown session $sid"
 done < "$GHS/gate_calls"
-pass "gate: MERGE merged, CHANGES -> red_merge_gate -> Failed, ESCALATE/no-verdict -> In Review; reviews posted; session resumed ($nres) and rotated ($nfresh)"
+pass "gate: APPROVE merged, REJECT -> red_merge_gate -> Failed, UNVERIFIED/no-verdict -> In Review; reviews posted; session resumed ($nres) and rotated ($nfresh)"
 
 # ---- In Review poller --------------------------------------------------
 # With the gate now on, the PR that PR-only mode parked earlier is adopted and
@@ -1276,11 +1317,58 @@ wait_status_at "$BASE4" "$IID_BLK" "Done" 30 || fail "poller: a human merge was 
 touch "$GHS/closed_$(pr_of "$IID_GE")"
 wait_status_at "$BASE4" "$IID_GE" "Canceled" 30 || fail "poller: a closed PR was not Canceled"
 pass "poller: PR-only PR adopted + merged by the gate; refused/escalated never re-adopted; human merge -> Done; closed -> Canceled"
+
+# ---- gate v2: the reviewer brief ----------------------------------------
+# O's own checks run before any model (.o-review.json, read from base). A test
+# that passes WITHOUT the change is a REJECT. A runtime-tier change needs a
+# human even when approved. An APPROVE with no command run is UNVERIFIED. A PR
+# O gives up on is closed. CI must be green on the PR merged with CURRENT main
+# (O updates the branch when main moves). A GitHub issue's follow-up carries
+# "Closes #N".
+IID_RT="$(gh_issue '[sim:real-test] feature with a real test')"
+IID_VT="$(gh_issue '[sim:vacuous-test] feature with a test that cannot fail')"
+IID_RK="$(gh_issue '[sim:risky] runtime internals')"
+IID_NB="$(gh_issue '[sim:good] [gate:nobash] reviewer only reads')"
+wait_status_at "$BASE4" "$IID_RT" "Done" 120 || { tail -30 "$TMP4/daemon.log"; fail "gate2: change with a real test never merged"; }
+grep "fails WITHOUT the change" "$GHS/comments_$(pr_of "$IID_RT")" >/dev/null || fail "gate2: red-green evidence missing from the PR comment"
+grep "make test" "$GHS/comments_$(pr_of "$IID_RT")" >/dev/null || fail "gate2: maintainer's command log missing from the PR comment"
+wait_status_at "$BASE4" "$IID_VT" "Failed" 180 || { tail -30 "$TMP4/daemon.log"; fail "gate2: vacuous test never failed out"; }
+sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_VT' ORDER BY started_at DESC LIMIT 1" | grep "proves nothing" >/dev/null || fail "gate2: vacuous test not rejected as can't-fail"
+for _i in $(seq 1 20); do [ -f "$GHS/closed_$(pr_of "$IID_VT")" ] && break; sleep 1; done
+[ -f "$GHS/closed_$(pr_of "$IID_VT")" ] || fail "gate2: PR O gave up on was left open"
+git -C "$GHS/remote.git" log --oneline main | grep "o/$IID_VT" >/dev/null && fail "gate2: vacuous-test PR merged"
+wait_status_at "$BASE4" "$IID_RK" "In Review" 120 || fail "gate2: runtime-tier change did not wait for a human"
+sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_RK' ORDER BY started_at DESC LIMIT 1" | grep "human sign-off" >/dev/null || fail "gate2: runtime-tier reason not recorded"
+wait_status_at "$BASE4" "$IID_NB" "In Review" 120 || fail "gate2: APPROVE without running anything was not downgraded"
+sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_NB' ORDER BY started_at DESC LIMIT 1" | grep "without running" >/dev/null || fail "gate2: UNVERIFIED reason not recorded"
+IID_GH9="$(sqlite3 "$TMP4/o.db" "SELECT identifier FROM issue WHERE fingerprint='gh:9'")"
+[ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM issue WHERE fingerprint='verify-final:$IID_GH9' AND body LIKE '%Closes #9%'")" = "1" ] || fail "gate2: follow-up for GitHub #9 does not carry 'Closes #9'"
+pass "gate2: red-green (vacuous test -> REJECT, PR closed), runtime tier -> human, APPROVE w/o commands -> UNVERIFIED, evidence + command log on the PR, Closes #N inherited"
+IID_BH="$(gh_issue '[sim:good] lands after main moves')"
+echo "o/$IID_BH" >> "$GHS/hold_ci"
+for _i in $(seq 1 90); do [ -n "$(pr_of "$IID_BH" 2>/dev/null)" ] && break; sleep 1; done
+[ -n "$(pr_of "$IID_BH")" ] || fail "gate2: held PR never opened"
+tmpb="$(mktemp -d)"; git clone -q "$GHS/remote.git" "$tmpb/c"
+echo moved > "$tmpb/c/main-moved.txt"; git -C "$tmpb/c" add main-moved.txt
+git -C "$tmpb/c" -c user.email=h@x -c user.name=human commit -q -m "main moves on"
+# Other gate2 PRs may still be landing on main: rebase and retry the push.
+for _i in 1 2 3 4 5; do git -C "$tmpb/c" push -q origin main 2>/dev/null && break; git -C "$tmpb/c" -c user.email=h@x -c user.name=human pull -q --rebase origin main; done
+sed -i "\|o/$IID_BH|d" "$GHS/hold_ci"
+wait_status_at "$BASE4" "$IID_BH" "Done" 120 || { tail -30 "$TMP4/daemon.log"; fail "gate2: PR behind main never merged"; }
+[ -f "$GHS/updated_$(pr_of "$IID_BH")" ] || fail "gate2: O merged a PR that was behind main without updating it"
+pass "gate2: PR behind main is updated (update-branch) and re-checked before merge"
 restart_d4 O_MERGE_GATE=1 O_ESCALATE_PATHS=sim_
 IID_GF="$(gh_issue '[sim:good] maintainer says merge but path is fenced')"
 wait_status_at "$BASE4" "$IID_GF" "In Review" 120 || fail "gate: O_ESCALATE_PATHS did not force escalation"
 sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_GF' ORDER BY started_at DESC LIMIT 1" | grep "O_ESCALATE_PATHS" >/dev/null || fail "gate: forced escalation reason not recorded"
-pass "gate: O_ESCALATE_PATHS overrides a MERGE verdict -> In Review"
+pass "gate: O_ESCALATE_PATHS overrides an APPROVE -> In Review"
+restart_d4 O_MERGE_GATE=1 O_CI_TIMEOUT_S=6
+IID_RC="$(gh_issue '[sim:good] required check never reports')"
+echo "o/$IID_RC" >> "$GHS/only_lint"
+wait_status_at "$BASE4" "$IID_RC" "Failed" 200 || { tail -30 "$TMP4/daemon.log"; fail "required: PR without the required 'build' check did not time out"; }
+[ "$(sqlite3 "$TMP4/o.db" "SELECT verify_state FROM run WHERE issue_id='$IID_RC' ORDER BY started_at DESC LIMIT 1")" = "red_timeout" ] || fail "required: expected red_timeout"
+git -C "$GHS/remote.git" log --oneline main | grep "o/$IID_RC" >/dev/null && fail "required: merged without the required check"
+pass "required: a PR whose required check never passes is never merged (red_timeout)"
 
 # ============================================================
 # Agent sandbox — 5th daemon, O_SANDBOX=bwrap + O_API_TOKEN
@@ -1313,12 +1401,13 @@ if git config core.fsmonitor "touch /tmp/pwned" 2>/dev/null; then p="$p config:W
 n="$(cat /proc/*/environ 2>/dev/null | tr '\0' '\n' | grep -c '^O_API_TOKEN=')"
 p="$p token_procs:$n"
 echo "$p" > probes.txt
+echo "$*" > "$SBX_ARGS"
 git add probes.txt && git commit -q -m "sandbox probes"
 printf '%s\n' '{"type":"result","total_cost_usd":0.01,"session_id":"sbx-1"}'
 STUB
 chmod +x "$TMP5/agent-stub"
 HOME="$TMP5" O_DB="$TMP5/.o/o.db" O_PORT="$PORT5" O_NO_OPEN=1 O_SANDBOX=bwrap O_API_TOKEN="$TOK" \
-  O_CLAUDE_BIN="$TMP5/agent-stub" SBX_REPO="$SCRATCHS" ./bin/swarmd >"$TMP5/daemon.log" 2>&1 &
+  O_CLAUDE_BIN="$TMP5/agent-stub" SBX_REPO="$SCRATCHS" SBX_ARGS="$TMP5/agent-args" ./bin/swarmd >"$TMP5/daemon.log" 2>&1 &
 DAEMON5_PID=$!
 up5=""
 for _i in $(seq 1 30); do
@@ -1345,9 +1434,155 @@ probes="$(git -C "$SCRATCHS" show main:probes.txt)"
   || fail "sandbox: unexpected probe results: '$probes'"
 [ "$(cat "$SCRATCHS/README.md")" = "sandbox project" ] || fail "sandbox: main checkout was modified"
 pass "sandbox: repo/hooks/config not writable, ~/.o hidden, token not visible in /proc; worktree commit merged"
+grep -- "--model haiku " "$TMP5/agent-args" >/dev/null || { cat "$TMP5/agent-args"; fail "model ladder: attempt 1 should run on haiku"; }
+pass "model ladder: a builder's first attempt runs on haiku"
 else
   echo "SKIP: agent sandbox stage (unprivileged bwrap unavailable here)"
 fi
+
+# ============================================================
+# Persona pass — 6th daemon, O_PERSONAS=1 + judge, stub personas
+# ============================================================
+# The stub plays each persona by the marker in its goal (STUB:<what>), plays
+# the judge (NOISE for a report titled "noise: ..."), and on a confirm run
+# answers RESULT: FIXED unless the scenario title says "still". Unsandboxed by
+# explicit opt-in so the stage runs where bwrap doesn't.
+TMP6="$(mktemp -d)"
+PORT6=$((5950 + RANDOM % 200))
+BASE6="http://127.0.0.1:${PORT6}"
+cat > "$TMP6/claude-stub" <<'STUB'
+#!/usr/bin/env bash
+prompt="$(cat)"
+result() { printf '{"type":"result","total_cost_usd":0.03,"session_id":"p","result":"%s"}\n' "$1"; }
+if printf '%s' "$prompt" | grep -q 'REAL or NOISE'; then
+  if printf '%s' "$prompt" | grep -q '"title":"noise:'; then result "NOISE: sandbox artifact"; else result "REAL: reproducible"; fi
+  exit 0
+fi
+url="$(printf '%s' "$prompt" | grep -oE 'http://127[^ ]*/persona_reports' | head -n1)"
+rid="$(printf '%s' "$prompt" | grep -oE '"run_id":"[^"]*"' | head -n1 | sed 's/.*:"//; s/"$//')"
+[ -d .git ] && echo "git:yes" >> "$PSTUB_LOG" || echo "git:no $(pwd)" >> "$PSTUB_LOG"
+# One retry when the connection drops (swarmrt's HTTP server can idle-close under load; see ocurl).
+post() { local c; for _t in 1 2 3; do c="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -X POST "$url" -H 'Content-Type: application/json' -d "$1")"; [ "$c" != "000" ] && break; sleep 1; done; printf '%s' "$c"; }
+rep() { printf '{"run_id":"%s","severity":"%s","title":"%s","doc_section":"README.md > Five minutes","steps":"1. make\\n2. ./run","expected":"it runs","actual":"%s","env":"linux"}' "$rid" "$1" "$2" "$3"; }
+if printf '%s' "$prompt" | grep -q 'RESULT: FIXED'; then
+  if printf '%s' "$prompt" | grep -A1 'you hit this problem' | grep still >/dev/null; then
+    post "$(rep blocked 'docs still wrong' 'error: still broken')" >/dev/null; result "RESULT: STILL_BROKEN"
+  else
+    result "it works now. RESULT: FIXED"
+  fi
+  exit 0
+fi
+case "$prompt" in
+  *STUB:blocked2*) post "$(rep blocked 'make fails on step 2' 'error: cannot open /var/b/99.txt (code 7)')" >/dev/null ;;
+  *STUB:blocked*)  post "$(rep blocked 'make fails' 'error: cannot open /tmp/a/1.txt (code 2)\nmore')" >/dev/null ;;
+  *STUB:norepro*)  echo "norepro:$(post "{\"run_id\":\"$rid\",\"severity\":\"blocked\",\"title\":\"vague\",\"steps\":\"1. stuff\"}")" >> "$PSTUB_LOG" ;;
+  *STUB:friction*) post "$(rep friction 'install section is confusing' 'had to guess the flag')" >/dev/null ;;
+  *STUB:noise*)    post "$(rep blocked 'noise: network down' 'curl: could not resolve host')" >/dev/null ;;
+  *STUB:wrong*)    post "$(rep wrong 'docs still wrong about --fast' 'unknown flag --fast')" >/dev/null ;;
+esac
+result "OUTCOME: DONE"
+STUB
+chmod +x "$TMP6/claude-stub"
+SCRATCHP="$TMP6/projp"
+mkdir -p "$SCRATCHP"
+git -C "$SCRATCHP" init -q -b main
+git -C "$SCRATCHP" config user.email "o@example.com"; git -C "$SCRATCHP" config user.name "O Test"
+echo "# persona project" > "$SCRATCHP/README.md"
+git -C "$SCRATCHP" add -A; git -C "$SCRATCHP" commit -q -m "seed persona project"
+HOME="$TMP6" O_DB="$TMP6/o.db" O_PORT="$PORT6" O_NO_OPEN=1 O_PERSONAS=1 O_PERSONAS_UNSANDBOXED=1 O_PERSONA_JUDGE=1 \
+  O_SELF_FILE_CAP=20 O_CLAUDE_BIN="$TMP6/claude-stub" PSTUB_LOG="$TMP6/stub.log" ./bin/swarmd >"$TMP6/daemon.log" 2>&1 &
+DAEMON6_PID=$!
+up6=""
+for _i in $(seq 1 30); do
+  code="$(ocurl -s -o /dev/null -w '%{http_code}' "$BASE6/api/health" 2>/dev/null || true)"
+  if [ "$code" = "200" ]; then up6="1"; break; fi
+  sleep 0.5
+done
+[ -n "$up6" ] || { cat "$TMP6/daemon.log" || true; fail "persona daemon never came up"; }
+mkco6() {
+  jget "$(ocurl -s -X POST "$BASE6/api/companies" -H 'Content-Type: application/json' \
+    -d "{\"name\":\"$1\",\"issue_prefix\":\"$2\",\"budget_monthly_cents\":1000000,\"repo\":\"$SCRATCHP\"}")" 'd["id"]'
+}
+TODAY6="(strftime('%s','now')*1000/86400000)"
+CIDP="$(mkco6 'Persona Co' 'PER')"; [ -n "$CIDP" ] || fail "persona company create failed"
+CIDB="$(mkco6 'Broke Co' 'BRK')"
+# Hold both passes until the personas exist.
+sqlite3 "$TMP6/o.db" "UPDATE company SET last_persona_day=$TODAY6 WHERE id IN ('$CIDP','$CIDB')"
+for who in blocked blocked2 norepro friction noise wrong; do
+  sc="$(ocurl -s -o /dev/null -w '%{http_code}' -X POST "$BASE6/api/companies/$CIDP/personas" -H 'Content-Type: application/json' \
+    -d "{\"name\":\"$who\",\"role\":\"tester\",\"goal\":\"STUB:$who\",\"done_when\":\"it runs\"}")"
+  [ "$sc" = "201" ] || fail "persona create ($who) expected 201, got $sc"
+done
+ocurl -s -X POST "$BASE6/api/companies/$CIDB/personas" -H 'Content-Type: application/json' -d '{"name":"broke","goal":"STUB:blocked"}' >/dev/null
+np="$(jget "$(ocurl -s "$BASE6/api/companies/$CIDP/personas")" 'len(d)')"
+[ "$np" = "6" ] || fail "personas: GET expected 6, got $np"
+ocurl -s -X POST "$BASE6/api/companies/$CIDP" -H 'Content-Type: application/json' -d '{"personas_per_day":6}' >/dev/null
+sqlite3 "$TMP6/o.db" "UPDATE company SET persona_daily_cents=0 WHERE id='$CIDB'"
+sqlite3 "$TMP6/o.db" "UPDATE company SET last_persona_day=0 WHERE id IN ('$CIDP','$CIDB')"
+# A report for a run that doesn't exist is refused.
+sc="$(ocurl -s -o /dev/null -w '%{http_code}' -X POST "$BASE6/api/companies/$CIDP/persona_reports" -H 'Content-Type: application/json' \
+  -d '{"run_id":"nope","severity":"blocked","title":"x","steps":"1","actual":"y"}')"
+[ "$sc" = "400" ] || fail "persona report with unknown run_id expected 400, got $sc"
+done6=""
+for _i in $(seq 1 60); do
+  n="$(sqlite3 "$TMP6/o.db" "SELECT COUNT(*) FROM persona_run WHERE company_id='$CIDP' AND ended_at > 0")"
+  [ "${n:-0}" = "6" ] && { done6="1"; break; }
+  sleep 1
+done
+[ -n "$done6" ] || { tail -30 "$TMP6/daemon.log"; sqlite3 "$TMP6/o.db" "SELECT * FROM persona_run"; fail "persona pass: 6 runs never finished"; }
+sleep 1
+q6() { sqlite3 "$TMP6/o.db" "$1"; }
+[ "$(q6 "SELECT COUNT(*) FROM issue WHERE company_id='$CIDP' AND origin='persona' AND priority='high'")" = "1" ] \
+  || { q6 "SELECT title, fingerprint FROM issue"; fail "persona: blocked x2 (same error, different paths/numbers) should file exactly one high issue"; }
+# >= 1: a retried POST whose first response was dropped records the same report twice, and that dedupes too.
+[ "$(q6 "SELECT COUNT(*) FROM activity WHERE company_id='$CIDP' AND verb='selffile.duped'")" -ge 1 ] || fail "persona: second blocked report not logged selffile.duped"
+q6 "SELECT body FROM issue WHERE company_id='$CIDP' AND priority='high'" | grep 'Also hit by persona' >/dev/null || fail "persona: dup not noted on the open issue"
+[ "$(q6 "SELECT persona_id != '' AND verify_scenario_after_fix = 1 FROM issue WHERE company_id='$CIDP' AND priority='high'")" = "1" ] || fail "persona: issue not linked to its persona"
+pass "persona: blocked -> one high issue, same error elsewhere dedupes (selffile.duped)"
+grep -qx 'norepro:400' "$TMP6/stub.log" || { cat "$TMP6/stub.log"; fail "persona: report without actual should be 400"; }
+pass "persona: a report without a verbatim repro is refused (400)"
+[ "$(q6 "SELECT COUNT(*) FROM issue WHERE company_id='$CIDP' AND fingerprint LIKE 'persona-digest:%' AND priority='low'")" = "1" ] || fail "persona: friction did not land in a digest issue"
+q6 "SELECT body FROM issue WHERE fingerprint LIKE 'persona-digest:%'" | grep 'install section is confusing' >/dev/null || fail "persona: digest missing the friction entry"
+pass "persona: friction goes to the weekly digest issue"
+q6 "SELECT COUNT(*) FROM activity WHERE verb='persona.discarded'" | grep -x 1 >/dev/null || fail "persona: judge NOISE not logged persona.discarded"
+[ "$(q6 "SELECT COUNT(*) FROM issue WHERE title LIKE 'noise:%'")" = "0" ] || fail "persona: a NOISE report was filed"
+pass "persona: judge drops NOISE (persona.discarded)"
+[ "$(q6 "SELECT priority FROM issue WHERE company_id='$CIDP' AND title='docs still wrong about --fast'")" = "medium" ] || fail "persona: wrong -> medium issue"
+sp6="$(q6 "SELECT persona_spent_today, spent_today_cents FROM company WHERE id='$CIDP'")"
+[ "$sp6" != "0|0" ] && [ "${sp6#*|}" = "0" ] || fail "persona: spend should land on the persona budget only (got $sp6)"
+pass "persona: wrong -> medium; spend on the separate persona budget ($sp6)"
+q6 "SELECT COUNT(*) FROM activity WHERE company_id='$CIDB' AND verb='persona.budget_stop'" | grep -x 1 >/dev/null || fail "persona: over-budget company not stopped"
+[ "$(q6 "SELECT COUNT(*) FROM persona_run WHERE company_id='$CIDB'")" = "0" ] || fail "persona: over-budget company still ran a persona"
+pass "persona: no budget left -> persona.budget_stop, nothing runs"
+! grep -q '^git:yes' "$TMP6/stub.log" || fail "persona: a persona saw a .git directory"
+[ "$(git -C "$SCRATCHP" worktree list | wc -l)" = "1" ] && [ -z "$(git -C "$SCRATCHP" status --porcelain)" ] || fail "persona: source repo not clean"
+[ -z "$(ls "$TMP6/.o/personas"/*/work 2>/dev/null)" ] || fail "persona: work dirs left behind"
+pass "persona: clean export (no .git), no worktree, nothing left behind"
+sleep 6
+[ "$(q6 "SELECT COUNT(*) FROM activity WHERE company_id='$CIDP' AND verb='persona.scenario'")" = "6" ] || fail "persona: pass ran more than once today"
+pass "persona: at most one pass per day"
+# Confirmation: mark both issues Done; the blocked one is fixed, the "still" one isn't.
+IB="$(q6 "SELECT id FROM issue WHERE company_id='$CIDP' AND priority='high' AND origin='persona'")"
+IW="$(q6 "SELECT id FROM issue WHERE company_id='$CIDP' AND title='docs still wrong about --fast'")"
+for i in "$IB" "$IW"; do ocurl -s -X POST "$BASE6/api/issues/$i" -H 'Content-Type: application/json' -d '{"status":"Done"}' >/dev/null; done
+conf=""
+for _i in $(seq 1 40); do
+  a="$(q6 "SELECT COUNT(*) FROM activity WHERE verb='persona.confirmed'")"; b="$(q6 "SELECT COUNT(*) FROM issue WHERE fingerprint='persona-regress:$IW' AND origin='auto'")"
+  [ "$a" = "1" ] && [ "$b" = "1" ] && { conf="1"; break; }
+  sleep 1
+done
+[ -n "$conf" ] || { tail -20 "$TMP6/daemon.log"; q6 "SELECT verb, target FROM activity"; fail "persona confirm: expected persona.confirmed + a persona-regress fix issue"; }
+pass "persona confirm: fixed -> persona.confirmed; still broken -> fix issue filed (origin auto)"
+IF="$(q6 "SELECT id FROM issue WHERE fingerprint='persona-regress:$IW'")"
+ocurl -s -X POST "$BASE6/api/issues/$IF" -H 'Content-Type: application/json' -d '{"status":"Done"}' >/dev/null
+d1=""
+for _i in $(seq 1 40); do
+  q6 "SELECT COUNT(*) FROM activity WHERE verb='selffile.skipped_depth'" | grep -x 1 >/dev/null && { d1="1"; break; }
+  sleep 1
+done
+[ -n "$d1" ] || fail "persona confirm: a failing fix-of-a-fix should stop at depth 1"
+[ "$(q6 "SELECT COUNT(*) FROM issue WHERE origin='auto'")" = "1" ] || fail "persona confirm: depth-1 filed a second fix issue"
+pass "persona confirm: depth-1 stops the chain at one fix issue"
 
 # ============================================================
 # Held-out invariant suite — the frozen core (tests/heldout/core.sh)

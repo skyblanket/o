@@ -1,0 +1,14 @@
+{
+  "_comment": "O's merge gate config for O itself (read from main, never from the PR). The gate and the sandbox live in src/orchestrator.sw, so changes there wait for a human; tests/heldout/ and scripts/check.sh are protected paths on the company, so an agent can't weaken them.",
+  "build": "make",
+  "suite": "make check",
+  "test_runners": [],
+  "required_checks": ["check"],
+  "tiers": [
+    { "name": "docs", "paths": ["README.md", "docs/", "examples/", "deploy/"], "merge": "auto" },
+    { "name": "ui", "paths": ["ui/", "feedback/"], "merge": "auto", "extra": ["cd ui && npm ci --no-audit --no-fund && npm run build"] },
+    { "name": "gate-and-sandbox", "paths": ["src/orchestrator.sw", "src/main.sw", "Makefile", ".github/"], "merge": "human", "extra": ["./tests/heldout/core.sh"] },
+    { "name": "api-and-store", "paths": ["src/router.sw", "src/store.sw", "src/schema.sw"], "merge": "auto", "extra": ["./tests/heldout/core.sh"] }
+  ],
+  "default_merge": "human"
+}

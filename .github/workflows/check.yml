@@ -18,8 +18,21 @@ jobs:
           repository: skyblanket/swarmrt
           path: swarmrt
       - name: Install test tools
-        run: sudo apt-get update && sudo apt-get install -y sqlite3
+        run: sudo apt-get install -y --no-install-recommends sqlite3 || (sudo apt-get update && sudo apt-get install -y sqlite3)
+      - name: swarmrt commit
+        id: srt
+        run: echo "sha=$(git -C swarmrt rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      # swarmrt only changes when its main moves: reuse the built compiler.
+      - name: Cache swarmrt build
+        id: srtcache
+        uses: actions/cache@v4
+        with:
+          path: |
+            swarmrt/bin
+            swarmrt/build
+          key: swarmrt-${{ runner.os }}-${{ steps.srt.outputs.sha }}
       - name: Build swarmrt compiler
+        if: steps.srtcache.outputs.cache-hit != 'true'
         run: make -C swarmrt swc libswarmrt -j"$(nproc)"
       - name: Hermetic suite
         working-directory: o

@@ -84,5 +84,19 @@ fun migrate(db) {
     _r_vout   = db_exec(db, "ALTER TABLE run ADD COLUMN verify_output TEXT DEFAULT ''")
     _r_msha   = db_exec(db, "ALTER TABLE run ADD COLUMN merge_sha TEXT DEFAULT ''")
 
-    print("  schema     migrated (9 tables)")
+    # ---- persona pass -------------------------------------------
+    # Simulated users who try a realistic task from the docs alone and report
+    # what blocked or confused them. persona_run.kind is "scenario" (the daily
+    # pass) or "confirm" (re-running the scenario after its fix landed).
+    _persona = db_exec(db, "CREATE TABLE IF NOT EXISTS persona (id TEXT PRIMARY KEY, company_id TEXT NOT NULL, name TEXT NOT NULL, role TEXT, goal TEXT, start TEXT, done_when TEXT, model TEXT DEFAULT '', enabled INTEGER DEFAULT 1, last_run_day INTEGER DEFAULT 0, created_at INTEGER)")
+    _prun = db_exec(db, "CREATE TABLE IF NOT EXISTS persona_run (id TEXT PRIMARY KEY, persona_id TEXT NOT NULL, company_id TEXT NOT NULL, kind TEXT DEFAULT 'scenario', started_at INTEGER, ended_at INTEGER DEFAULT 0, outcome TEXT DEFAULT 'running', report TEXT DEFAULT '', cost_cents INTEGER DEFAULT 0, issue_id TEXT DEFAULT '', for_issue_id TEXT DEFAULT '')")
+    _ix6 = db_exec(db, "CREATE INDEX IF NOT EXISTS ix_prun_company ON persona_run (company_id)")
+    _c_pday   = db_exec(db, "ALTER TABLE company ADD COLUMN persona_daily_cents INTEGER DEFAULT 200")
+    _c_pspent = db_exec(db, "ALTER TABLE company ADD COLUMN persona_spent_today INTEGER DEFAULT 0")
+    _c_pper   = db_exec(db, "ALTER TABLE company ADD COLUMN personas_per_day INTEGER DEFAULT 2")
+    _c_plast  = db_exec(db, "ALTER TABLE company ADD COLUMN last_persona_day INTEGER DEFAULT 0")
+    _i_pid    = db_exec(db, "ALTER TABLE issue ADD COLUMN persona_id TEXT DEFAULT ''")
+    _i_vsaf   = db_exec(db, "ALTER TABLE issue ADD COLUMN verify_scenario_after_fix INTEGER DEFAULT 0")
+
+    print("  schema     migrated (11 tables)")
 }
