@@ -1011,6 +1011,22 @@ cat > "$TMP4/claude-stub" <<'STUB'
 #!/bin/sh
 in="$(cat)"
 case "$in" in
+  *"== Review PR #"*)
+    # merge-gate maintainer: log fresh vs resumed session, keep a session id
+    sid=""; prev=""
+    for a in "$@"; do [ "$prev" = "--resume" ] && sid="$a"; prev="$a"; done
+    if [ -n "$sid" ]; then echo "resume $sid" >> "$GHS/gate_calls"
+    else n=$(( $(cat "$GHS/gate_ctr" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$GHS/gate_ctr"; sid="maint-$n"; echo "fresh $sid" >> "$GHS/gate_calls"; fi
+    case "$in" in
+      *"[gate:changes]"*) v="VERDICT: CHANGES: add a regression test for the new path" ;;
+      *"[gate:escalate]"*) v="VERDICT: ESCALATE: this changes a public API" ;;
+      *"[gate:silent]"*) v="I looked at it." ;;
+      *) v="VERDICT: MERGE" ;;
+    esac
+    printf '{"type":"result","result":"Reviewed in context.\\n%s","total_cost_usd":0.02,"session_id":"%s"}' "$v" "$sid"
+    exit 0 ;;
+esac
+case "$in" in
   *"[review:reject]"*) printf '%s' '{"type":"result","result":"REJECT: stub reviewer says the change is wrong","total_cost_usd":0.01}' ;;
   *) printf '%s' '{"type":"result","result":"APPROVE","total_cost_usd":0.01}' ;;
 esac
@@ -1023,6 +1039,9 @@ chmod +x "$TMP4/claude-stub"
 cat > "$TMP4/gh-stub" <<'STUB'
 #!/bin/sh
 [ "$1" = "api" ] || { echo "gh-stub: only 'gh api' is supported, got: $*" >&2; exit 2; }
+# One call at a time, like a real server: concurrent PR creates must not hand
+# out the same number, and concurrent merges must not race the push.
+exec 9>"$GHS/.lock"; flock 9
 shift
 method=GET; path=""; head=""; bodyf=""
 while [ $# -gt 0 ]; do
@@ -1062,6 +1081,8 @@ case "$method $path" in
     if listed fail_ci "$b"; then c=failure; else c=success; fi
     echo "{\"check_runs\":[{\"name\":\"build\",\"status\":\"completed\",\"conclusion\":\"$c\"}]}" ;;
   "GET repos/acme/widgets/commits/"*/status) echo '{"state":"success","statuses":[]}' ;;
+  "POST repos/acme/widgets/issues/"*/comments)
+    n="${path#repos/acme/widgets/issues/}"; n="${n%/comments}"; cat "$bodyf" >> "$GHS/comments_$n"; echo '{"id":1}' ;;
   *) echo "gh-stub: unhandled $method $path" >&2; exit 2 ;;
 esac
 STUB
@@ -1190,6 +1211,56 @@ IID_PRO="$(jget "$(ocurl -s -X POST "$BASE4/api/companies/$CIDG/issues" -H 'Cont
 wait_status_at "$BASE4" "$IID_PRO" "In Review" 90 || { tail -30 "$TMP4/daemon.log"; fail "pr-only: green PR never parked In Review"; }
 git -C "$GHS/remote.git" log --oneline main | grep -q "o/$IID_PRO" && fail "pr-only: PR was merged with O_PR_AUTOMERGE=0"
 pass "pr-only: O_PR_AUTOMERGE=0 leaves a green PR open, issue In Review, nothing merged"
+
+# ---- merge gate: persistent maintainer (O_MERGE_GATE=1) ----------------
+# Restart with the gate on and a rotation every 3 reviews. The stub maintainer
+# answers by title marker. MERGE -> merged into the remote; CHANGES ->
+# red_merge_gate on every attempt -> Failed; ESCALATE and a missing VERDICT
+# (fail-closed) -> In Review. Every review is posted on its PR, and the
+# session is resumed between PRs and rotated on schedule.
+restart_d4() {  # extra env assignments as args
+  kill "$DAEMON4_PID" 2>/dev/null || true; wait "$DAEMON4_PID" 2>/dev/null || true
+  env HOME="$TMP4" O_DB="$TMP4/o.db" O_PORT="$PORT4" O_NO_OPEN=1 O_REVIEW=1 O_CLAUDE_BIN="$TMP4/claude-stub" \
+    O_GH_BIN="$TMP4/gh-stub" GHS="$GHS" O_GH_POLL_S=2 O_CI_POLL_S=1 O_CI_SETTLE_S=0 "$@" \
+    ./bin/swarmd >>"$TMP4/daemon.log" 2>&1 &
+  DAEMON4_PID=$!
+  for _i in $(seq 1 30); do
+    [ "$(ocurl -s -o /dev/null -w '%{http_code}' "$BASE4/api/health" 2>/dev/null || true)" = "200" ] && break; sleep 0.5
+  done
+}
+gh_issue() { jget "$(ocurl -s -X POST "$BASE4/api/companies/$CIDG/issues" -H 'Content-Type: application/json' -d "{\"title\":\"$1\"}")" 'd["id"]'; }
+pr_of() { grep -lx "o/$1" "$GHS"/pr_* | head -1 | sed 's|.*/pr_||'; }
+restart_d4 O_MERGE_GATE=1 O_MAINTAINER_ROTATE=3
+IID_GM="$(gh_issue '[sim:good] gate merges')"
+IID_GX="$(gh_issue '[sim:good] [gate:changes] needs work')"
+IID_GE="$(gh_issue '[sim:good] [gate:escalate] api change')"
+IID_GS="$(gh_issue '[sim:good] [gate:silent] mute reviewer')"
+wait_status_at "$BASE4" "$IID_GM" "Done" 120 || { tail -40 "$TMP4/daemon.log"; fail "gate: MERGE verdict never Done"; }
+git -C "$GHS/remote.git" log --oneline main | grep -q "o/$IID_GM" || {
+  echo "--- remote main:"; git -C "$GHS/remote.git" log --oneline main | head -20
+  echo "--- PR map:"; for f in "$GHS"/pr_*; do echo "$(basename "$f") $(cat "$f")"; done; ls "$GHS" | grep merged_
+  echo "--- activity for $IID_GM:"; sqlite3 "$TMP4/o.db" "SELECT verb FROM activity WHERE target='$IID_GM' ORDER BY ts"
+  grep -v "\[orch\] tick" "$TMP4/daemon.log" | tail -25
+  fail "gate: MERGE verdict did not merge the PR"; }
+grep -q "Gate decision" "$GHS/comments_$(pr_of "$IID_GM")" || fail "gate: no review comment posted on the merged PR"
+wait_status_at "$BASE4" "$IID_GE" "In Review" 120 || { tail -40 "$TMP4/daemon.log"; fail "gate: ESCALATE never parked In Review"; }
+wait_status_at "$BASE4" "$IID_GS" "In Review" 120 || fail "gate: missing VERDICT did not fail closed to In Review"
+wait_status_at "$BASE4" "$IID_GX" "Failed" 180 || { tail -40 "$TMP4/daemon.log"; fail "gate: CHANGES x3 never Failed"; }
+[ "$(sqlite3 "$TMP4/o.db" "SELECT verify_state FROM run WHERE issue_id='$IID_GX' ORDER BY started_at DESC LIMIT 1")" = "red_merge_gate" ] || fail "gate: CHANGES not recorded as red_merge_gate"
+sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_GX' ORDER BY started_at DESC LIMIT 1" | grep -q "regression test" || fail "gate: maintainer findings not passed to the retry"
+for i in "$IID_GE" "$IID_GX"; do git -C "$GHS/remote.git" log --oneline main | grep -q "o/$i" && fail "gate: $i was merged without a MERGE verdict"; done
+nfresh="$(grep -c '^fresh' "$GHS/gate_calls")"; nres="$(grep -c '^resume' "$GHS/gate_calls")"
+[ "$nres" -ge 2 ] || fail "gate: maintainer session never resumed (fresh=$nfresh resume=$nres)"
+[ "$nfresh" -ge 2 ] || fail "gate: maintainer session never rotated with O_MAINTAINER_ROTATE=3 (fresh=$nfresh resume=$nres)"
+while read -r kind sid; do
+  [ "$kind" = "resume" ] && ! grep -qx "fresh $sid" "$GHS/gate_calls" && fail "gate: resumed unknown session $sid"
+done < "$GHS/gate_calls"
+pass "gate: MERGE merged, CHANGES -> red_merge_gate -> Failed, ESCALATE/no-verdict -> In Review; reviews posted; session resumed ($nres) and rotated ($nfresh)"
+restart_d4 O_MERGE_GATE=1 O_ESCALATE_PATHS=sim_
+IID_GF="$(gh_issue '[sim:good] maintainer says merge but path is fenced')"
+wait_status_at "$BASE4" "$IID_GF" "In Review" 120 || fail "gate: O_ESCALATE_PATHS did not force escalation"
+sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_GF' ORDER BY started_at DESC LIMIT 1" | grep -q "O_ESCALATE_PATHS" || fail "gate: forced escalation reason not recorded"
+pass "gate: O_ESCALATE_PATHS overrides a MERGE verdict -> In Review"
 
 # ============================================================
 # Agent sandbox — 5th daemon, O_SANDBOX=bwrap + O_API_TOKEN

@@ -11,7 +11,7 @@ module Store
 
 export [next_id, companies, company_row, company_create, company_update,
         company_add_spend, enforce_budget, rollover_day, company_mark_green, global_spent_today,
-        company_touch_reflect, companies_to_reflect, company_set_github, companies_with_github,
+        company_touch_reflect, companies_to_reflect, company_set_github, companies_with_github, company_set_maintainer,
         issues_for, issue_row, issue_create, issue_create_auto, issue_create_with_origin, issue_open_fp_count, issue_import_github,
         issue_set_status, issue_assign, issue_update, open_issue_titles,
         log_activity, activity_recent, activity_since, candidate_issues,
@@ -33,11 +33,11 @@ fun next_id(prefix) {
 # ---- companies ------------------------------------------------
 
 fun companies(db) {
-    db_query(db, "SELECT id, name, mission, issue_prefix, status, budget_monthly_cents, spent_cents, issue_counter, created_at, updated_at, repo, verify_cmd, protected_paths, budget_daily_cents, spent_today_cents, budget_day, pause_reason, greens_today, no_signal_days, last_reflect_day, github_repo, ship FROM company ORDER BY created_at DESC", [])
+    db_query(db, "SELECT id, name, mission, issue_prefix, status, budget_monthly_cents, spent_cents, issue_counter, created_at, updated_at, repo, verify_cmd, protected_paths, budget_daily_cents, spent_today_cents, budget_day, pause_reason, greens_today, no_signal_days, last_reflect_day, github_repo, ship, maintainer_session, maintainer_reviews FROM company ORDER BY created_at DESC", [])
 }
 
 fun company_row(db, id) {
-    rows = db_query(db, "SELECT id, name, mission, issue_prefix, status, budget_monthly_cents, spent_cents, issue_counter, created_at, updated_at, repo, verify_cmd, protected_paths, budget_daily_cents, spent_today_cents, budget_day, pause_reason, greens_today, no_signal_days, last_reflect_day, github_repo, ship FROM company WHERE id = ?", [id])
+    rows = db_query(db, "SELECT id, name, mission, issue_prefix, status, budget_monthly_cents, spent_cents, issue_counter, created_at, updated_at, repo, verify_cmd, protected_paths, budget_daily_cents, spent_today_cents, budget_day, pause_reason, greens_today, no_signal_days, last_reflect_day, github_repo, ship, maintainer_session, maintainer_reviews FROM company WHERE id = ?", [id])
     if (length(rows) == 0) { nil } else { hd(rows) }
 }
 
@@ -55,6 +55,11 @@ fun company_update(db, id, budget, status, repo, verify_cmd, protected_paths, bu
 
 fun company_set_github(db, id, github_repo, ship) {
     _u = db_query(db, "UPDATE company SET github_repo = ?, ship = ?, updated_at = ? WHERE id = ?", [github_repo, ship, timestamp(), id])
+    id
+}
+
+fun company_set_maintainer(db, id, session, reviews) {
+    _u = db_query(db, "UPDATE company SET maintainer_session = ?, maintainer_reviews = ?, updated_at = ? WHERE id = ?", [session, reviews, timestamp(), id])
     id
 }
 

@@ -72,6 +72,10 @@ fun migrate(db) {
     # branch, open a PR, let the repo's CI gate it, merge via gh).
     _c_gh     = db_exec(db, "ALTER TABLE company ADD COLUMN github_repo TEXT DEFAULT ''")
     _c_ship   = db_exec(db, "ALTER TABLE company ADD COLUMN ship TEXT DEFAULT 'merge'")
+    # The merge gate's long-lived maintainer session (resumed for every PR,
+    # rotated every O_MAINTAINER_ROTATE reviews) and how many reviews it has done.
+    _c_msess  = db_exec(db, "ALTER TABLE company ADD COLUMN maintainer_session TEXT DEFAULT ''")
+    _c_mrev   = db_exec(db, "ALTER TABLE company ADD COLUMN maintainer_reviews INTEGER DEFAULT 0")
 
     _i_orig   = db_exec(db, "ALTER TABLE issue ADD COLUMN origin TEXT DEFAULT 'operator'")
     _i_fp     = db_exec(db, "ALTER TABLE issue ADD COLUMN fingerprint TEXT DEFAULT ''")

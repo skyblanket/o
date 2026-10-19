@@ -24,6 +24,7 @@ Postgres and no container: an embedded SQLite file is the whole control plane.
 | **Protected paths** | Nothing in the fence was touched, renamed or deleted. The tests that judge the agent sit behind it. |
 | **Review gate** | A second, read-only model approves the diff against the issue (`O_REVIEW=1`). |
 | **CI** | In PR mode, your repo's own checks go green on the PR (`ship: "pr"`). |
+| **Merge gate** | A long-lived maintainer model (Opus by default), with the whole repo in context, decides MERGE, CHANGES or ESCALATE (`O_MERGE_GATE=1`). |
 | **Post-merge verify** | Still green on main after the merge. If not, O auto-reverts and files a fix. |
 
 Every red verdict goes back to the agent with the actual failure output, so it
@@ -167,6 +168,35 @@ curl -s -X POST localhost:4100/api/companies -H 'Content-Type: application/json'
 - `ship: "merge"` (the default) keeps the local serialized merge, with
   post-merge verify and auto-revert.
 
+### Merge gate: a persistent maintainer
+
+With `O_MERGE_GATE=1`, a PR whose CI is green isn't merged automatically. It
+goes to one long-lived **maintainer** session per company (`O_MERGE_MODEL`,
+default `claude-opus-5-5`):
+
+- **One session, resumed for every PR.** It learns the repo once and keeps that
+  context, re-reading files when it needs detail (after a compaction, say).
+  It works from `~/.o/maintainer/<company>/`, with each PR's checkout attached
+  read-only by `--add-dir`.
+- **`NOTES.md` is its durable memory.** It records conventions, pitfalls and
+  past decisions there. Every `O_MAINTAINER_ROTATE` reviews (default 25) it
+  starts a fresh session primed from `NOTES.md`, so it never drifts on a stale
+  view of the repo.
+- **Verdicts:**
+  - **MERGE**: O merges the PR.
+  - **CHANGES**: the findings go back to the builder (`red_merge_gate`), and
+    its next push updates the same PR.
+  - **ESCALATE**: the PR parks **In Review** for a human. A missing verdict
+    counts as ESCALATE.
+- PRs touching `O_ESCALATE_PATHS`, or larger than `O_ESCALATE_LINES` (default
+  1000), always go to a human. Every review is posted on its PR.
+- One review at a time: a single maintainer process serializes them, so a
+  session is never resumed twice at once.
+
+O acts with your GitHub token, and GitHub won't let a PR's author approve their
+own PR. So the maintainer's review is a comment, and the merge works as long as
+branch protection doesn't require an approving review.
+
 ## Feedback widget
 
 `feedback/o-feedback.js` is a dependency-free annotation layer for your dev app.
@@ -259,6 +289,10 @@ The daemon reads its configuration from the environment. All are optional.
 | `O_CI_SETTLE_S` | `30` | how long a PR with no checks reported waits before counting as "no CI, green". |
 | `O_SANDBOX` | unset | `bwrap` confines agent + reviewer runs with bubblewrap (Linux). |
 | `O_SANDBOX_RW` | unset | extra comma-separated paths the sandbox keeps writable, if your agent CLI needs them. |
+| `O_MERGE_GATE` | unset | `1` sends every green PR to the persistent maintainer for MERGE / CHANGES / ESCALATE. |
+| `O_MERGE_MODEL` | `claude-opus-5-5` | the maintainer's model. |
+| `O_MAINTAINER_ROTATE` | `25` | reviews per maintainer session before a fresh one primed from `NOTES.md`. |
+| `O_ESCALATE_PATHS` / `O_ESCALATE_LINES` | unset / `1000` | PRs touching these path prefixes, or bigger than this, always go to a human. |
 | `O_VERIFY_RERUNS` | `1` | post-merge verify re-runs before a red result counts as a regression. |
 
 ## API
