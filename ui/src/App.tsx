@@ -2,9 +2,10 @@ import { useState, useEffect, useCallback, useRef, useMemo, type ReactNode } fro
 import {
   api, money, ago, dur, initials,
   type Company, type Issue, type Agent, type Run, type Activity, type Orchestrator, type Message,
+  type Persona, type PersonaRun, type PersonaReport,
 } from "./api";
 
-const LANES = ["Backlog", "In Progress", "Verifying", "Done", "Failed"];
+const LANES = ["Backlog", "In Progress", "Verifying", "In Review", "Done", "Failed"];
 
 // An issue lives in the Failed lane whether it truly Failed or was Reverted
 // off main; the "reverted" case gets its own chip on the card.
@@ -12,7 +13,7 @@ const laneOf = (status: string) => (status === "Reverted" ? "Failed" : status);
 
 // where the loop got this issue from — operator issues show nothing.
 const ORIGIN_CHIP: Record<string, string> = {
-  auto: "⚙ auto", reflect: "🪞 reflect", feedback: "🎯 feedback",
+  auto: "⚙ auto", reflect: "🪞 reflect", feedback: "🎯 feedback", persona: "🧑 persona",
 };
 
 // verify_state (STRING from the DB) → a semantic color class for a chip.
@@ -552,6 +553,7 @@ function CompanyView({ company, issues, agents, onIssue, onNewIssue, onHire, onM
     "budget-daily": "budget · daily", "budget-monthly": "budget · monthly", "no-signal": "no signal",
   };
   const pauseLabel = PAUSE_LABEL[company.pause_reason] || company.pause_reason;
+  const [tab, setTab] = useState<"board" | "personas">("board");
   return (
     <div className="main">
       <div className="cohead">
@@ -581,6 +583,11 @@ function CompanyView({ company, issues, agents, onIssue, onNewIssue, onHire, onM
           {over && <div className="warn">⚠ budget cap reached — paused</div>}
         </div>
       </div>
+      <div className="tabs">
+        <button className={tab === "board" ? "on" : ""} onClick={() => setTab("board")}>Board</button>
+        <button className={tab === "personas" ? "on" : ""} onClick={() => setTab("personas")}>Personas</button>
+      </div>
+      {tab === "personas" ? <PersonasView company={company} issues={issues} onIssue={onIssue} /> : <>
       <div className="agents">
         {agents.length === 0
           ? <span style={{ color: "var(--faint)", fontSize: 12 }}>No agents yet — issues won't run until you hire one.</span>
@@ -623,6 +630,146 @@ function CompanyView({ company, issues, agents, onIssue, onNewIssue, onHire, onM
           );
         })}
       </div>
+      </>}
+    </div>
+  );
+}
+
+// ---- personas: simulated users and what they hit -------------------
+const OUTCOME_CLASS: Record<string, string> = {
+  clean: "green", confirmed: "green", reported: "red", still_broken: "red",
+  error: "conflict", running: "none",
+};
+
+function reportsOf(r: PersonaRun): PersonaReport[] {
+  try { return r.report ? (JSON.parse(r.report) as PersonaReport[]) : []; } catch { return []; }
+}
+
+function NewPersona({ cid, onClose, done }: { cid: string; onClose: () => void; done: () => void }) {
+  const [name, setName] = useState(""), [role, setRole] = useState(""), [goal, setGoal] = useState("");
+  const [start, setStart] = useState("README.md"), [doneWhen, setDoneWhen] = useState(""), [model, setModel] = useState("");
+  const [err, setErr] = useState("");
+  const save = async () => {
+    try {
+      await api.createPersona(cid, { name, role, goal, start, done_when: doneWhen, model });
+      done();
+    } catch (e) { setErr(String(e)); }
+  };
+  return (
+    <Modal title="New persona" onClose={onClose}
+      footer={<><button className="ghost" onClick={onClose}>Cancel</button>
+        <button className="primary" disabled={!name.trim() || !goal.trim()} onClick={save}>Add persona</button></>}>
+      <Field label="Name"><input value={name} onChange={e => setName(e.target.value)} placeholder="Newcomer" autoFocus /></Field>
+      <Field label="Who they are"><textarea value={role} onChange={e => setRole(e.target.value)} placeholder="A backend developer who has never seen this project. Copies commands exactly." /></Field>
+      <Field label="What they're trying to do"><textarea value={goal} onChange={e => setGoal(e.target.value)} placeholder="Follow the quick start and get the tests passing." /></Field>
+      <div className="row3">
+        <Field label="Start from"><input value={start} onChange={e => setStart(e.target.value)} /></Field>
+        <Field label="Model (blank: O_PERSONA_MODEL)"><input value={model} onChange={e => setModel(e.target.value)} placeholder="haiku" /></Field>
+      </div>
+      <Field label="Done when"><input value={doneWhen} onChange={e => setDoneWhen(e.target.value)} placeholder="the tests pass, or you're blocked" /></Field>
+      {err && <p className="hint" style={{ color: "var(--red)" }}>{err}</p>}
+    </Modal>
+  );
+}
+
+function PersonasView({ company, issues, onIssue }: { company: Company; issues: Issue[]; onIssue: (id: string) => void }) {
+  const [personas, setPersonas] = useState<Persona[]>([]);
+  const [runs, setRuns] = useState<PersonaRun[]>([]);
+  const [adding, setAdding] = useState(false);
+  const [open, setOpen] = useState<string | null>(null);
+  const [perDay, setPerDay] = useState(String(company.personas_per_day ?? 2));
+  const [daily, setDaily] = useState(String(((company.persona_daily_cents ?? 200) / 100) || 0));
+  const load = useCallback(async () => {
+    try {
+      const [p, r] = await Promise.all([api.personas(company.id), api.personaRuns(company.id)]);
+      setPersonas(p); setRuns(r);
+    } catch { /* daemon offline: the top bar says so */ }
+  }, [company.id]);
+  useEffect(() => {
+    const first = setTimeout(load, 0), t = setInterval(load, 5000);
+    return () => { clearTimeout(first); clearInterval(t); };
+  }, [load]);
+  const toggle = async (p: Persona) => { await api.updatePersona(p.id, { enabled: p.enabled ? 0 : 1 }); load(); };
+  const saveBudget = async () => {
+    await api.updateCompany(company.id, {
+      personas_per_day: Math.max(0, parseInt(perDay) || 0),
+      persona_daily_cents: Math.round((parseFloat(daily) || 0) * 100),
+    });
+    load();
+  };
+  const found = issues.filter(i => i.origin === "persona" || i.persona_id);
+  const confirmed = runs.filter(r => r.outcome === "confirmed").length;
+  const lastRun = (pid: string) => runs.find(r => r.persona_id === pid);
+  const identOf = (id: string) => issues.find(i => i.id === id)?.identifier || id;
+  return (
+    <div className="personas">
+      <div className="pstats">
+        <div><div className="k">Persona spend today</div><div className="vv">{money(company.persona_spent_today ?? 0)} <span style={{ color: "var(--faint)", fontWeight: 400 }}>/ {money(company.persona_daily_cents ?? 0)}</span></div></div>
+        <div><div className="k">Runs</div><div className="vv">{runs.length}</div></div>
+        <div><div className="k">Issues found</div><div className="vv">{found.length}</div></div>
+        <div><div className="k">Fixes confirmed</div><div className="vv">{confirmed}</div></div>
+        <div className="pbudget">
+          <Field label="Personas a day"><input type="number" min={0} value={perDay} onChange={e => setPerDay(e.target.value)} /></Field>
+          <Field label="Daily budget (USD)"><input type="number" min={0} step="0.5" value={daily} onChange={e => setDaily(e.target.value)} /></Field>
+          <button className="sm" onClick={saveBudget}>Save</button>
+        </div>
+      </div>
+      <div className="pcols">
+        <section>
+          <div className="phead"><span className="lbl">Personas</span><button className="primary sm" onClick={() => setAdding(true)}>+ Persona</button></div>
+          {personas.length === 0 && <p className="hint">No personas yet. Add one, or load <code>examples/personas/</code>. The pass runs daily with <code>O_PERSONAS=1</code>.</p>}
+          {personas.map(p => {
+            const lr = lastRun(p.id);
+            return (
+              <div className={"pcard" + (p.enabled ? "" : " off")} key={p.id}>
+                <div className="r1">
+                  <span className="av">{initials(p.name)}</span>
+                  <b>{p.name}</b>
+                  {p.model && <span className="rtag">{p.model}</span>}
+                  <label className="tog" title={p.enabled ? "enabled" : "disabled"}>
+                    <input type="checkbox" checked={!!p.enabled} onChange={() => toggle(p)} /> on
+                  </label>
+                </div>
+                {p.role && <div className="role">{p.role}</div>}
+                <div className="goal"><span className="k">Goal</span> {p.goal}</div>
+                <div className="meta">
+                  starts at {p.start || "README.md"}
+                  {lr && <> · last run {ago(lr.started_at)} ago, <span className={"vchip " + (OUTCOME_CLASS[lr.outcome] || "none")}>{lr.outcome}</span></>}
+                </div>
+              </div>
+            );
+          })}
+        </section>
+        <section>
+          <div className="phead"><span className="lbl">Runs</span></div>
+          {runs.length === 0 && <p className="hint">No runs yet.</p>}
+          {runs.map(r => {
+            const reps = reportsOf(r);
+            const isOpen = open === r.id;
+            return (
+              <div className="prun" key={r.id}>
+                <div className="r1" onClick={() => setOpen(isOpen ? null : r.id)} style={{ cursor: reps.length ? "pointer" : "default" }}>
+                  <b>{r.persona || "?"}</b>
+                  <span className="ochip">{r.kind === "confirm" ? "confirm" : "scenario"}</span>
+                  <span className={"vchip " + (OUTCOME_CLASS[r.outcome] || "none")}>{r.outcome}</span>
+                  {reps.length > 0 && <span className="ct">{reps.length} report{reps.length > 1 ? "s" : ""} {isOpen ? "▾" : "▸"}</span>}
+                  {r.issue_id && <a className="ilink" onClick={(e) => { e.stopPropagation(); onIssue(r.issue_id); }}>{identOf(r.issue_id)}</a>}
+                  <span className="at">{money(r.cost_cents)} · {r.ended_at ? dur(r.started_at, r.ended_at) : "running"} · {ago(r.started_at)}</span>
+                </div>
+                {isOpen && reps.map((rep, k) => (
+                  <div className="prep" key={k}>
+                    <div><span className={"sev " + rep.severity}>{rep.severity}</span> <b>{rep.title}</b> {rep.doc_section && <span className="by">· {rep.doc_section}</span>}</div>
+                    <pre>{rep.steps}</pre>
+                    {rep.expected && <div className="by">expected: {rep.expected}</div>}
+                    <pre className="actual">{rep.actual}</pre>
+                  </div>
+                ))}
+              </div>
+            );
+          })}
+        </section>
+      </div>
+      {adding && <NewPersona cid={company.id} onClose={() => setAdding(false)} done={() => { setAdding(false); load(); }} />}
     </div>
   );
 }

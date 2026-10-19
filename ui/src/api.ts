@@ -16,6 +16,8 @@ export interface Company {
   pause_reason: string; greens_today: number; no_signal_days: number;
   // GitHub in/out: issues imported from github_repo; ship "merge" | "pr"
   github_repo: string; ship: string;
+  // persona pass: its own daily budget, and how many personas run a day
+  persona_daily_cents: number; persona_spent_today: number; personas_per_day: number;
 }
 export interface Issue {
   id: string; company_id: string; identifier: string; title: string; body: string;
@@ -23,6 +25,8 @@ export interface Issue {
   sort_order: number; created_at: number; updated_at: number;
   // where this issue came from: operator | auto | reflect | feedback
   origin: string; fingerprint: string;
+  // set when a persona found it: the persona re-runs the scenario once it's Done
+  persona_id: string; verify_scenario_after_fix: number;
 }
 export interface Agent {
   id: string; company_id: string; name: string; role: string;
@@ -44,6 +48,21 @@ export interface Orchestrator {
 }
 export interface Message {
   id: string; agent_id: string; role: string; content: string; created_at: number;
+}
+
+export interface Persona {
+  id: string; company_id: string; name: string; role: string; goal: string;
+  start: string; done_when: string; model: string; enabled: number;
+  last_run_day: number; created_at: number;
+}
+export interface PersonaReport {
+  severity: "blocked" | "wrong" | "friction"; title: string; doc_section: string;
+  steps: string; expected: string; actual: string; env: string;
+}
+export interface PersonaRun {
+  id: string; persona_id: string; persona: string | null; kind: "scenario" | "confirm";
+  started_at: number; ended_at: number; outcome: string; report: string;
+  cost_cents: number; issue_id: string; for_issue_id: string;
 }
 
 async function req<T>(path: string, opts?: RequestInit): Promise<T> {
@@ -83,6 +102,12 @@ export const api = {
   }>(`/runs/${id}/result`),
   fs: (path: string) =>
     post("/fs", { path }) as Promise<{ path: string; parent: string; listing: string; gits: string }>,
+  personas: (cid: string) => req<Persona[]>(`/companies/${cid}/personas`),
+  createPersona: (cid: string, b: Record<string, unknown>) =>
+    post(`/companies/${cid}/personas`, b) as Promise<Persona>,
+  updatePersona: (id: string, b: Record<string, unknown>) =>
+    post(`/personas/${id}`, b) as Promise<Persona>,
+  personaRuns: (cid: string) => req<PersonaRun[]>(`/companies/${cid}/persona_runs`),
   agentMessages: (id: string) => req<Message[]>(`/agents/${id}/messages`),
   agentChat: (id: string, message: string) => post(`/agents/${id}/chat`, { message }),
 };
