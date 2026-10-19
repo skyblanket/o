@@ -239,6 +239,7 @@ The daemon reads its configuration from the environment. All are optional.
 | `O_CLAUDE_BIN` | `claude` on `PATH` | claude-code binary for the `claude-code` runtime. |
 | `O_SWARM_BIN` | `swarm-code` on `PATH` | binary for the `swarm-code` runtime. |
 | `O_MAX_TURNS` | `50` | per-run turn cap passed to claude-code. |
+| `O_STALL_TIMEOUT_S` | `600` | wall-clock cap on one agent run, in seconds. |
 | `O_VERIFY_TIMEOUT_S` | `600` | wall-clock cap on a single verify command. |
 | `O_GLOBAL_DAILY_CENTS` | unset | global daily spend ceiling across all companies; dispatch stops for the day when met. |
 | `O_SELF_FILE_CAP` | `10` | max auto/reflect issues one company may file per day. |

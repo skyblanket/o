@@ -31,7 +31,14 @@ export [start, chat_worker]
 # ---- tunables ------------------------------------------------
 fun max_concurrent() { 3 }        # PRD: configurable, default 10
 fun tick_interval()  { 5000 }     # PRD: 30000
-fun stall_timeout()  { 600000 }   # 10 min — real agent runs are slow
+# Wall-clock cap on one agent run (and the stall sweep's budget for it).
+# O_STALL_TIMEOUT_S overrides; default 600 (10 min). Raise it for repos
+# where real changes take longer.
+fun stall_timeout()  {
+    v = getenv("O_STALL_TIMEOUT_S")
+    n = if (v == nil) { nil } else { to_int(v) }
+    if (n == nil) { 600000 } else { n * 1000 }
+}
 fun backoff_base()   { 2000 }     # PRD: 10000
 fun max_backoff()    { 60000 }    # PRD: 300000
 fun max_attempts()   { 3 }        # after this many failed runs, the issue is marked Failed
