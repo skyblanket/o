@@ -20,7 +20,11 @@ export [next_id, companies, company_row, company_create, company_update,
         agents_for, agent_row, agent_first_active, agent_create,
         agent_set_session, agent_set_chat_session,
         message_create, messages_for,
-        approval_create, approvals_pending, approval_row, approval_set]
+        approval_create, approvals_pending, approval_row, approval_set,
+        persona_create, persona_row, personas_for, persona_set, personas_due, persona_touch,
+        companies_persona_due, company_touch_persona, company_add_persona_spend,
+        persona_run_create, persona_run_row, persona_runs_for, persona_run_report, persona_run_finish,
+        issue_link_persona, issue_open_by_fp, issue_append_body]
 
 # Ask the registered `idgen` process for a fresh unique id.
 fun next_id(prefix) {
@@ -33,11 +37,11 @@ fun next_id(prefix) {
 # ---- companies ------------------------------------------------
 
 fun companies(db) {
-    db_query(db, "SELECT id, name, mission, issue_prefix, status, budget_monthly_cents, spent_cents, issue_counter, created_at, updated_at, repo, verify_cmd, protected_paths, budget_daily_cents, spent_today_cents, budget_day, pause_reason, greens_today, no_signal_days, last_reflect_day, github_repo, ship, maintainer_session, maintainer_reviews FROM company ORDER BY created_at DESC", [])
+    db_query(db, "SELECT id, name, mission, issue_prefix, status, budget_monthly_cents, spent_cents, issue_counter, created_at, updated_at, repo, verify_cmd, protected_paths, budget_daily_cents, spent_today_cents, budget_day, pause_reason, greens_today, no_signal_days, last_reflect_day, github_repo, ship, maintainer_session, maintainer_reviews, persona_daily_cents, persona_spent_today, personas_per_day, last_persona_day FROM company ORDER BY created_at DESC", [])
 }
 
 fun company_row(db, id) {
-    rows = db_query(db, "SELECT id, name, mission, issue_prefix, status, budget_monthly_cents, spent_cents, issue_counter, created_at, updated_at, repo, verify_cmd, protected_paths, budget_daily_cents, spent_today_cents, budget_day, pause_reason, greens_today, no_signal_days, last_reflect_day, github_repo, ship, maintainer_session, maintainer_reviews FROM company WHERE id = ?", [id])
+    rows = db_query(db, "SELECT id, name, mission, issue_prefix, status, budget_monthly_cents, spent_cents, issue_counter, created_at, updated_at, repo, verify_cmd, protected_paths, budget_daily_cents, spent_today_cents, budget_day, pause_reason, greens_today, no_signal_days, last_reflect_day, github_repo, ship, maintainer_session, maintainer_reviews, persona_daily_cents, persona_spent_today, personas_per_day, last_persona_day FROM company WHERE id = ?", [id])
     if (length(rows) == 0) { nil } else { hd(rows) }
 }
 
@@ -157,14 +161,14 @@ fun rollover_one(db, c, now_ms, threshold) {
     tripped = if (incremented == 'true' && new_nosig >= threshold) { 'true' } else { 'false' }
     now = timestamp()
     if (tripped == 'true') {
-        _u = db_query(db, "UPDATE company SET spent_today_cents = 0, greens_today = 0, budget_day = (? / 86400000), no_signal_days = ?, status = 'paused', pause_reason = 'no-signal', updated_at = ? WHERE id = ?", [now_ms, new_nosig, now, cid])
+        _u = db_query(db, "UPDATE company SET spent_today_cents = 0, persona_spent_today = 0, greens_today = 0, budget_day = (? / 86400000), no_signal_days = ?, status = 'paused', pause_reason = 'no-signal', updated_at = ? WHERE id = ?", [now_ms, new_nosig, now, cid])
         %{id: cid, result: "paused", no_signal_days: new_nosig}
     } else {
         if (pause_reason == "budget-daily") {
-            _u = db_query(db, "UPDATE company SET spent_today_cents = 0, greens_today = 0, budget_day = (? / 86400000), no_signal_days = ?, status = 'active', pause_reason = '', updated_at = ? WHERE id = ?", [now_ms, new_nosig, now, cid])
+            _u = db_query(db, "UPDATE company SET spent_today_cents = 0, persona_spent_today = 0, greens_today = 0, budget_day = (? / 86400000), no_signal_days = ?, status = 'active', pause_reason = '', updated_at = ? WHERE id = ?", [now_ms, new_nosig, now, cid])
             %{id: cid, result: "unpaused", no_signal_days: new_nosig}
         } else {
-            _u = db_query(db, "UPDATE company SET spent_today_cents = 0, greens_today = 0, budget_day = (? / 86400000), no_signal_days = ?, updated_at = ? WHERE id = ?", [now_ms, new_nosig, now, cid])
+            _u = db_query(db, "UPDATE company SET spent_today_cents = 0, persona_spent_today = 0, greens_today = 0, budget_day = (? / 86400000), no_signal_days = ?, updated_at = ? WHERE id = ?", [now_ms, new_nosig, now, cid])
             %{id: cid, result: "reset", no_signal_days: new_nosig}
         }
     }
@@ -206,7 +210,7 @@ fun issues_for(db, company_id) {
 }
 
 fun issue_row(db, id) {
-    rows = db_query(db, "SELECT id, company_id, identifier, title, body, status, priority, assignee_agent_id, goal_id, sort_order, created_at, updated_at, origin, fingerprint FROM issue WHERE id = ?", [id])
+    rows = db_query(db, "SELECT id, company_id, identifier, title, body, status, priority, assignee_agent_id, goal_id, sort_order, created_at, updated_at, origin, fingerprint, persona_id, verify_scenario_after_fix FROM issue WHERE id = ?", [id])
     if (length(rows) == 0) { nil } else { hd(rows) }
 }
 
@@ -269,7 +273,7 @@ fun issue_create_auto(db, company_id, title, body, priority, origin, fingerprint
         if (dup > 0) {
             nil
         } else {
-            caprows = db_query(db, "SELECT COUNT(*) AS n FROM issue WHERE company_id = ? AND origin IN ('auto', 'reflect') AND (created_at / 86400000) = (? / 86400000)", [company_id, now])
+            caprows = db_query(db, "SELECT COUNT(*) AS n FROM issue WHERE company_id = ? AND origin IN ('auto', 'reflect', 'persona') AND (created_at / 86400000) = (? / 86400000)", [company_id, now])
             filed_today = if (length(caprows) == 0) { 0 } else { map_get(hd(caprows), "n") }
             if (filed_today >= self_file_cap()) {
                 nil
@@ -515,4 +519,94 @@ fun activity_since(db, company_id, since_ms) {
 # reasons over. Joined through issue to scope by company.
 fun failed_runs_for(db, company_id) {
     db_query(db, "SELECT r.state AS state, r.verify_state AS verify_state, r.verify_output AS verify_output, i.identifier AS identifier, i.title AS title FROM run r JOIN issue i ON r.issue_id = i.id WHERE i.company_id = ? AND r.state IN ('Failed', 'Reverted', 'VerifyFailed', 'Stalled') ORDER BY r.started_at DESC LIMIT 20", [company_id])
+}
+
+# ============================================================
+# Persona pass
+# ============================================================
+fun persona_create(db, company_id, name, role, goal, start, done_when, model) {
+    id = next_id("per")
+    _i = db_query(db, "INSERT INTO persona (id, company_id, name, role, goal, start, done_when, model, enabled, last_run_day, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?)", [id, company_id, name, role, goal, start, done_when, model, timestamp()])
+    id
+}
+
+fun persona_row(db, id) {
+    rows = db_query(db, "SELECT id, company_id, name, role, goal, start, done_when, model, enabled, last_run_day, created_at FROM persona WHERE id = ?", [id])
+    if (length(rows) == 0) { nil } else { hd(rows) }
+}
+
+fun personas_for(db, company_id) {
+    db_query(db, "SELECT id, company_id, name, role, goal, start, done_when, model, enabled, last_run_day, created_at FROM persona WHERE company_id = ? ORDER BY created_at ASC", [company_id])
+}
+
+fun persona_set(db, id, name, role, goal, start, done_when, model, enabled) {
+    _u = db_query(db, "UPDATE persona SET name = ?, role = ?, goal = ?, start = ?, done_when = ?, model = ?, enabled = ? WHERE id = ?", [name, role, goal, start, done_when, model, enabled, id])
+    id
+}
+
+# Up to n enabled personas, least recently run first, so each gets a turn.
+fun personas_due(db, company_id, n) {
+    db_query(db, "SELECT id, company_id, name, role, goal, start, done_when, model FROM persona WHERE company_id = ? AND enabled = 1 ORDER BY last_run_day ASC, created_at ASC LIMIT ?", [company_id, n])
+}
+
+fun persona_touch(db, id, now_ms) {
+    _u = db_query(db, "UPDATE persona SET last_run_day = (? / 86400000) WHERE id = ?", [now_ms, id])
+    id
+}
+
+# Active companies whose persona pass hasn't run today.
+fun companies_persona_due(db, now_ms) {
+    db_query(db, "SELECT id, repo, personas_per_day, persona_daily_cents, persona_spent_today FROM company WHERE status = 'active' AND repo != '' AND last_persona_day < (? / 86400000)", [now_ms])
+}
+
+fun company_touch_persona(db, id, now_ms) {
+    _u = db_query(db, "UPDATE company SET last_persona_day = (? / 86400000), updated_at = ? WHERE id = ?", [now_ms, timestamp(), id])
+    id
+}
+
+fun company_add_persona_spend(db, id, cents) {
+    _u = db_query(db, "UPDATE company SET persona_spent_today = persona_spent_today + CAST(ROUND(?) AS INTEGER) WHERE id = ?", [cents, id])
+    id
+}
+
+fun persona_run_create(db, persona_id, company_id, kind, for_issue_id) {
+    id = next_id("prun")
+    _i = db_query(db, "INSERT INTO persona_run (id, persona_id, company_id, kind, started_at, outcome, report, cost_cents, issue_id, for_issue_id) VALUES (?, ?, ?, ?, ?, 'running', '', 0, '', ?)", [id, persona_id, company_id, kind, timestamp(), for_issue_id])
+    id
+}
+
+fun persona_run_row(db, id) {
+    rows = db_query(db, "SELECT id, persona_id, company_id, kind, started_at, ended_at, outcome, report, cost_cents, issue_id, for_issue_id FROM persona_run WHERE id = ?", [id])
+    if (length(rows) == 0) { nil } else { hd(rows) }
+}
+
+fun persona_runs_for(db, company_id) {
+    db_query(db, "SELECT r.id, r.persona_id, p.name AS persona, r.kind, r.started_at, r.ended_at, r.outcome, r.report, r.cost_cents, r.issue_id, r.for_issue_id FROM persona_run r LEFT JOIN persona p ON p.id = r.persona_id WHERE r.company_id = ? ORDER BY r.started_at DESC LIMIT 200", [company_id])
+}
+
+fun persona_run_report(db, run_id, outcome, report, issue_id) {
+    _u = db_query(db, "UPDATE persona_run SET outcome = ?, report = ?, issue_id = ? WHERE id = ?", [outcome, report, issue_id, run_id])
+    run_id
+}
+
+# The worker finished: record cost and end time. A run that never filed a
+# report ends as "error".
+fun persona_run_finish(db, run_id, cost) {
+    _u = db_query(db, "UPDATE persona_run SET ended_at = ?, cost_cents = CAST(ROUND(?) AS INTEGER), outcome = CASE WHEN outcome = 'running' THEN 'error' ELSE outcome END WHERE id = ?", [timestamp(), cost, run_id])
+    persona_run_row(db, run_id)
+}
+
+fun issue_link_persona(db, issue_id, persona_id) {
+    _u = db_query(db, "UPDATE issue SET persona_id = ?, verify_scenario_after_fix = 1 WHERE id = ?", [persona_id, issue_id])
+    issue_id
+}
+
+fun issue_open_by_fp(db, company_id, fp) {
+    rows = db_query(db, "SELECT id, body FROM issue WHERE company_id = ? AND fingerprint = ? AND status NOT IN ('Done', 'Canceled', 'Failed', 'Reverted')", [company_id, fp])
+    if (length(rows) == 0) { nil } else { hd(rows) }
+}
+
+fun issue_append_body(db, id, text) {
+    _u = db_query(db, "UPDATE issue SET body = body || ?, updated_at = ? WHERE id = ?", [text, timestamp(), id])
+    id
 }
