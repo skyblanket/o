@@ -1016,42 +1016,53 @@ case "$in" in
 esac
 STUB
 chmod +x "$TMP4/claude-stub"
-# gh stub: a bare repo stands in for GitHub. `pr merge` really merges the
-# branch into the bare repo's main; checks fail for branches listed in
-# $GHS/fail_ci; merges are refused for branches listed in $GHS/block_merge.
+# gh stub: `gh api` (REST) against a bare repo standing in for GitHub. PUT
+# .../merge really merges the branch into the bare repo's main; check runs fail
+# for branches listed in $GHS/fail_ci; merges are refused for branches listed
+# in $GHS/block_merge. PR numbers map to branches through $GHS/pr_<n>.
 cat > "$TMP4/gh-stub" <<'STUB'
 #!/bin/sh
-sub="$1 $2"; shift 2
-branch=""; json=""; bodyf=""
+[ "$1" = "api" ] || { echo "gh-stub: only 'gh api' is supported, got: $*" >&2; exit 2; }
+shift
+method=GET; path=""; head=""; bodyf=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    -R|--base|--title|--label|--state|--limit) shift ;;
-    --head) branch="$2"; shift ;;
-    --json) json="$2"; shift ;;
-    --body-file) bodyf="$2"; shift ;;
-    --*) ;;
-    *) [ -z "$branch" ] && branch="$1" ;;
+    -X) method="$2"; shift ;;
+    -f|-F) case "$2" in head=*) head="${2#head=}" ;; body=@*) bodyf="${2#body=@}" ;; esac; shift ;;
+    *) path="$1" ;;
   esac
   shift
 done
-key="$(printf '%s' "$branch" | tr '/' '_')"
-listed() { [ -f "$GHS/$1" ] && grep -qx "$branch" "$GHS/$1"; }
-case "$sub" in
-  "issue list") cat "$GHS/issues.json" ;;
-  "pr create") cp "$bodyf" "$GHS/body_$key"; echo "https://example.test/pr/$key" ;;
-  "pr merge")
-    listed block_merge && { echo "base branch policy prohibits the merge" >&2; exit 1; }
+listed() { [ -f "$GHS/$1" ] && grep -qx "$2" "$GHS/$1"; }
+num_for() { grep -lx "$1" "$GHS"/pr_* 2>/dev/null | head -1 | sed 's|.*/pr_||'; }
+case "$method $path" in
+  "GET repos/acme/widgets/issues?"*) cat "$GHS/issues.json" ;;
+  "GET repos/acme/widgets/pulls?head="*)
+    b="${path#*head=acme:}"; b="${b%%&*}"; n="$(num_for "$b")"
+    if [ -n "$n" ]; then echo "[{\"number\":$n}]"; else echo "[]"; fi ;;
+  "POST repos/acme/widgets/pulls")
+    n=$(( $(ls "$GHS" | grep -c '^pr_') + 1 )); echo "$head" > "$GHS/pr_$n"
+    cp "$bodyf" "$GHS/body_$(printf '%s' "$head" | tr '/' '_')"
+    echo "{\"number\":$n}" ;;
+  "PUT repos/acme/widgets/pulls/"*/merge)
+    n="${path#repos/acme/widgets/pulls/}"; n="${n%/merge}"; b="$(cat "$GHS/pr_$n")"
+    listed block_merge "$b" && { echo '{"message":"Required reviews: at least 1 approving review is required"}'; echo "gh: HTTP 405" >&2; exit 1; }
     tmp="$(mktemp -d)"; git clone -q "$GHS/remote.git" "$tmp/c" && cd "$tmp/c" \
-      && git -c user.email=gh@x -c user.name=gh merge -q --no-ff --no-edit "origin/$branch" \
-      && git push -q origin main && git push -q origin --delete "$branch" && touch "$GHS/merged_$key" ;;
-  "pr view")
-    case "$json" in
-      number,url) [ -f "$GHS/body_$key" ] || exit 1; echo '{"number":1,"url":"https://example.test/pr"}' ;;
-      mergeCommit) echo '{"mergeCommit":{"oid":"0000000"}}' ;;
-      *) if listed fail_ci; then c='"FAILURE"'; else c='"SUCCESS"'; fi
-         echo "{\"state\":\"OPEN\",\"mergeable\":\"MERGEABLE\",\"statusCheckRollup\":[{\"name\":\"build\",\"status\":\"COMPLETED\",\"conclusion\":$c}]}" ;;
-    esac ;;
-  *) echo "gh-stub: unhandled $sub" >&2; exit 2 ;;
+      && git -c user.email=gh@x -c user.name=gh merge -q --no-ff --no-edit "origin/$b" \
+      && git push -q origin main && touch "$GHS/merged_$n" \
+      && echo "{\"merged\":true,\"sha\":\"$(git rev-parse HEAD)\"}" ;;
+  "DELETE repos/acme/widgets/git/refs/heads/"*) git -C "$GHS/remote.git" branch -q -D "${path#repos/acme/widgets/git/refs/heads/}" ;;
+  "GET repos/acme/widgets/pulls/"*)
+    n="${path#repos/acme/widgets/pulls/}"; b="$(cat "$GHS/pr_$n")"
+    sha="$(git -C "$GHS/remote.git" rev-parse "refs/heads/$b" 2>/dev/null)"; echo "$b" > "$GHS/sha_$sha"
+    m=false; [ -f "$GHS/merged_$n" ] && m=true
+    echo "{\"number\":$n,\"merged\":$m,\"mergeable_state\":\"clean\",\"head\":{\"sha\":\"$sha\"}}" ;;
+  "GET repos/acme/widgets/commits/"*/check-runs*)
+    sha="${path#repos/acme/widgets/commits/}"; sha="${sha%%/*}"; b="$(cat "$GHS/sha_$sha" 2>/dev/null)"
+    if listed fail_ci "$b"; then c=failure; else c=success; fi
+    echo "{\"check_runs\":[{\"name\":\"build\",\"status\":\"completed\",\"conclusion\":\"$c\"}]}" ;;
+  "GET repos/acme/widgets/commits/"*/status) echo '{"state":"success","statuses":[]}' ;;
+  *) echo "gh-stub: unhandled $method $path" >&2; exit 2 ;;
 esac
 STUB
 chmod +x "$TMP4/gh-stub"
@@ -1123,6 +1134,8 @@ CIDG="$(jget "$body" 'd["id"]')"
 [ "$(jget "$body" 'd["ship"]')" = "pr" ] && [ "$(jget "$body" 'd["github_repo"]')" = "acme/widgets" ] || fail "gh company fields not stored"
 sc="$(ocurl -s -o /dev/null -w '%{http_code}' -X POST "$BASE4/api/companies/$CIDG" -H 'Content-Type: application/json' -d '{"ship":"yolo"}')"
 [ "$sc" = "400" ] || fail "invalid ship value expected 400, got $sc"
+sc="$(ocurl -s -o /dev/null -w '%{http_code}' -X POST "$BASE4/api/companies/$CIDG" -H 'Content-Type: application/json' -d '{"github_repo":"widgets"}')"
+[ "$sc" = "400" ] || fail "ship=pr with github_repo lacking owner/ expected 400, got $sc"
 # issues whose ids we need up front go in BEFORE the agent is hired
 IID_CIF="$(jget "$(ocurl -s -X POST "$BASE4/api/companies/$CIDG/issues" -H 'Content-Type: application/json' -d '{"title":"[sim:good] ci goes red"}')" 'd["id"]')"
 IID_BLK="$(jget "$(ocurl -s -X POST "$BASE4/api/companies/$CIDG/issues" -H 'Content-Type: application/json' -d '{"title":"[sim:good] needs a human"}')" 'd["id"]')"
@@ -1134,7 +1147,7 @@ git -C "$GHREPO" worktree add -q "$TMP4/.o/workspaces/$IID_BLK" -b "o/$IID_BLK" 
 rm -rf "$TMP4/.o/workspaces/$IID_BLK"
 echo "o/$IID_CIF" > "$GHS/fail_ci"
 echo "o/$IID_BLK" > "$GHS/block_merge"
-echo '[{"number":7,"title":"[sim:good] from github","body":"filed on GitHub"}]' > "$GHS/issues.json"
+echo '[{"number":7,"title":"[sim:good] from github","body":"filed on GitHub"},{"number":8,"title":"[sim:good] a PR, not an issue","body":"","pull_request":{"url":"x"}}]' > "$GHS/issues.json"
 ocurl -s -X POST "$BASE4/api/companies/$CIDG/agents" \
   -H 'Content-Type: application/json' -d '{"name":"Ghsim","runtime":"sim"}' >/dev/null
 IID_GH=""
@@ -1150,13 +1163,14 @@ grep -q "Closes #7" "$GHS/body_o_$IID_GH" || fail "github: PR body lacks 'Closes
 [ -z "$(git -C "$GHREPO" branch --list "o/$IID_GH")" ] || fail "github: local branch not cleaned up after merge"
 sleep 4  # more polls: #7 is still "open" on the stub and must not be re-imported
 [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM issue WHERE company_id='$CIDG' AND fingerprint='gh:7'")" = "1" ] || fail "github: issue #7 imported more than once"
+[ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM issue WHERE company_id='$CIDG' AND fingerprint='gh:8'")" = "0" ] || fail "github: a pull request (#8) was imported as an issue"
 pass "github: #7 imported once, shipped as a PR (Closes #7), merged on green checks"
 wait_status_at "$BASE4" "$IID_CIF" "Failed" 150 || { tail -40 "$TMP4/daemon.log"; fail "github: red-CI issue never Failed"; }
 vs="$(sqlite3 "$TMP4/o.db" "SELECT verify_state FROM run WHERE issue_id='$IID_CIF' ORDER BY started_at DESC LIMIT 1")"
 [ "$vs" = "red_ci" ] || fail "github: expected red_ci, got '$vs'"
 sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_CIF' ORDER BY started_at DESC LIMIT 1" | grep -q "build" \
   || fail "github: failing check name not passed to the retry prompt"
-[ ! -f "$GHS/merged_o_$IID_CIF" ] || fail "github: red-CI PR was merged"
+git -C "$GHS/remote.git" log --oneline main | grep -q "o/$IID_CIF" && fail "github: red-CI PR was merged"
 pass "github: failing checks -> red_ci x3 -> Failed (check names in the retry tail), never merged"
 wait_status_at "$BASE4" "$IID_BLK" "In Review" 90 || { tail -40 "$TMP4/daemon.log"; fail "github: merge-refused issue never parked In Review"; }
 sleep 6

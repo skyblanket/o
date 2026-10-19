@@ -142,8 +142,9 @@ O edits real repositories on its own. The guard rails are the point.
 ## GitHub in / out
 
 Point a company at a GitHub repo and O works its issue tracker and ships
-through its CI. `repo` must be a local clone whose `origin` is that repo; the
-`gh` CLI must be authenticated.
+through its CI. `repo` must be a local clone whose `origin` is that repo, and
+`github_repo` must be its `owner/name`. O talks to GitHub only through
+`gh api` (REST), so it needs an authenticated `gh`, but not GitHub's GraphQL API.
 
 ```sh
 curl -s -X POST localhost:4100/api/companies -H 'Content-Type: application/json' -d '{
