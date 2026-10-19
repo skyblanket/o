@@ -22,6 +22,11 @@
 #   POST /api/companies/:id/issues          create an issue
 #   GET  /api/companies/:id/agents          list a company's agents
 #   POST /api/companies/:id/agents          hire an agent (approval-gated)
+#   GET  /api/companies/:id/personas        list a company's personas
+#   POST /api/companies/:id/personas        add a persona
+#   POST /api/personas/:id                  edit / enable / disable a persona
+#   GET  /api/companies/:id/persona_runs    persona run history + reports
+#   POST /api/companies/:id/persona_reports a running persona files a finding
 
 module Router
 
@@ -135,7 +140,8 @@ fun open_write(path) {
     if (string_ends_with(path, "/issues") == 'true') { 'true' }
     else { if (string_ends_with(path, "/feedback") == 'true') { 'true' }
     else { if (string_ends_with(path, "/chat") == 'true') { 'true' }
-    else { 'false' }}}
+    else { if (string_ends_with(path, "/persona_reports") == 'true') { 'true' }
+    else { 'false' }}}}
 }
 
 fun token_ok(path, hdrs) {
@@ -183,6 +189,7 @@ fun route(db, dbpath, conn, method, path, body) {
         p when string_starts_with(p, "/api/runs/") == 'true' -> run_result(db, conn, p)
         p when string_starts_with(p, "/api/issues/") == 'true' -> route_issue(db, conn, method, p, body)
         p when string_starts_with(p, "/api/agents/") == 'true' -> route_agent(db, dbpath, conn, method, p, body)
+        p when string_starts_with(p, "/api/personas/") == 'true' -> update_persona(db, conn, method, p, body)
         _ -> respond(conn, 404, err_json("no route for that path"))
     }
 }
@@ -314,6 +321,16 @@ fun route_company(db, conn, method, p, body) {
             acid = string_sub(rest, 0, string_length(rest) - 7)
             route_agents(db, conn, method, acid, body)
         } else {
+          if (string_ends_with(rest, "/personas") == 'true') {
+            route_personas(db, conn, method, string_sub(rest, 0, string_length(rest) - 9), body)
+          } else {
+          if (string_ends_with(rest, "/persona_runs") == 'true') {
+            prc = string_sub(rest, 0, string_length(rest) - 13)
+            if (method == 'GET') { respond(conn, 200, json_encode(Store.persona_runs_for(db, prc))) } else { respond(conn, 405, err_json("method not allowed")) }
+          } else {
+          if (string_ends_with(rest, "/persona_reports") == 'true') {
+            persona_report(db, conn, method, string_sub(rest, 0, string_length(rest) - 16), body)
+          } else {
             if (method == 'GET') {
                 row = Store.company_row(db, rest)
                 if (row == nil) {
@@ -328,6 +345,7 @@ fun route_company(db, conn, method, p, body) {
                     respond(conn, 405, err_json("method not allowed"))
                 }
             }
+          }}}
         }
       }
     }
@@ -364,10 +382,103 @@ fun update_company(db, conn, id, body) {
             } else {
                 _u = Store.company_update(db, id, budget, status, repo, verify_cmd, protected_paths, budget_daily)
                 _g = Store.company_set_github(db, id, gh, ship)
+                _pp = Store.company_set_persona(db, id, default_num(map_get(data, "persona_daily_cents"), map_get(cur, "persona_daily_cents")), default_num(map_get(data, "personas_per_day"), map_get(cur, "personas_per_day")))
                 respond(conn, 200, json_encode(Store.company_row(db, id)))
             }
         }
     }
+}
+
+# ---- personas ------------------------------------------------
+#
+# A persona is a simulated user: a role, a realistic goal, where they start
+# (usually the README) and what "done" looks like. The daily pass hands one a
+# clean checkout and lets it try; it files what blocked it through
+# /persona_reports. Adding or editing a persona is an operator write (token).
+
+fun route_personas(db, conn, method, cid, body) {
+    if (method == 'GET') {
+        respond(conn, 200, json_encode(Store.personas_for(db, cid)))
+    } else {
+        if (method == 'POST') {
+            create_persona(db, conn, cid, body)
+        } else {
+            respond(conn, 405, err_json("method not allowed"))
+        }
+    }
+}
+
+fun create_persona(db, conn, cid, body) {
+    if (Store.company_row(db, cid) == nil) {
+        respond(conn, 404, err_json("company not found"))
+    } else {
+        data = json_decode(body)
+        name = map_get(data, "name")
+        goal = map_get(data, "goal")
+        if (name == nil || goal == nil) {
+            respond(conn, 400, err_json("fields 'name' and 'goal' are required"))
+        } else {
+            id = Store.persona_create(db, cid, name, default_str(map_get(data, "role"), ""), goal, default_str(map_get(data, "start"), "README.md"), default_str(map_get(data, "done_when"), ""), default_str(map_get(data, "model"), ""))
+            _l = Store.log_activity(db, cid, "operator", "persona.create", id)
+            respond(conn, 201, json_encode(Store.persona_row(db, id)))
+        }
+    }
+}
+
+fun update_persona(db, conn, method, p, body) {
+    id = string_sub(p, 14, string_length(p) - 14)
+    cur = Store.persona_row(db, id)
+    if (cur == nil) {
+        respond(conn, 404, err_json("persona not found"))
+    } else {
+        if (method != 'POST') {
+            respond(conn, 405, err_json("method not allowed"))
+        } else {
+            data = json_decode(body)
+            en_raw = map_get(data, "enabled")
+            enabled = if (en_raw == nil) { map_get(cur, "enabled") } else { if (en_raw == 'false' || en_raw == 0) { 0 } else { 1 } }
+            _u = Store.persona_set(db, id, default_str(map_get(data, "name"), map_get(cur, "name")), default_str(map_get(data, "role"), map_get(cur, "role")), default_str(map_get(data, "goal"), map_get(cur, "goal")), default_str(map_get(data, "start"), map_get(cur, "start")), default_str(map_get(data, "done_when"), map_get(cur, "done_when")), default_str(map_get(data, "model"), map_get(cur, "model")), enabled)
+            respond(conn, 200, json_encode(Store.persona_row(db, id)))
+        }
+    }
+}
+
+# POST /api/companies/:id/persona_reports — open (the persona has no token),
+# but only a persona run that is still in flight for this company may report,
+# and every report must carry a repro: no steps or no verbatim `actual` is a
+# 400. The reply says nothing about other reports or the board: a persona
+# never learns what anyone else found.
+fun persona_report(db, conn, method, cid, body) {
+    if (method != 'POST') {
+        respond(conn, 405, err_json("method not allowed"))
+    } else {
+        data = json_decode(body)
+        run_id = default_str(map_get(data, "run_id"), "")
+        run = Store.persona_run_row(db, run_id)
+        rerr = persona_report_error(run, cid, data)
+        if (string_length(rerr) > 0) {
+            respond(conn, 400, err_json(rerr))
+        } else {
+            rep = %{severity: map_get(data, "severity"), title: string_truncate(map_get(data, "title"), 200), doc_section: string_truncate(default_str(map_get(data, "doc_section"), ""), 200), steps: string_truncate(map_get(data, "steps"), 4000), expected: string_truncate(default_str(map_get(data, "expected"), ""), 2000), actual: string_truncate(map_get(data, "actual"), 4000), env: string_truncate(default_str(map_get(data, "env"), ""), 500)}
+            n = Store.persona_run_add_report(db, run_id, rep)
+            respond(conn, 201, json_encode(%{status: "recorded", reports: n}))
+        }
+    }
+}
+
+fun blank(v) {
+    if (v == nil) { 'true' } else { if (string_length(string_trim(v)) == 0) { 'true' } else { 'false' } }
+}
+
+fun persona_report_error(run, cid, data) {
+    sev = default_str(map_get(data, "severity"), "")
+    if (run == nil) { "unknown run_id" }
+    else { if (map_get(run, "company_id") != cid) { "unknown run_id" }
+    else { if (map_get(run, "ended_at") != 0) { "this persona run has already finished" }
+    else { if (sev != "blocked" && sev != "wrong" && sev != "friction") { "severity must be blocked, wrong or friction" }
+    else { if (blank(map_get(data, "title")) == 'true') { "field 'title' is required" }
+    else { if (blank(map_get(data, "steps")) == 'true' || blank(map_get(data, "actual")) == 'true') { "a report needs a repro: 'steps' and the verbatim 'actual' output" }
+    else { "" }}}}}}
 }
 
 # ---- issues --------------------------------------------------

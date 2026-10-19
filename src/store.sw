@@ -23,8 +23,9 @@ export [next_id, companies, company_row, company_create, company_update,
         approval_create, approvals_pending, approval_row, approval_set,
         persona_create, persona_row, personas_for, persona_set, personas_due, persona_touch,
         companies_persona_due, company_touch_persona, company_add_persona_spend,
-        persona_run_create, persona_run_row, persona_runs_for, persona_run_report, persona_run_finish,
-        issue_link_persona, issue_open_by_fp, issue_append_body]
+        persona_run_create, persona_run_row, persona_runs_for, persona_run_report, persona_run_finish, persona_run_add_report,
+        issue_link_persona, issue_open_by_fp, issue_append_body,
+        persona_confirm_due, issue_set_scenario_state, company_set_persona]
 
 # Ask the registered `idgen` process for a fresh unique id.
 fun next_id(prefix) {
@@ -589,11 +590,38 @@ fun persona_run_report(db, run_id, outcome, report, issue_id) {
     run_id
 }
 
-# The worker finished: record cost and end time. A run that never filed a
-# report ends as "error".
-fun persona_run_finish(db, run_id, cost) {
-    _u = db_query(db, "UPDATE persona_run SET ended_at = ?, cost_cents = CAST(ROUND(?) AS INTEGER), outcome = CASE WHEN outcome = 'running' THEN 'error' ELSE outcome END WHERE id = ?", [timestamp(), cost, run_id])
+# A persona POSTs its findings while it runs; each report is appended to the
+# run's JSON list and the run is marked "reported". The orchestrator files
+# them when the run finishes (so the router never blocks on a judge call).
+fun persona_run_add_report(db, run_id, report) {
+    row = persona_run_row(db, run_id)
+    raw = map_get(row, "report")
+    cur = if (raw == nil) { [] } else { if (string_length(raw) == 0) { [] } else { json_decode(raw) } }
+    _u = db_query(db, "UPDATE persona_run SET outcome = 'reported', report = ? WHERE id = ?", [json_encode(cur ++ [report]), run_id])
+    length(cur) + 1
+}
+
+# The worker finished: record cost and end time. A run still "running" (it
+# filed nothing) ends as `quiet` (a clean pass), or "error" if the worker failed.
+fun persona_run_finish(db, run_id, cost, quiet) {
+    _u = db_query(db, "UPDATE persona_run SET ended_at = ?, cost_cents = CAST(ROUND(?) AS INTEGER), outcome = CASE WHEN outcome = 'running' THEN ? ELSE outcome END WHERE id = ?", [timestamp(), cost, quiet, run_id])
     persona_run_row(db, run_id)
+}
+
+# Persona-found issues that reached Done and still owe a confirmation run
+# (verify_scenario_after_fix: 1 = owed, 2 = running, 3 = settled).
+fun persona_confirm_due(db) {
+    db_query(db, "SELECT i.id, i.company_id, i.identifier, i.title, i.persona_id, i.origin, i.fingerprint FROM issue i JOIN company c ON c.id = i.company_id WHERE i.verify_scenario_after_fix = 1 AND i.status = 'Done' AND i.persona_id != '' AND c.status = 'active' LIMIT 4", [])
+}
+
+fun issue_set_scenario_state(db, id, v) {
+    _u = db_query(db, "UPDATE issue SET verify_scenario_after_fix = ? WHERE id = ?", [v, id])
+    id
+}
+
+fun company_set_persona(db, id, daily_cents, per_day) {
+    _u = db_query(db, "UPDATE company SET persona_daily_cents = ?, personas_per_day = ?, updated_at = ? WHERE id = ?", [daily_cents, per_day, timestamp(), id])
+    id
 }
 
 fun issue_link_persona(db, issue_id, persona_id) {
