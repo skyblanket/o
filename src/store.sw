@@ -26,7 +26,7 @@ export [next_id, companies, company_row, company_create, company_update,
         persona_run_create, persona_run_row, persona_runs_for, persona_run_report, persona_run_finish, persona_run_add_report,
         issue_link_persona, issue_open_by_fp, issue_append_body,
         persona_confirm_due, issue_set_scenario_state, company_set_persona,
-        persona_run_set_issue, persona_runs_reap]
+        persona_run_set_issue, persona_runs_reap, persona_confirms_running]
 
 # Ask the registered `idgen` process for a fresh unique id.
 fun next_id(prefix) {
@@ -612,7 +612,7 @@ fun persona_run_finish(db, run_id, cost, quiet) {
 # Persona-found issues that reached Done and still owe a confirmation run
 # (verify_scenario_after_fix: 1 = owed, 2 = running, 3 = settled).
 fun persona_confirm_due(db) {
-    db_query(db, "SELECT i.id, i.company_id, i.identifier, i.title, i.persona_id, i.origin, i.fingerprint FROM issue i JOIN company c ON c.id = i.company_id WHERE i.verify_scenario_after_fix = 1 AND i.status = 'Done' AND i.persona_id != '' AND c.status = 'active' LIMIT 4", [])
+    db_query(db, "SELECT i.id, i.company_id, i.identifier, i.title, i.persona_id, i.origin, i.fingerprint FROM issue i JOIN company c ON c.id = i.company_id WHERE i.verify_scenario_after_fix = 1 AND i.status = 'Done' AND i.persona_id != '' AND c.status = 'active' LIMIT 1", [])
 }
 
 fun persona_run_set_issue(db, run_id, issue_id) {
@@ -625,6 +625,11 @@ fun persona_run_set_issue(db, run_id, issue_id) {
 fun persona_runs_reap(db, cutoff) {
     _u = db_query(db, "UPDATE persona_run SET outcome = 'error', ended_at = ? WHERE ended_at = 0 AND started_at < ?", [timestamp(), cutoff])
     ""
+}
+
+fun persona_confirms_running(db) {
+    rows = db_query(db, "SELECT COUNT(*) AS n FROM persona_run WHERE kind = 'confirm' AND ended_at = 0", [])
+    if (length(rows) == 0) { 0 } else { map_get(hd(rows), "n") }
 }
 
 fun issue_set_scenario_state(db, id, v) {

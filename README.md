@@ -373,6 +373,7 @@ The daemon reads its configuration from the environment. All are optional.
 
 | variable | default | meaning |
 |---|---|---|
+| `SW_SCHEDULERS` | CPU count | scheduler threads (a swarmrt setting). Each running agent, verify, gate review or persona holds one while its subprocess runs, and when all are held the API and orchestrator stall; set it well above how many can run at once (`deploy/o.env.example` uses 32). |
 | `O_DB` | `~/.o/o.db` | control-plane SQLite path. |
 | `O_PORT` | `4100` | HTTP port. |
 | `O_CLAUDE_BIN` | `claude` on `PATH` | claude-code binary for the `claude-code` runtime. |

@@ -2718,7 +2718,9 @@ fun persona_budget_left(company) {
 
 fun maybe_persona_pass(db, dbpath, port, now) {
     if (getenv("O_PERSONAS") == "1") {
-        _r = Store.persona_runs_reap(db, now - persona_timeout_ms() * 3)
+        # A pass runs its personas one after another, so a queued run can be
+        # hours old; only a run from before yesterday is surely dead.
+        _r = Store.persona_runs_reap(db, now - 86400000)
         persona_pass_each(db, dbpath, port, Store.companies_persona_due(db, now), now)
     } else {
         ""
@@ -2739,33 +2741,47 @@ fun persona_pass_each(db, dbpath, port, cands, now) {
             if (persona_budget_left(c) == 'false') {
                 _l = Store.log_activity(db, cid, "budget-guard", "persona.budget_stop", cid)
             } else {
-                _s = persona_spawn_each(db, dbpath, port, Store.company_row(db, cid), Store.personas_due(db, cid, map_get(c, "personas_per_day")), now)
+                jobs = persona_jobs(db, dbpath, port, Store.company_row(db, cid), Store.personas_due(db, cid, map_get(c, "personas_per_day")), now)
+                _s = spawn(persona_batch(jobs))
             }
         }
         persona_pass_each(db, dbpath, port, tl(cands), now)
     }
 }
 
-fun persona_spawn_each(db, dbpath, port, company, personas, now) {
+# A pass's personas run one after another in one worker, not side by side:
+# every persona (and agent, and gate review) holds a scheduler thread for as
+# long as its CLI runs, and when all of them are held the router and the
+# orchestrator stop until one returns.
+fun persona_jobs(db, dbpath, port, company, personas, now) {
     if (length(personas) == 0) {
-        ""
+        []
     } else {
         p = hd(personas)
         _t = Store.persona_touch(db, map_get(p, "id"), now)
-        _s = persona_spawn(db, dbpath, port, company, p, "scenario", nil)
-        persona_spawn_each(db, dbpath, port, company, tl(personas), now)
+        [persona_job(db, dbpath, port, company, p, "scenario", nil)] ++ persona_jobs(db, dbpath, port, company, tl(personas), now)
     }
 }
 
-# scenario: nil for the daily pass; the original report (a map) for a confirm run.
+fun persona_batch(jobs) {
+    if (length(jobs) == 0) { "" } else {
+        _w = persona_worker(hd(jobs))
+        persona_batch(tl(jobs))
+    }
+}
+
 fun persona_spawn(db, dbpath, port, company, persona, kind, scenario) {
+    spawn(persona_worker(persona_job(db, dbpath, port, company, persona, kind, scenario)))
+}
+
+# scenario: nil for the daily pass; the original report (a map) for a confirm run.
+fun persona_job(db, dbpath, port, company, persona, kind, scenario) {
     cid = map_get(company, "id")
     repo = map_get(company, "repo")
     for_issue = if (scenario == nil) { "" } else { str_or(map_get(scenario, "issue_id"), "") }
     run_id = Store.persona_run_create(db, map_get(persona, "id"), cid, kind, for_issue)
     _l = Store.log_activity(db, cid, "orchestrator", f"persona.{kind}", map_get(persona, "name"))
-    job = %{dbpath: dbpath, port: port, company_id: cid, repo: repo, base: company_base(company, repo), fetch: is_pr_mode(company), persona: persona, run_id: run_id, kind: kind, scenario: scenario}
-    spawn(persona_worker(job))
+    %{dbpath: dbpath, port: port, company_id: cid, repo: repo, base: company_base(company, repo), fetch: is_pr_mode(company), persona: persona, run_id: run_id, kind: kind, scenario: scenario}
 }
 
 # A sandbox for a persona: read-only filesystem, writable only its own
@@ -2814,7 +2830,7 @@ fun persona_report_url_help(url, run_id) {
     example = "{\"run_id\":\"" ++ run_id ++ "\",\"severity\":\"blocked\",\"title\":\"...\",\"doc_section\":\"README.md > Install\",\"steps\":\"1. ...\\n2. ...\",\"expected\":\"...\",\"actual\":\"<the exact output, pasted>\",\"env\":\"<uname -sm and tool versions>\"}"
     "To report a problem, write the JSON to a file and POST it:\n  curl -s -X POST " ++ url ++ " -H 'Content-Type: application/json' -d @report.json\nwhere report.json looks like:\n  " ++ example ++ "\n" ++
     "severity is one of:\n  blocked  - you cannot get any further toward your goal. Report it, then stop.\n  wrong    - the docs say one thing and the product does another.\n  friction - you got past it, but it was confusing, slow or needed guessing.\n" ++
-    "`actual` must be the real output, copied verbatim, not a summary. A report without steps and actual is refused. Report each distinct problem once.\n"
+    "`actual` must be the real output, copied verbatim, not a summary. A report without steps and actual is refused. Report each distinct problem once. If the POST gets no response, retry it once.\n"
 }
 
 fun persona_rules() {
@@ -2983,7 +2999,8 @@ fun file_friction(db, cid, persona, rep) {
 # ---- confirmation ---------------------------------------------
 
 fun maybe_persona_confirm(db, dbpath, port, now) {
-    if (getenv("O_PERSONAS") == "1" && persona_sandbox_ok() == 'true') {
+    # One confirmation in flight at a time (see persona_jobs).
+    if (getenv("O_PERSONAS") == "1" && persona_sandbox_ok() == 'true' && Store.persona_confirms_running(db) == 0) {
         confirm_each(db, dbpath, port, Store.persona_confirm_due(db))
     } else {
         ""

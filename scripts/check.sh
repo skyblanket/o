@@ -1454,7 +1454,8 @@ fi
 url="$(printf '%s' "$prompt" | grep -oE 'http://127[^ ]*/persona_reports' | head -n1)"
 rid="$(printf '%s' "$prompt" | grep -oE '"run_id":"[^"]*"' | head -n1 | sed 's/.*:"//; s/"$//')"
 [ -d .git ] && echo "git:yes" >> "$PSTUB_LOG" || echo "git:no $(pwd)" >> "$PSTUB_LOG"
-post() { curl -s -o /dev/null -w '%{http_code}' --max-time 10 -X POST "$url" -H 'Content-Type: application/json' -d "$1"; }
+# One retry when the connection drops (swarmrt's HTTP server can idle-close under load; see ocurl).
+post() { local c; for _t in 1 2 3; do c="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -X POST "$url" -H 'Content-Type: application/json' -d "$1")"; [ "$c" != "000" ] && break; sleep 1; done; printf '%s' "$c"; }
 rep() { printf '{"run_id":"%s","severity":"%s","title":"%s","doc_section":"README.md > Five minutes","steps":"1. make\\n2. ./run","expected":"it runs","actual":"%s","env":"linux"}' "$rid" "$1" "$2" "$3"; }
 if printf '%s' "$prompt" | grep -q 'RESULT: FIXED'; then
   if printf '%s' "$prompt" | grep -A1 'you hit this problem' | grep still >/dev/null; then
@@ -1526,7 +1527,8 @@ sleep 1
 q6() { sqlite3 "$TMP6/o.db" "$1"; }
 [ "$(q6 "SELECT COUNT(*) FROM issue WHERE company_id='$CIDP' AND origin='persona' AND priority='high'")" = "1" ] \
   || { q6 "SELECT title, fingerprint FROM issue"; fail "persona: blocked x2 (same error, different paths/numbers) should file exactly one high issue"; }
-q6 "SELECT COUNT(*) FROM activity WHERE company_id='$CIDP' AND verb='selffile.duped'" | grep -x 1 >/dev/null || fail "persona: second blocked report not logged selffile.duped"
+# >= 1: a retried POST whose first response was dropped records the same report twice, and that dedupes too.
+[ "$(q6 "SELECT COUNT(*) FROM activity WHERE company_id='$CIDP' AND verb='selffile.duped'")" -ge 1 ] || fail "persona: second blocked report not logged selffile.duped"
 q6 "SELECT body FROM issue WHERE company_id='$CIDP' AND priority='high'" | grep 'Also hit by persona' >/dev/null || fail "persona: dup not noted on the open issue"
 [ "$(q6 "SELECT persona_id != '' AND verify_scenario_after_fix = 1 FROM issue WHERE company_id='$CIDP' AND priority='high'")" = "1" ] || fail "persona: issue not linked to its persona"
 pass "persona: blocked -> one high issue, same error elsewhere dedupes (selffile.duped)"
