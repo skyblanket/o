@@ -1,0 +1,33 @@
+{
+  "_comment": "Personas for skyblanket/swarmrt. Load with: jq -c '.personas[]' examples/personas/swarmrt.json | while read -r p; do curl -s -X POST \"$O/api/companies/$CID/personas\" -H 'Content-Type: application/json' -H \"Authorization: Bearer $O_API_TOKEN\" -d \"$p\"; done",
+  "personas": [
+    {
+      "name": "Newcomer",
+      "role": "A backend developer who has never seen swarmrt or Erlang. Comfortable with a shell, make and a C compiler; reads the README top to bottom and copies commands exactly.",
+      "goal": "Follow the README's \"Five minutes\" section: build swc, create a project with `swc new`, and get its tests passing offline.",
+      "start": "README.md, section \"Five minutes\"",
+      "done_when": "`make test` passes inside the generated project, or you are blocked."
+    },
+    {
+      "name": "Eval-runner builder",
+      "role": "An ML engineer who wants to run an LLM eval over a few hundred prompts with a deadline per item. Knows Python well, no Erlang. Will not set up an API key; uses the offline mock server the docs describe.",
+      "goal": "Write the eval runner from the README's \"An eval runner in 15 lines\" section as a real file, run it against tasks.txt with the offline model, and see per-task results and timeouts.",
+      "start": "README.md, section \"An eval runner in 15 lines\", then docs/BUILDING_AGENTS.md",
+      "done_when": "Your runner prints a result (or a timeout) for every task, or you are blocked."
+    },
+    {
+      "name": "Erlang porter",
+      "role": "An Erlang/OTP developer evaluating swarmrt for a port. Expects spawn/send/receive, links, monitors and supervisors to behave like OTP, and will check the differences the docs claim.",
+      "goal": "Port a small OTP-style program to sw: a supervisor with one_for_one restart over two workers, one of which crashes on a bad message. Confirm the crash is restarted and the other worker keeps its state.",
+      "start": "docs/SW_LANGUAGE.md (processes and supervisors), README.md \"The language in one screenful\"",
+      "done_when": "The program runs compiled (`swc build`) and interpreted (`swc run`) with the same output, showing the restart, or you are blocked."
+    },
+    {
+      "name": "Docs-only model",
+      "role": "An LLM coding assistant with only docs/AGENT_SYSTEM.md loaded as its reference, writing sw for a user. It writes code from the cheatsheet without reading the compiler source.",
+      "goal": "Using only docs/AGENT_SYSTEM.md, write an sw program that fans out 5 HTTP-free tasks to processes, collects their replies with a timeout, and prints them in order.",
+      "start": "docs/AGENT_SYSTEM.md",
+      "done_when": "The program compiles with `swc build` and prints the 5 results, or a construct the cheatsheet promised doesn't work."
+    }
+  ]
+}

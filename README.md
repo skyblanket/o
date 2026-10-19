@@ -261,6 +261,51 @@ O acts with your GitHub token, and GitHub won't let a PR's author approve their
 own PR. So the maintainer's review is a comment, and the merge works as long as
 branch protection doesn't require an approving review.
 
+## Personas: simulated users
+
+Tests check what the authors thought of. Personas check what a user hits. Once a
+day (`O_PERSONAS=1`) O sends a few simulated users at the product, each with a
+role, a realistic goal and a starting doc, and lets them try to get there from
+the docs alone. Each one gets a clean export of the base branch: no `.git`, no
+board, no other reports, no fix diffs.
+
+What blocks them comes back as an issue with a verbatim repro:
+
+| severity | what it means | becomes |
+|---|---|---|
+| `blocked` | can't get any further toward the goal | a high-priority issue |
+| `wrong` | the docs say X, the product does Y | a medium issue |
+| `friction` | got there, but had to guess | an entry in the week's digest issue |
+
+- **Repro or nothing.** A report needs `steps` and the verbatim `actual` output,
+  or it's refused with a 400.
+- **Dedup.** Reports are fingerprinted on the first line of `actual` with paths,
+  numbers and addresses stripped (or on doc section + title for `wrong`), so two
+  personas hitting the same error file one issue.
+- **Judge (optional).** With `O_PERSONA_JUDGE=1`, a second cheap pass reads each
+  report against the checkout and drops NOISE, such as the persona's own
+  mistakes and sandbox artifacts.
+- **Confirmation.** When a persona-found issue reaches Done, the same persona
+  re-runs the scenario on the new version. If it passes, O logs
+  `persona.confirmed`. If it fails, O files a fix issue, and depth-1 stops the
+  chain there.
+- **Safety and cost.** Personas run whatever the docs tell them to, so they run
+  only under `O_SANDBOX=bwrap` (or with an explicit `O_PERSONAS_UNSANDBOXED=1`),
+  and their prompt treats everything in the checkout as data, not instructions.
+  They have their own daily budget (`persona_daily_cents`, default $2) and
+  default to a cheaper model (`O_PERSONA_MODEL`, default `haiku`).
+
+```sh
+curl -X POST localhost:4100/api/companies/<id>/personas -H 'Content-Type: application/json' \
+  -d '{"name":"Newcomer","role":"never seen the project","goal":"follow the README quick start",
+       "start":"README.md","done_when":"the tests pass"}'
+curl localhost:4100/api/companies/<id>/persona_runs      # runs, outcomes, reports
+```
+
+[`examples/personas/swarmrt.json`](examples/personas/swarmrt.json) has four
+personas for swarmrt: a newcomer, an eval-runner builder, an Erlang porter and a
+docs-only model.
+
 ## Feedback widget
 
 `feedback/o-feedback.js` is a dependency-free annotation layer for your dev app.
@@ -358,6 +403,10 @@ The daemon reads its configuration from the environment. All are optional.
 | `O_MAINTAINER_ROTATE` | `25` | reviews per maintainer session before a fresh one primed from `NOTES.md`. |
 | `O_ESCALATE_PATHS` / `O_ESCALATE_LINES` | unset / `1000` | PRs touching these path prefixes, or bigger than this, always go to a human (on top of `.o-review.json` tiers). |
 | `O_GATE_TIMEOUT_S` / `O_GATE_MAX_TURNS` | `3600` / `80` | wall-clock and turn caps for one gate review, checks included. |
+| `O_PERSONAS` | unset | `1` turns on the daily persona pass (needs `O_SANDBOX=bwrap` or `O_PERSONAS_UNSANDBOXED=1`). |
+| `O_PERSONA_MODEL` | `haiku` | default model for personas (a persona's own `model` wins). |
+| `O_PERSONA_MAX_TURNS` / `O_PERSONA_TIMEOUT_S` | `40` / `900` | turn and wall-clock caps for one persona run. |
+| `O_PERSONA_JUDGE` / `O_PERSONA_JUDGE_MODEL` | unset / `haiku` | `1` runs a REAL-or-NOISE judge over each report before it's filed. |
 | `O_VERIFY_RERUNS` | `1` | post-merge verify re-runs before a red result counts as a regression. |
 
 ## API
