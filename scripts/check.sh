@@ -1159,8 +1159,8 @@ SEEDGH="$TMP4/seedgh"
 git clone -q "$GHS/remote.git" "$SEEDGH"
 git -C "$SEEDGH" config user.email "o@example.com"; git -C "$SEEDGH" config user.name "O Test"
 cp "$SCRATCH/verify.sh" "$SEEDGH/verify.sh"; echo "gh project" > "$SEEDGH/README.md"
-mkdir -p "$SEEDGH/.o"
-cat > "$SEEDGH/.o/review.json" <<'JSON'
+: # config lives at the repo root
+cat > "$SEEDGH/.o-review.json" <<'JSON'
 { "build": "true",
   "suite": "true",
   "test_runners": [ { "paths": ["tests/"], "cmd": "sh {file}", "prove_fails": true } ],
@@ -1303,7 +1303,7 @@ wait_status_at "$BASE4" "$IID_GE" "Canceled" 30 || fail "poller: a closed PR was
 pass "poller: PR-only PR adopted + merged by the gate; refused/escalated never re-adopted; human merge -> Done; closed -> Canceled"
 
 # ---- gate v2: the reviewer brief ----------------------------------------
-# O's own checks run before any model (.o/review.json, read from base). A test
+# O's own checks run before any model (.o-review.json, read from base). A test
 # that passes WITHOUT the change is a REJECT. A runtime-tier change needs a
 # human even when approved. An APPROVE with no command run is UNVERIFIED. A PR
 # O gives up on is closed. CI must be green on the PR merged with CURRENT main

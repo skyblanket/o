@@ -1803,7 +1803,7 @@ fun ci_poll(orch, run_id, issue_id, gh_repo, branch, num, base, required, pushed
     checks = pr_checks(gh_repo, sha)
     verdict = classify_checks(checks, "success", "")
     settled = timestamp() - pushed_at >= env_int("O_CI_SETTLE_S", 30) * 1000
-    # Every check .o/review.json requires must have run AND passed, not just
+    # Every check .o-review.json requires must have run AND passed, not just
     # whatever has reported so far.
     req_ok = Std.all(required, fn(n) { Std.any(checks, fn(c) { str_or(map_get(c, "name"), str_or(map_get(c, "context"), "")) == n && (string_lower(str_or(map_get(c, "conclusion"), "")) == "success" || string_lower(str_or(map_get(c, "state"), "")) == "success") }) })
     # The checks must have run on the PR merged with CURRENT base: if base has
@@ -2043,7 +2043,7 @@ fun lines_of(s) {
     [l for l in string_split(string_trim(s), "\n") when string_length(string_trim(l)) > 0]
 }
 
-# ---- per-repo review config: .o/review.json, read from the BASE branch ----
+# ---- per-repo review config: .o-review.json, read from the BASE branch ----
 # (never from the PR, so a change can't relax the checks that judge it)
 #   build            command that builds the project
 #   suite            the test suite to run on the merged result
@@ -2052,7 +2052,7 @@ fun lines_of(s) {
 #   tiers            [{name, paths, merge: "auto"|"human", extra: [cmd]}]
 #   default_merge    tier for files no tier matches ("auto" unless set)
 fun review_config(repo, base) {
-    r = shell(f"git -C {sq(repo)} show {sq(base ++ ":.o/review.json")}")
+    r = shell(f"git -C {sq(repo)} show {sq(base ++ ":.o-review.json")}")
     d = if (elem(r, 0) == 0) { json_decode(elem(r, 1)) } else { nil }
     if (d == nil) { %{} } else { d }
 }
@@ -2176,7 +2176,7 @@ fun gate_model_review(job, cfg, rv, files, lines, numstat, tier, evidence) {
 # Post the decision with its evidence on the PR, and hand it back.
 fun gate_result(job, verdict, text, evidence, cmd_md, session, cost) {
     dir = map_get(job, "dir")
-    body = "**O merge gate** (" ++ merge_model() ++ ")\n\n**Decision:** `" ++ verdict ++ "`\n\n<details><summary>O's own checks</summary>\n\n" ++ (if (string_length(evidence) > 0) { evidence } else { "_(none configured; add .o/review.json)_\n" }) ++ "\n</details>\n\n<details><summary>Commands the maintainer ran</summary>\n\n" ++ (if (string_length(cmd_md) > 0) { cmd_md } else { "_(model not consulted)_\n" }) ++ "\n</details>\n\n" ++ text
+    body = "**O merge gate** (" ++ merge_model() ++ ")\n\n**Decision:** `" ++ verdict ++ "`\n\n<details><summary>O's own checks</summary>\n\n" ++ (if (string_length(evidence) > 0) { evidence } else { "_(none configured; add .o-review.json)_\n" }) ++ "\n</details>\n\n<details><summary>Commands the maintainer ran</summary>\n\n" ++ (if (string_length(cmd_md) > 0) { cmd_md } else { "_(model not consulted)_\n" }) ++ "\n</details>\n\n" ++ text
     _c = file_write(f"{dir}/COMMENT.md", body)
     _p = shell(f"{gh_bin()} api -X POST repos/{map_get(job, "gh_repo")}/issues/{map_get(job, "num")}/comments -F body=@{sq(dir)}/COMMENT.md")
     %{verdict: verdict, text: (if (string_length(evidence) > 0) { "O's checks:\n" ++ evidence ++ "\n" } else { "" }) ++ text, session: session, cost: cost}
@@ -2205,7 +2205,7 @@ fun gate_primer(gh_repo) {
 
 fun gate_pr_message(job, cfg, rv, numstat, hist, diff, tier, evidence) {
     cmds = "build: " ++ cfg_str(cfg, "build") ++ "\nsuite: " ++ cfg_str(cfg, "suite") ++ "\nextra for this change's tier: " ++ Std.join(map_get(tier, "extra"), "; ")
-    "== Review PR #" ++ to_string(map_get(job, "num")) ++ ": " ++ map_get(job, "title") ++ " ==\nCheckout (PR merged with current " ++ map_get(job, "base") ++ "): " ++ rv ++ "\nRisk tier: " ++ (if (string_length(map_get(tier, "names")) > 0) { map_get(tier, "names") } else { "default" }) ++ "\nRepo commands (.o/review.json):\n" ++ cmds ++ "\n\nO already ran these checks itself:\n" ++ (if (string_length(evidence) > 0) { evidence } else { "(none configured)\n" }) ++ "\nIssue:\n" ++ map_get(job, "body") ++ "\n\nFiles changed (added, removed, path):\n" ++ numstat ++ "\nRecent history of these files on the base:\n" ++ hist ++ "\nDiff:\n" ++ diff ++ "\n\n" ++ gate_rubric()
+    "== Review PR #" ++ to_string(map_get(job, "num")) ++ ": " ++ map_get(job, "title") ++ " ==\nCheckout (PR merged with current " ++ map_get(job, "base") ++ "): " ++ rv ++ "\nRisk tier: " ++ (if (string_length(map_get(tier, "names")) > 0) { map_get(tier, "names") } else { "default" }) ++ "\nRepo commands (.o-review.json):\n" ++ cmds ++ "\n\nO already ran these checks itself:\n" ++ (if (string_length(evidence) > 0) { evidence } else { "(none configured)\n" }) ++ "\nIssue:\n" ++ map_get(job, "body") ++ "\n\nFiles changed (added, removed, path):\n" ++ numstat ++ "\nRecent history of these files on the base:\n" ++ hist ++ "\nDiff:\n" ++ diff ++ "\n\n" ++ gate_rubric()
 }
 
 # The reviewer rubric (from the swarmrt reviewer brief, generalised).

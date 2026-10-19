@@ -94,6 +94,26 @@ claude mcp add o -- node "$PWD/mcp/server.js"
 The control plane lives at `~/.o/o.db`; per-issue worktrees live under
 `~/.o/workspaces/`. Nothing else is created.
 
+## Run it 24/7
+
+O is a long-running daemon. Give it a machine that stays up (your Linux box
+or a small VM), and it keeps working its repos:
+
+```sh
+git clone https://github.com/skyblanket/o && cd o
+gh auth login            # GitHub access for issues and PRs
+claude                   # log in once, interactively
+deploy/install.sh        # builds swarmrt + O, installs a systemd user service
+loginctl enable-linger "$USER"   # keep it running after you log out
+```
+
+Settings live in `~/.config/o/o.env` (start from `deploy/o.env.example`: set
+`O_API_TOKEN`, keep `O_SANDBOX=bwrap`, choose `O_MERGE_GATE` or
+`O_PR_AUTOMERGE=0`). Then use `systemctl --user restart o` and
+`journalctl --user -u o -f`. Restarts are safe: in-flight issues are recovered
+with their attempt counts. To add a repo, clone it on the machine and create a
+company with `ship: "pr"`, `github_repo` and a `.o-review.json` in the repo.
+
 ## Safety model
 
 O edits real repositories on its own. The guard rails are the point.
@@ -182,7 +202,7 @@ default `claude-opus-5-5`), and nothing merges on reading alone.
 **1. O's own checks run first, with no model involved.** O makes a
 disposable clone of the PR **merged with current base**. It has no git
 remotes, and `GH_TOKEN` is stripped, so nothing in it can push. In that clone
-O runs the commands from `.o/review.json`:
+O runs the commands from `.o-review.json`:
 - the build
 - every new or changed test, which must pass on the PR **and fail on base
   without the change**, so a test that can't fail is a REJECT
@@ -213,9 +233,9 @@ the pre-PR screen.
 every command the maintainer ran (taken from its tool calls, not its own
 summary).
 
-#### `.o/review.json`
+#### `.o-review.json`
 The file is read from the **base** branch, so a PR can't relax the checks
-that judge it. Protect `.o/` with `protected_paths`.
+that judge it. Protect `.o-review.json` with `protected_paths`. (It is a root file rather than an `.o/` directory because C projects routinely `.gitignore` `*.o`, which would hide `.o/`.)
 
 ```json
 { "build": "make swc libswarmrt",
@@ -336,7 +356,7 @@ The daemon reads its configuration from the environment. All are optional.
 | `O_MERGE_GATE` | unset | `1` sends every green PR to the persistent maintainer for MERGE / CHANGES / ESCALATE. |
 | `O_MERGE_MODEL` | `claude-opus-5-5` | the maintainer's model. |
 | `O_MAINTAINER_ROTATE` | `25` | reviews per maintainer session before a fresh one primed from `NOTES.md`. |
-| `O_ESCALATE_PATHS` / `O_ESCALATE_LINES` | unset / `1000` | PRs touching these path prefixes, or bigger than this, always go to a human (on top of `.o/review.json` tiers). |
+| `O_ESCALATE_PATHS` / `O_ESCALATE_LINES` | unset / `1000` | PRs touching these path prefixes, or bigger than this, always go to a human (on top of `.o-review.json` tiers). |
 | `O_GATE_TIMEOUT_S` / `O_GATE_MAX_TURNS` | `3600` / `80` | wall-clock and turn caps for one gate review, checks included. |
 | `O_VERIFY_RERUNS` | `1` | post-merge verify re-runs before a red result counts as a regression. |
 
