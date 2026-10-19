@@ -65,7 +65,8 @@ git clone https://github.com/skyblanket/swarmrt   # sibling of this repo
 git clone https://github.com/skyblanket/o
 cd o
 make                 # -> bin/swarmd   (or: make SWARMRT=/path/to/swarmrt)
-make check           # hermetic end-to-end test suite (sim runtime, no tokens)
+make check-fast      # ~10s: build + held-out invariants (run before every push)
+make check           # ~2.5 min: full hermetic end-to-end suite (sim runtime, no tokens)
 ./scripts/acceptance.sh                  # whole-loop acceptance, stub agent
 O_ACCEPT_REAL=1 ./scripts/acceptance.sh  # same, with a real claude agent (spends tokens)
 ```
@@ -267,7 +268,7 @@ O maintains its own repo the same way. This repo's [`.o-review.json`](.o-review.
 - **Automatic on APPROVE:** docs, UI, and the API/store code.
 - **Needs a human:** changes to the gate and sandbox (`src/orchestrator.sw`).
 
-Run the company with `verify_cmd: "make && ./tests/heldout/core.sh"` and protected paths `tests/heldout/,scripts/check.sh,.github/,.o-review.json`, and set `SWARMRT=/path/to/swarmrt` in the daemon's environment so agents and the gate can build. A merged change takes effect only when you rebuild and restart the daemon.
+Run the company with `verify_cmd: "make check-fast"` and protected paths `tests/heldout/,scripts/check.sh,.github/,.o-review.json`, and set `SWARMRT=/path/to/swarmrt` in the daemon's environment so agents and the gate can build. A merged change takes effect only when you rebuild and restart the daemon.
 
 ## Personas: simulated users
 
@@ -382,6 +383,7 @@ The daemon reads its configuration from the environment. All are optional.
 | variable | default | meaning |
 |---|---|---|
 | `SW_SCHEDULERS` | CPU count | scheduler threads (a swarmrt setting). Each running agent, verify, gate review or persona holds one while its subprocess runs, and when all are held the API and orchestrator stall; set it well above how many can run at once (`deploy/o.env.example` uses 32). |
+| `O_TICK_MS` / `O_BACKOFF_MS` | `5000` / `2000` | orchestrator tick and base retry backoff in ms (the test suite runs at 500 / 300). |
 | `O_DB` | `~/.o/o.db` | control-plane SQLite path. |
 | `O_PORT` | `4100` | HTTP port. |
 | `O_CLAUDE_BIN` | `claude` on `PATH` | claude-code binary for the `claude-code` runtime. |
@@ -398,7 +400,8 @@ The daemon reads its configuration from the environment. All are optional.
 | `O_API_TOKEN` | unset | when set, company / agent / approval writes need `Authorization: Bearer <token>`. The UI reads `VITE_O_TOKEN`, the MCP server `O_API_TOKEN`. |
 | `O_TIMEOUT_FLAT_CENTS` | `300` | cost charged for an agent run killed on its wall-clock cap. |
 | `O_REVIEW` | unset | set `1` to require a reviewer model's APPROVE before any green change merges. |
-| `O_REVIEW_MODEL` | claude default | model for the reviewer (e.g. a stronger one than the builder). |
+| `O_MODEL_LADDER` | `haiku,sonnet,opus` | builder model by attempt: attempt 1 on the first, each retry after a red verdict one rung up, the last rung repeats. An agent's own `model` overrides it; `""` uses the CLI default. |
+| `O_REVIEW_MODEL` | `sonnet` | model for the pre-PR reviewer. |
 | `O_GH_BIN` | `gh` on `PATH` | GitHub CLI used for issue import and PRs. |
 | `O_GH_LABEL` | `o` | only open GitHub issues with this label are imported. |
 | `O_GH_POLL_S` | `60` | GitHub issue poll interval. |

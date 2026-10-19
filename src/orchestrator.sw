@@ -31,7 +31,9 @@ export [start, chat_worker]
 
 # ---- tunables ------------------------------------------------
 fun max_concurrent() { 3 }        # PRD: configurable, default 10
-fun tick_interval()  { 5000 }     # PRD: 30000
+# Orchestrator tick and retry backoff, in ms. O_TICK_MS / O_BACKOFF_MS
+# override (the test suite runs at a fraction of a second).
+fun tick_interval()  { env_int("O_TICK_MS", 5000) }
 # Wall-clock cap on one agent run (and the stall sweep's budget for it).
 # O_STALL_TIMEOUT_S overrides; default 600 (10 min). Raise it for repos
 # where real changes take longer.
@@ -40,7 +42,7 @@ fun stall_timeout()  {
     n = if (v == nil) { nil } else { to_int(v) }
     if (n == nil) { 600000 } else { n * 1000 }
 }
-fun backoff_base()   { 2000 }     # PRD: 10000
+fun backoff_base()   { env_int("O_BACKOFF_MS", 2000) }
 fun max_backoff()    { 60000 }    # PRD: 300000
 fun max_attempts()   { 3 }        # after this many failed runs, the issue is marked Failed
 
@@ -707,24 +709,39 @@ fun dispatch_one(db, issue, iid, attempt, running, now) {
         _a = Store.log_activity(db, company_id, "orchestrator", "run.dispatch", iid)
         ident = map_get(issue, "identifier")
         resumed = if (string_length(session_id) > 0) { "resume" } else { "fresh" }
-        print(f"[orch] dispatch {ident} via {runtime} ({resumed} session, attempt {attempt})")
+        model = builder_model(agent, attempt)
+        print(f"[orch] dispatch {ident} via {runtime} ({resumed} session, attempt {attempt}, model {model})")
         sim_outcome = if (runtime == "sim") { decide_outcome(issue, attempt) } else { 'none' }
         start = worktree_start(company, repo)
-        wpid = spawn(run_worker(self(), run_id, iid, runtime, prompt, workspace, repo, session_id, sim_outcome, title, protected, start))
+        wpid = spawn(run_worker(self(), run_id, iid, runtime, prompt, workspace, repo, session_id, sim_outcome, title, protected, start, model))
         map_put(running, iid, %{run_id: run_id, worker_pid: wpid, started_at: now, attempt: attempt, company_id: company_id, agent_id: agent_id, phase: 'agent', workspace: workspace})
     }
 }
 
 # ---- workers: real agent runtimes ----------------------------
 
-fun run_worker(orch, run_id, issue_id, runtime, prompt, workspace, repo, session_id, sim_outcome, title, protected, start) {
+# Builder model: the agent's own `model` if set, else a ladder by attempt.
+# O_MODEL_LADDER (default "haiku,sonnet,opus"): attempt 1 runs on the first,
+# each retry after a red verdict climbs one rung, the last rung repeats. Most
+# issues finish on the cheap model; the expensive one only sees the ones that
+# already failed twice. An empty ladder ("") leaves the CLI's default.
+fun builder_model(agent, attempt) {
+    own = str_or(map_get(agent, "model"), "")
+    if (string_length(own) > 0) { own } else {
+        raw = getenv("O_MODEL_LADDER")
+        ladder = if (raw == nil) { ["haiku", "sonnet", "opus"] } else { [string_trim(x) for x in string_split(raw, ",") when string_length(string_trim(x)) > 0] }
+        if (length(ladder) == 0) { "" } else { Std.nth(ladder, min2(attempt, length(ladder)) - 1) }
+    }
+}
+
+fun run_worker(orch, run_id, issue_id, runtime, prompt, workspace, repo, session_id, sim_outcome, title, protected, start, model) {
     if (runtime == "sim") {
         run_sim(orch, run_id, issue_id, sim_outcome, workspace, repo, title, protected, start)
     } else {
         if (runtime == "swarm-code") {
             run_swarm_code(orch, run_id, issue_id, prompt, workspace, repo, start)
         } else {
-            run_claude_code(orch, run_id, issue_id, prompt, workspace, repo, session_id, start)
+            run_claude_code(orch, run_id, issue_id, prompt, workspace, repo, session_id, start, model)
         }
     }
 }
@@ -738,7 +755,7 @@ fun run_worker(orch, run_id, issue_id, runtime, prompt, workspace, repo, session
 # CONTINUES across every issue it's handed. The (possibly new)
 # session id is parsed back out and returned in run_done, where the
 # orchestrator persists it onto the agent.
-fun run_claude_code(orch, run_id, issue_id, prompt, workspace, repo, session_id, start) {
+fun run_claude_code(orch, run_id, issue_id, prompt, workspace, repo, session_id, start, model) {
     if (string_length(repo) > 0) {
         prepare_worktree(repo, workspace, issue_id, start)
     } else {
@@ -747,11 +764,11 @@ fun run_claude_code(orch, run_id, issue_id, prompt, workspace, repo, session_id,
     if (ws_missing(repo, workspace)) {
         send(orch, {'run_done', run_id, issue_id, 'crashed', 0, ""})
     } else {
-        run_claude_code_in(orch, run_id, issue_id, prompt, workspace, repo, session_id)
+        run_claude_code_in(orch, run_id, issue_id, prompt, workspace, repo, session_id, model)
     }
 }
 
-fun run_claude_code_in(orch, run_id, issue_id, prompt, workspace, repo, session_id) {
+fun run_claude_code_in(orch, run_id, issue_id, prompt, workspace, repo, session_id, model) {
     _w = file_write(f"{workspace}/PROMPT.txt", prompt)
     bin = claude_bin()
     resume = if (string_length(session_id) > 0) { f" --resume {session_id}" } else { "" }
@@ -759,7 +776,7 @@ fun run_claude_code_in(orch, run_id, issue_id, prompt, workspace, repo, session_
     # agent work live. The final {type:"result"} event carries cost
     # and session — parse_stream_* find it after the run.
     sbx = sandbox_prefix(workspace, repo)
-    first = claude_once(workspace, bin, resume, sbx)
+    first = claude_once(workspace, bin, resume, sbx, model)
     # A stored session id can go stale (session pruned, CLI or machine
     # changed, or an inherited parent id — see agent_env), and `--resume`
     # then fails before doing any work: "No conversation found". Retry once
@@ -767,7 +784,7 @@ fun run_claude_code_in(orch, run_id, issue_id, prompt, workspace, repo, session_
     # failed resume still emits a result event echoing the bad id, so the
     # stderr message — not a missing session — is the signal.)
     stale = string_length(resume) > 0 && elem(first, 0) != 0 && string_contains(file_read(f"{workspace}/err.log"), "No conversation found") == 'true'
-    result = if (stale) { claude_once(workspace, bin, "", sbx) } else { first }
+    result = if (stale) { claude_once(workspace, bin, "", sbx, model) } else { first }
     code = elem(result, 0)
     cost = run_cost(code, parse_stream_cost(f"{workspace}/stream.jsonl"))
     new_session = parse_stream_session(f"{workspace}/stream.jsonl")
@@ -783,9 +800,10 @@ fun run_claude_code_in(orch, run_id, issue_id, prompt, workspace, repo, session_
 # child — a real agent run (minutes) would "crash" at 2min while claude kept
 # working unsupervised. shell_managed owns the process group, enforces the
 # timeout in C, and killpg's on expiry (exit 124), ahead of the sweeper.
-fun claude_once(workspace, bin, resume, sbx) {
+fun claude_once(workspace, bin, resume, sbx, model) {
     turns = max_turns()
-    cmd = f"cd {workspace} && cat PROMPT.txt | {agent_env()} {sbx}{bin} -p{resume} --max-turns {turns} --dangerously-skip-permissions --verbose --output-format stream-json > stream.jsonl 2> err.log"
+    mflag = if (string_length(model) > 0) { " --model " ++ sq(model) } else { "" }
+    cmd = f"cd {workspace} && cat PROMPT.txt | {agent_env()} {sbx}{bin} -p{resume}{mflag} --max-turns {turns} --dangerously-skip-permissions --verbose --output-format stream-json > stream.jsonl 2> err.log"
     shell_managed(cmd, stall_timeout())
 }
 
@@ -1650,8 +1668,8 @@ fun review_worker(orch, run_id, issue_id, ws, repo, base, title, body, vcmd) {
     evidence = "O ran the project's verify command on this branch and it PASSED:\n$ " ++ vcmd ++ "\n" ++ tail_n(f"{ws}/verify.log", 1500)
     _w = file_write(f"{ws}/REVIEW.txt", build_review_prompt(title, body, diff, evidence))
     bin = claude_bin()
-    model = getenv("O_REVIEW_MODEL")
-    mflag = if (model == nil) { "" } else { f" --model {sq(model)}" }
+    model = str_or(getenv("O_REVIEW_MODEL"), "sonnet")
+    mflag = if (string_length(model) == 0) { "" } else { f" --model {sq(model)}" }
     cmd = f"cd {ws} && cat REVIEW.txt | {agent_env()} {sandbox_prefix(ws, repo)}{bin} -p{mflag} --max-turns 10 --allowedTools Read,Grep,Glob --output-format json > review.json 2> review.err"
     r = shell_managed(cmd, stall_timeout())
     cost = run_cost(elem(r, 0), parse_cost(f"{ws}/review.json"))

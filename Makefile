@@ -14,7 +14,7 @@ SOURCES := $(wildcard $(SRC_DIR)/*.sw)
 PREFIX  ?= $(HOME)/.local
 DATADIR := $(HOME)/.o
 
-.PHONY: all clean run install seed dev stop-dev logs check
+.PHONY: all clean run install seed dev stop-dev logs check check-fast
 
 all: $(BIN)
 
@@ -22,6 +22,11 @@ all: $(BIN)
 # port + temp DB, and drives the REST pipeline end to end.
 check: $(BIN)
 	@./scripts/check.sh
+
+# About a minute: build + the held-out invariant suite (API, dispatch, verify
+# gate, protected paths). Run it before every push; `make check` before merge.
+check-fast: $(BIN)
+	@O_TICK_MS=$${O_TICK_MS:-500} O_BACKOFF_MS=$${O_BACKOFF_MS:-300} ./tests/heldout/core.sh
 
 $(BIN): $(SOURCES)
 	@test -x "$(SWC)" || { \

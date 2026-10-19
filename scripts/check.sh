@@ -12,6 +12,10 @@
 # failing assert can never leak a running daemon.
 set -euo pipefail
 
+# Fast clock for every daemon this suite boots (and the held-out suite):
+# half-second ticks and retry backoff instead of the 5s/2s production values.
+export O_TICK_MS="${O_TICK_MS:-500}" O_BACKOFF_MS="${O_BACKOFF_MS:-300}"
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
@@ -1397,12 +1401,13 @@ if git config core.fsmonitor "touch /tmp/pwned" 2>/dev/null; then p="$p config:W
 n="$(cat /proc/*/environ 2>/dev/null | tr '\0' '\n' | grep -c '^O_API_TOKEN=')"
 p="$p token_procs:$n"
 echo "$p" > probes.txt
+echo "$*" > "$SBX_ARGS"
 git add probes.txt && git commit -q -m "sandbox probes"
 printf '%s\n' '{"type":"result","total_cost_usd":0.01,"session_id":"sbx-1"}'
 STUB
 chmod +x "$TMP5/agent-stub"
 HOME="$TMP5" O_DB="$TMP5/.o/o.db" O_PORT="$PORT5" O_NO_OPEN=1 O_SANDBOX=bwrap O_API_TOKEN="$TOK" \
-  O_CLAUDE_BIN="$TMP5/agent-stub" SBX_REPO="$SCRATCHS" ./bin/swarmd >"$TMP5/daemon.log" 2>&1 &
+  O_CLAUDE_BIN="$TMP5/agent-stub" SBX_REPO="$SCRATCHS" SBX_ARGS="$TMP5/agent-args" ./bin/swarmd >"$TMP5/daemon.log" 2>&1 &
 DAEMON5_PID=$!
 up5=""
 for _i in $(seq 1 30); do
@@ -1429,6 +1434,8 @@ probes="$(git -C "$SCRATCHS" show main:probes.txt)"
   || fail "sandbox: unexpected probe results: '$probes'"
 [ "$(cat "$SCRATCHS/README.md")" = "sandbox project" ] || fail "sandbox: main checkout was modified"
 pass "sandbox: repo/hooks/config not writable, ~/.o hidden, token not visible in /proc; worktree commit merged"
+grep -- "--model haiku " "$TMP5/agent-args" >/dev/null || { cat "$TMP5/agent-args"; fail "model ladder: attempt 1 should run on haiku"; }
+pass "model ladder: a builder's first attempt runs on haiku"
 else
   echo "SKIP: agent sandbox stage (unprivileged bwrap unavailable here)"
 fi
