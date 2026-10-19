@@ -25,6 +25,8 @@ DAEMON4_PID=""
 TMP4=""
 DAEMON5_PID=""
 TMP5=""
+DAEMON6_PID=""
+TMP6=""
 
 cleanup() {
   if [ -n "$DAEMON_PID" ]; then
@@ -55,6 +57,13 @@ cleanup() {
   fi
   if [ -n "$TMP5" ]; then
     rm -rf "$TMP5" 2>/dev/null || true
+  fi
+  if [ -n "$DAEMON6_PID" ]; then
+    kill "$DAEMON6_PID" 2>/dev/null || true
+    wait "$DAEMON6_PID" 2>/dev/null || true
+  fi
+  if [ -n "$TMP6" ]; then
+    rm -rf "$TMP6" 2>/dev/null || true
   fi
   if [ -n "$TMP4" ]; then
     rm -rf "$TMP4" 2>/dev/null || true
@@ -1027,6 +1036,9 @@ case "$in" in
       *"[gate:nobash]"*) ;;
       *) printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"make test"}}]}}' ;;
     esac
+    # An interim result first, as the CLI emits when commands are still running
+    # in the background: O must read the LAST result event, not this one.
+    printf '{"type":"result","result":"The suite is still running in the background.","total_cost_usd":0.01,"session_id":"%s"}\n' "$sid"
     printf '{"type":"result","result":"Reviewed in context.\\n%s","total_cost_usd":0.02,"session_id":"%s"}\n' "$v" "$sid"
     exit 0 ;;
 esac
@@ -1418,6 +1430,148 @@ pass "sandbox: repo/hooks/config not writable, ~/.o hidden, token not visible in
 else
   echo "SKIP: agent sandbox stage (unprivileged bwrap unavailable here)"
 fi
+
+# ============================================================
+# Persona pass — 6th daemon, O_PERSONAS=1 + judge, stub personas
+# ============================================================
+# The stub plays each persona by the marker in its goal (STUB:<what>), plays
+# the judge (NOISE for a report titled "noise: ..."), and on a confirm run
+# answers RESULT: FIXED unless the scenario title says "still". Unsandboxed by
+# explicit opt-in so the stage runs where bwrap doesn't.
+TMP6="$(mktemp -d)"
+PORT6=$((5950 + RANDOM % 200))
+BASE6="http://127.0.0.1:${PORT6}"
+cat > "$TMP6/claude-stub" <<'STUB'
+#!/usr/bin/env bash
+prompt="$(cat)"
+result() { printf '{"type":"result","total_cost_usd":0.03,"session_id":"p","result":"%s"}\n' "$1"; }
+if printf '%s' "$prompt" | grep -q 'REAL or NOISE'; then
+  if printf '%s' "$prompt" | grep -q '"title":"noise:'; then result "NOISE: sandbox artifact"; else result "REAL: reproducible"; fi
+  exit 0
+fi
+url="$(printf '%s' "$prompt" | grep -oE 'http://127[^ ]*/persona_reports' | head -n1)"
+rid="$(printf '%s' "$prompt" | grep -oE '"run_id":"[^"]*"' | head -n1 | sed 's/.*:"//; s/"$//')"
+[ -d .git ] && echo "git:yes" >> "$PSTUB_LOG" || echo "git:no $(pwd)" >> "$PSTUB_LOG"
+post() { curl -s -o /dev/null -w '%{http_code}' --max-time 10 -X POST "$url" -H 'Content-Type: application/json' -d "$1"; }
+rep() { printf '{"run_id":"%s","severity":"%s","title":"%s","doc_section":"README.md > Five minutes","steps":"1. make\\n2. ./run","expected":"it runs","actual":"%s","env":"linux"}' "$rid" "$1" "$2" "$3"; }
+if printf '%s' "$prompt" | grep -q 'RESULT: FIXED'; then
+  if printf '%s' "$prompt" | grep -A1 'you hit this problem' | grep still >/dev/null; then
+    post "$(rep blocked 'docs still wrong' 'error: still broken')" >/dev/null; result "RESULT: STILL_BROKEN"
+  else
+    result "it works now. RESULT: FIXED"
+  fi
+  exit 0
+fi
+case "$prompt" in
+  *STUB:blocked2*) post "$(rep blocked 'make fails on step 2' 'error: cannot open /var/b/99.txt (code 7)')" >/dev/null ;;
+  *STUB:blocked*)  post "$(rep blocked 'make fails' 'error: cannot open /tmp/a/1.txt (code 2)\nmore')" >/dev/null ;;
+  *STUB:norepro*)  echo "norepro:$(post "{\"run_id\":\"$rid\",\"severity\":\"blocked\",\"title\":\"vague\",\"steps\":\"1. stuff\"}")" >> "$PSTUB_LOG" ;;
+  *STUB:friction*) post "$(rep friction 'install section is confusing' 'had to guess the flag')" >/dev/null ;;
+  *STUB:noise*)    post "$(rep blocked 'noise: network down' 'curl: could not resolve host')" >/dev/null ;;
+  *STUB:wrong*)    post "$(rep wrong 'docs still wrong about --fast' 'unknown flag --fast')" >/dev/null ;;
+esac
+result "OUTCOME: DONE"
+STUB
+chmod +x "$TMP6/claude-stub"
+SCRATCHP="$TMP6/projp"
+mkdir -p "$SCRATCHP"
+git -C "$SCRATCHP" init -q -b main
+git -C "$SCRATCHP" config user.email "o@example.com"; git -C "$SCRATCHP" config user.name "O Test"
+echo "# persona project" > "$SCRATCHP/README.md"
+git -C "$SCRATCHP" add -A; git -C "$SCRATCHP" commit -q -m "seed persona project"
+HOME="$TMP6" O_DB="$TMP6/o.db" O_PORT="$PORT6" O_NO_OPEN=1 O_PERSONAS=1 O_PERSONAS_UNSANDBOXED=1 O_PERSONA_JUDGE=1 \
+  O_SELF_FILE_CAP=20 O_CLAUDE_BIN="$TMP6/claude-stub" PSTUB_LOG="$TMP6/stub.log" ./bin/swarmd >"$TMP6/daemon.log" 2>&1 &
+DAEMON6_PID=$!
+up6=""
+for _i in $(seq 1 30); do
+  code="$(ocurl -s -o /dev/null -w '%{http_code}' "$BASE6/api/health" 2>/dev/null || true)"
+  if [ "$code" = "200" ]; then up6="1"; break; fi
+  sleep 0.5
+done
+[ -n "$up6" ] || { cat "$TMP6/daemon.log" || true; fail "persona daemon never came up"; }
+mkco6() {
+  jget "$(ocurl -s -X POST "$BASE6/api/companies" -H 'Content-Type: application/json' \
+    -d "{\"name\":\"$1\",\"issue_prefix\":\"$2\",\"budget_monthly_cents\":1000000,\"repo\":\"$SCRATCHP\"}")" 'd["id"]'
+}
+TODAY6="(strftime('%s','now')*1000/86400000)"
+CIDP="$(mkco6 'Persona Co' 'PER')"; [ -n "$CIDP" ] || fail "persona company create failed"
+CIDB="$(mkco6 'Broke Co' 'BRK')"
+# Hold both passes until the personas exist.
+sqlite3 "$TMP6/o.db" "UPDATE company SET last_persona_day=$TODAY6 WHERE id IN ('$CIDP','$CIDB')"
+for who in blocked blocked2 norepro friction noise wrong; do
+  sc="$(ocurl -s -o /dev/null -w '%{http_code}' -X POST "$BASE6/api/companies/$CIDP/personas" -H 'Content-Type: application/json' \
+    -d "{\"name\":\"$who\",\"role\":\"tester\",\"goal\":\"STUB:$who\",\"done_when\":\"it runs\"}")"
+  [ "$sc" = "201" ] || fail "persona create ($who) expected 201, got $sc"
+done
+ocurl -s -X POST "$BASE6/api/companies/$CIDB/personas" -H 'Content-Type: application/json' -d '{"name":"broke","goal":"STUB:blocked"}' >/dev/null
+np="$(jget "$(ocurl -s "$BASE6/api/companies/$CIDP/personas")" 'len(d)')"
+[ "$np" = "6" ] || fail "personas: GET expected 6, got $np"
+ocurl -s -X POST "$BASE6/api/companies/$CIDP" -H 'Content-Type: application/json' -d '{"personas_per_day":6}' >/dev/null
+sqlite3 "$TMP6/o.db" "UPDATE company SET persona_daily_cents=0 WHERE id='$CIDB'"
+sqlite3 "$TMP6/o.db" "UPDATE company SET last_persona_day=0 WHERE id IN ('$CIDP','$CIDB')"
+# A report for a run that doesn't exist is refused.
+sc="$(ocurl -s -o /dev/null -w '%{http_code}' -X POST "$BASE6/api/companies/$CIDP/persona_reports" -H 'Content-Type: application/json' \
+  -d '{"run_id":"nope","severity":"blocked","title":"x","steps":"1","actual":"y"}')"
+[ "$sc" = "400" ] || fail "persona report with unknown run_id expected 400, got $sc"
+done6=""
+for _i in $(seq 1 60); do
+  n="$(sqlite3 "$TMP6/o.db" "SELECT COUNT(*) FROM persona_run WHERE company_id='$CIDP' AND ended_at > 0")"
+  [ "${n:-0}" = "6" ] && { done6="1"; break; }
+  sleep 1
+done
+[ -n "$done6" ] || { tail -30 "$TMP6/daemon.log"; sqlite3 "$TMP6/o.db" "SELECT * FROM persona_run"; fail "persona pass: 6 runs never finished"; }
+sleep 1
+q6() { sqlite3 "$TMP6/o.db" "$1"; }
+[ "$(q6 "SELECT COUNT(*) FROM issue WHERE company_id='$CIDP' AND origin='persona' AND priority='high'")" = "1" ] \
+  || { q6 "SELECT title, fingerprint FROM issue"; fail "persona: blocked x2 (same error, different paths/numbers) should file exactly one high issue"; }
+q6 "SELECT COUNT(*) FROM activity WHERE company_id='$CIDP' AND verb='selffile.duped'" | grep -x 1 >/dev/null || fail "persona: second blocked report not logged selffile.duped"
+q6 "SELECT body FROM issue WHERE company_id='$CIDP' AND priority='high'" | grep 'Also hit by persona' >/dev/null || fail "persona: dup not noted on the open issue"
+[ "$(q6 "SELECT persona_id != '' AND verify_scenario_after_fix = 1 FROM issue WHERE company_id='$CIDP' AND priority='high'")" = "1" ] || fail "persona: issue not linked to its persona"
+pass "persona: blocked -> one high issue, same error elsewhere dedupes (selffile.duped)"
+grep -qx 'norepro:400' "$TMP6/stub.log" || { cat "$TMP6/stub.log"; fail "persona: report without actual should be 400"; }
+pass "persona: a report without a verbatim repro is refused (400)"
+[ "$(q6 "SELECT COUNT(*) FROM issue WHERE company_id='$CIDP' AND fingerprint LIKE 'persona-digest:%' AND priority='low'")" = "1" ] || fail "persona: friction did not land in a digest issue"
+q6 "SELECT body FROM issue WHERE fingerprint LIKE 'persona-digest:%'" | grep 'install section is confusing' >/dev/null || fail "persona: digest missing the friction entry"
+pass "persona: friction goes to the weekly digest issue"
+q6 "SELECT COUNT(*) FROM activity WHERE verb='persona.discarded'" | grep -x 1 >/dev/null || fail "persona: judge NOISE not logged persona.discarded"
+[ "$(q6 "SELECT COUNT(*) FROM issue WHERE title LIKE 'noise:%'")" = "0" ] || fail "persona: a NOISE report was filed"
+pass "persona: judge drops NOISE (persona.discarded)"
+[ "$(q6 "SELECT priority FROM issue WHERE company_id='$CIDP' AND title='docs still wrong about --fast'")" = "medium" ] || fail "persona: wrong -> medium issue"
+sp6="$(q6 "SELECT persona_spent_today, spent_today_cents FROM company WHERE id='$CIDP'")"
+[ "$sp6" != "0|0" ] && [ "${sp6#*|}" = "0" ] || fail "persona: spend should land on the persona budget only (got $sp6)"
+pass "persona: wrong -> medium; spend on the separate persona budget ($sp6)"
+q6 "SELECT COUNT(*) FROM activity WHERE company_id='$CIDB' AND verb='persona.budget_stop'" | grep -x 1 >/dev/null || fail "persona: over-budget company not stopped"
+[ "$(q6 "SELECT COUNT(*) FROM persona_run WHERE company_id='$CIDB'")" = "0" ] || fail "persona: over-budget company still ran a persona"
+pass "persona: no budget left -> persona.budget_stop, nothing runs"
+! grep -q '^git:yes' "$TMP6/stub.log" || fail "persona: a persona saw a .git directory"
+[ "$(git -C "$SCRATCHP" worktree list | wc -l)" = "1" ] && [ -z "$(git -C "$SCRATCHP" status --porcelain)" ] || fail "persona: source repo not clean"
+[ -z "$(ls "$TMP6/.o/personas"/*/work 2>/dev/null)" ] || fail "persona: work dirs left behind"
+pass "persona: clean export (no .git), no worktree, nothing left behind"
+sleep 6
+[ "$(q6 "SELECT COUNT(*) FROM activity WHERE company_id='$CIDP' AND verb='persona.scenario'")" = "6" ] || fail "persona: pass ran more than once today"
+pass "persona: at most one pass per day"
+# Confirmation: mark both issues Done; the blocked one is fixed, the "still" one isn't.
+IB="$(q6 "SELECT id FROM issue WHERE company_id='$CIDP' AND priority='high' AND origin='persona'")"
+IW="$(q6 "SELECT id FROM issue WHERE company_id='$CIDP' AND title='docs still wrong about --fast'")"
+for i in "$IB" "$IW"; do ocurl -s -X POST "$BASE6/api/issues/$i" -H 'Content-Type: application/json' -d '{"status":"Done"}' >/dev/null; done
+conf=""
+for _i in $(seq 1 40); do
+  a="$(q6 "SELECT COUNT(*) FROM activity WHERE verb='persona.confirmed'")"; b="$(q6 "SELECT COUNT(*) FROM issue WHERE fingerprint='persona-regress:$IW' AND origin='auto'")"
+  [ "$a" = "1" ] && [ "$b" = "1" ] && { conf="1"; break; }
+  sleep 1
+done
+[ -n "$conf" ] || { tail -20 "$TMP6/daemon.log"; q6 "SELECT verb, target FROM activity"; fail "persona confirm: expected persona.confirmed + a persona-regress fix issue"; }
+pass "persona confirm: fixed -> persona.confirmed; still broken -> fix issue filed (origin auto)"
+IF="$(q6 "SELECT id FROM issue WHERE fingerprint='persona-regress:$IW'")"
+ocurl -s -X POST "$BASE6/api/issues/$IF" -H 'Content-Type: application/json' -d '{"status":"Done"}' >/dev/null
+d1=""
+for _i in $(seq 1 40); do
+  q6 "SELECT COUNT(*) FROM activity WHERE verb='selffile.skipped_depth'" | grep -x 1 >/dev/null && { d1="1"; break; }
+  sleep 1
+done
+[ -n "$d1" ] || fail "persona confirm: a failing fix-of-a-fix should stop at depth 1"
+[ "$(q6 "SELECT COUNT(*) FROM issue WHERE origin='auto'")" = "1" ] || fail "persona confirm: depth-1 filed a second fix issue"
+pass "persona confirm: depth-1 stops the chain at one fix issue"
 
 # ============================================================
 # Held-out invariant suite — the frozen core (tests/heldout/core.sh)
