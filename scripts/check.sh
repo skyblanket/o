@@ -595,8 +595,8 @@ for _i in $(seq 1 15); do
 done
 [ -n "$selffile_ok" ] || { cat "$TMP/daemon.log" || true; fail "revert self-file: expected exactly 1 origin=auto high revert:$REG_IDENT issue, got ${nrev:-0}"; }
 sfbody="$(sqlite3 "$TMP/o.db" "SELECT body FROM issue WHERE company_id='$CID4' AND fingerprint='revert:$REG_IDENT'")"
-printf '%s' "$sfbody" | grep -q "o/$IID_REG" || fail "revert self-file: body does not name kept branch o/$IID_REG"
-sqlite3 "$TMP/o.db" "SELECT COUNT(*) FROM activity WHERE verb='selffile.created' AND target='revert:$REG_IDENT'" | grep -q '^1$' \
+printf '%s' "$sfbody" | grep "o/$IID_REG" >/dev/null || fail "revert self-file: body does not name kept branch o/$IID_REG"
+sqlite3 "$TMP/o.db" "SELECT COUNT(*) FROM activity WHERE verb='selffile.created' AND target='revert:$REG_IDENT'" | grep '^1$' >/dev/null \
   || fail "revert self-file: selffile.created not logged for revert:$REG_IDENT"
 pass "self-file: revert auto-filed exactly one origin=auto high issue (revert:$REG_IDENT), branch named, selffile.created logged"
 
@@ -898,7 +898,7 @@ done
 [ -n "$paused2_ok" ] || { cat "$TMP2/daemon.log" || true; fail "no-signal: 2nd rollover expected paused/no-signal (got status=${st:-?} reason=${pr:-?})"; }
 ndiag="$(sqlite3 "$TMP2/o.db" "SELECT COUNT(*) FROM issue WHERE company_id='$CID_L' AND fingerprint='no-signal:$CID_L' AND origin='auto'")"
 [ "$ndiag" = "1" ] || fail "no-signal: expected exactly 1 diagnostic issue no-signal:$CID_L, got $ndiag"
-sqlite3 "$TMP2/o.db" "SELECT COUNT(*) FROM activity WHERE company_id='$CID_L' AND verb='budget.no_signal'" | grep -q '^1$' \
+sqlite3 "$TMP2/o.db" "SELECT COUNT(*) FROM activity WHERE company_id='$CID_L' AND verb='budget.no_signal'" | grep '^1$' >/dev/null \
   || fail "no-signal: budget.no_signal not logged exactly once"
 pass "no-signal: 2nd rollover paused company (pause_reason=no-signal), diagnostic filed, budget.no_signal logged"
 
@@ -1074,8 +1074,8 @@ case "$method $path" in
   "GET repos/acme/widgets/pulls/"*)
     n="${path#repos/acme/widgets/pulls/}"; b="$(cat "$GHS/pr_$n")"
     sha="$(git -C "$GHS/remote.git" rev-parse "refs/heads/$b" 2>/dev/null)"; echo "$b" > "$GHS/sha_$sha"
-    m=false; [ -f "$GHS/merged_$n" ] && m=true
-    echo "{\"number\":$n,\"merged\":$m,\"mergeable_state\":\"clean\",\"head\":{\"sha\":\"$sha\"}}" ;;
+    m=false; st=open; [ -f "$GHS/merged_$n" ] && { m=true; st=closed; }; [ -f "$GHS/closed_$n" ] && st=closed
+    echo "{\"number\":$n,\"state\":\"$st\",\"merged\":$m,\"mergeable_state\":\"clean\",\"head\":{\"sha\":\"$sha\"}}" ;;
   "GET repos/acme/widgets/commits/"*/check-runs*)
     sha="${path#repos/acme/widgets/commits/}"; sha="${sha%%/*}"; b="$(cat "$GHS/sha_$sha" 2>/dev/null)"
     if listed fail_ci "$b"; then c=failure; else c=success; fi
@@ -1122,9 +1122,9 @@ git -C "$SCRATCHV" log --oneline main | grep "o/$IID_APP" >/dev/null || fail "re
 wait_status_at "$BASE4" "$IID_REJ" "Failed" 150 || { cat "$TMP4/daemon.log"; fail "review: rejected change never Failed"; }
 vs="$(sqlite3 "$TMP4/o.db" "SELECT verify_state FROM run WHERE issue_id='$IID_REJ' ORDER BY started_at DESC LIMIT 1")"
 [ "$vs" = "red_review" ] || fail "review: expected red_review, got '$vs'"
-sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_REJ' ORDER BY started_at DESC LIMIT 1" | grep -q "stub reviewer says" \
+sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_REJ' ORDER BY started_at DESC LIMIT 1" | grep "stub reviewer says" >/dev/null \
   || fail "review: rejection reason not recorded for the retry prompt"
-git -C "$SCRATCHV" log --oneline main | grep -q "o/$IID_REJ" && fail "review: rejected change was merged"
+git -C "$SCRATCHV" log --oneline main | grep "o/$IID_REJ" >/dev/null && fail "review: rejected change was merged"
 # (count per target: the verify-final fix issue auto-filed for the rejected one
 # is itself reviewed and may land review.pass rows of its own)
 npass="$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='review.pass' AND target='$IID_APP'")"
@@ -1179,7 +1179,7 @@ done
 [ -n "$IID_GH" ] || { tail -30 "$TMP4/daemon.log"; fail "github: issue #7 never imported"; }
 [ "$(sqlite3 "$TMP4/o.db" "SELECT origin FROM issue WHERE id='$IID_GH'")" = "github" ] || fail "github: imported issue origin != github"
 wait_status_at "$BASE4" "$IID_GH" "Done" 120 || { tail -40 "$TMP4/daemon.log"; fail "github: imported issue never Done"; }
-git -C "$GHS/remote.git" log --oneline main | grep -q "o/$IID_GH" || { git -C "$GHS/remote.git" log --oneline main; fail "github: PR was not merged into the remote main"; }
+git -C "$GHS/remote.git" log --oneline main | grep "o/$IID_GH" >/dev/null || { git -C "$GHS/remote.git" log --oneline main; fail "github: PR was not merged into the remote main"; }
 grep -q "Closes #7" "$GHS/body_o_$IID_GH" || fail "github: PR body lacks 'Closes #7'"
 [ -z "$(git -C "$GHREPO" branch --list "o/$IID_GH")" ] || fail "github: local branch not cleaned up after merge"
 sleep 4  # more polls: #7 is still "open" on the stub and must not be re-imported
@@ -1189,9 +1189,9 @@ pass "github: #7 imported once, shipped as a PR (Closes #7), merged on green che
 wait_status_at "$BASE4" "$IID_CIF" "Failed" 150 || { tail -40 "$TMP4/daemon.log"; fail "github: red-CI issue never Failed"; }
 vs="$(sqlite3 "$TMP4/o.db" "SELECT verify_state FROM run WHERE issue_id='$IID_CIF' ORDER BY started_at DESC LIMIT 1")"
 [ "$vs" = "red_ci" ] || fail "github: expected red_ci, got '$vs'"
-sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_CIF' ORDER BY started_at DESC LIMIT 1" | grep -q "build" \
+sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_CIF' ORDER BY started_at DESC LIMIT 1" | grep "build" >/dev/null \
   || fail "github: failing check name not passed to the retry prompt"
-git -C "$GHS/remote.git" log --oneline main | grep -q "o/$IID_CIF" && fail "github: red-CI PR was merged"
+git -C "$GHS/remote.git" log --oneline main | grep "o/$IID_CIF" >/dev/null && fail "github: red-CI PR was merged"
 pass "github: failing checks -> red_ci x3 -> Failed (check names in the retry tail), never merged"
 wait_status_at "$BASE4" "$IID_BLK" "In Review" 90 || { tail -40 "$TMP4/daemon.log"; fail "github: merge-refused issue never parked In Review"; }
 sleep 6
@@ -1209,7 +1209,7 @@ for _i in $(seq 1 30); do
 done
 IID_PRO="$(jget "$(ocurl -s -X POST "$BASE4/api/companies/$CIDG/issues" -H 'Content-Type: application/json' -d '{"title":"[sim:good] pr-only"}')" 'd["id"]')"
 wait_status_at "$BASE4" "$IID_PRO" "In Review" 90 || { tail -30 "$TMP4/daemon.log"; fail "pr-only: green PR never parked In Review"; }
-git -C "$GHS/remote.git" log --oneline main | grep -q "o/$IID_PRO" && fail "pr-only: PR was merged with O_PR_AUTOMERGE=0"
+git -C "$GHS/remote.git" log --oneline main | grep "o/$IID_PRO" >/dev/null && fail "pr-only: PR was merged with O_PR_AUTOMERGE=0"
 pass "pr-only: O_PR_AUTOMERGE=0 leaves a green PR open, issue In Review, nothing merged"
 
 # ---- merge gate: persistent maintainer (O_MERGE_GATE=1) ----------------
@@ -1236,7 +1236,7 @@ IID_GX="$(gh_issue '[sim:good] [gate:changes] needs work')"
 IID_GE="$(gh_issue '[sim:good] [gate:escalate] api change')"
 IID_GS="$(gh_issue '[sim:good] [gate:silent] mute reviewer')"
 wait_status_at "$BASE4" "$IID_GM" "Done" 120 || { tail -40 "$TMP4/daemon.log"; fail "gate: MERGE verdict never Done"; }
-git -C "$GHS/remote.git" log --oneline main | grep -q "o/$IID_GM" || {
+git -C "$GHS/remote.git" log --oneline main | grep "o/$IID_GM" >/dev/null || {
   echo "--- remote main:"; git -C "$GHS/remote.git" log --oneline main | head -20
   echo "--- PR map:"; for f in "$GHS"/pr_*; do echo "$(basename "$f") $(cat "$f")"; done; ls "$GHS" | grep merged_
   echo "--- activity for $IID_GM:"; sqlite3 "$TMP4/o.db" "SELECT verb FROM activity WHERE target='$IID_GM' ORDER BY ts"
@@ -1247,8 +1247,8 @@ wait_status_at "$BASE4" "$IID_GE" "In Review" 120 || { tail -40 "$TMP4/daemon.lo
 wait_status_at "$BASE4" "$IID_GS" "In Review" 120 || fail "gate: missing VERDICT did not fail closed to In Review"
 wait_status_at "$BASE4" "$IID_GX" "Failed" 180 || { tail -40 "$TMP4/daemon.log"; fail "gate: CHANGES x3 never Failed"; }
 [ "$(sqlite3 "$TMP4/o.db" "SELECT verify_state FROM run WHERE issue_id='$IID_GX' ORDER BY started_at DESC LIMIT 1")" = "red_merge_gate" ] || fail "gate: CHANGES not recorded as red_merge_gate"
-sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_GX' ORDER BY started_at DESC LIMIT 1" | grep -q "regression test" || fail "gate: maintainer findings not passed to the retry"
-for i in "$IID_GE" "$IID_GX"; do git -C "$GHS/remote.git" log --oneline main | grep -q "o/$i" && fail "gate: $i was merged without a MERGE verdict"; done
+sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_GX' ORDER BY started_at DESC LIMIT 1" | grep "regression test" >/dev/null || fail "gate: maintainer findings not passed to the retry"
+for i in "$IID_GE" "$IID_GX"; do git -C "$GHS/remote.git" log --oneline main | grep "o/$i" >/dev/null && fail "gate: $i was merged without a MERGE verdict"; done
 nfresh="$(grep -c '^fresh' "$GHS/gate_calls")"; nres="$(grep -c '^resume' "$GHS/gate_calls")"
 [ "$nres" -ge 2 ] || fail "gate: maintainer session never resumed (fresh=$nfresh resume=$nres)"
 [ "$nfresh" -ge 2 ] || fail "gate: maintainer session never rotated with O_MAINTAINER_ROTATE=3 (fresh=$nfresh resume=$nres)"
@@ -1256,10 +1256,30 @@ while read -r kind sid; do
   [ "$kind" = "resume" ] && ! grep -qx "fresh $sid" "$GHS/gate_calls" && fail "gate: resumed unknown session $sid"
 done < "$GHS/gate_calls"
 pass "gate: MERGE merged, CHANGES -> red_merge_gate -> Failed, ESCALATE/no-verdict -> In Review; reviews posted; session resumed ($nres) and rotated ($nfresh)"
+
+# ---- In Review poller --------------------------------------------------
+# With the gate now on, the PR that PR-only mode parked earlier is adopted and
+# merged by the maintainer. A merge GitHub refused is never re-adopted, but
+# when a human merges it O marks it Done. An escalated PR a human closes
+# becomes Canceled.
+wait_status_at "$BASE4" "$IID_PRO" "Done" 90 || { tail -30 "$TMP4/daemon.log"; fail "poller: PR-only parked PR was not adopted by the gate"; }
+git -C "$GHS/remote.git" log --oneline main | grep "o/$IID_PRO" >/dev/null || fail "poller: adopted PR not merged"
+[ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='pr.adopted' AND target='$IID_PRO'")" = "1" ] || fail "poller: pr.adopted not logged once"
+[ "$(sqlite3 "$TMP4/o.db" "SELECT status FROM issue WHERE id='$IID_BLK'")" = "In Review" ] || fail "poller: a refused merge left In Review"
+[ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='pr.adopted' AND target IN ('$IID_BLK','$IID_GE','$IID_GS')")" = "0" ] || fail "poller: re-adopted a PR that must wait for a human"
+nblk="$(pr_of "$IID_BLK")"
+tmpm="$(mktemp -d)"; git clone -q "$GHS/remote.git" "$tmpm/c"
+git -C "$tmpm/c" -c user.email=h@x -c user.name=human merge -q --no-ff --no-edit "origin/o/$IID_BLK" && git -C "$tmpm/c" push -q origin main
+touch "$GHS/merged_$nblk"
+wait_status_at "$BASE4" "$IID_BLK" "Done" 30 || fail "poller: a human merge was not picked up as Done"
+[ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='pr.merged' AND target='$IID_BLK'")" = "1" ] || fail "poller: pr.merged not logged"
+touch "$GHS/closed_$(pr_of "$IID_GE")"
+wait_status_at "$BASE4" "$IID_GE" "Canceled" 30 || fail "poller: a closed PR was not Canceled"
+pass "poller: PR-only PR adopted + merged by the gate; refused/escalated never re-adopted; human merge -> Done; closed -> Canceled"
 restart_d4 O_MERGE_GATE=1 O_ESCALATE_PATHS=sim_
 IID_GF="$(gh_issue '[sim:good] maintainer says merge but path is fenced')"
 wait_status_at "$BASE4" "$IID_GF" "In Review" 120 || fail "gate: O_ESCALATE_PATHS did not force escalation"
-sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_GF' ORDER BY started_at DESC LIMIT 1" | grep -q "O_ESCALATE_PATHS" || fail "gate: forced escalation reason not recorded"
+sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_GF' ORDER BY started_at DESC LIMIT 1" | grep "O_ESCALATE_PATHS" >/dev/null || fail "gate: forced escalation reason not recorded"
 pass "gate: O_ESCALATE_PATHS overrides a MERGE verdict -> In Review"
 
 # ============================================================

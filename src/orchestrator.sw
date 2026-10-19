@@ -377,6 +377,9 @@ fun tick_loop(db, dbpath, port, tick_n, running, retry) {
         {'ci_done', run_id, issue_id, outcome, sha, tail} ->
             r = handle_ci_done(db, running, retry, run_id, issue_id, outcome, sha, tail)
             tick_loop(db, dbpath, port, tick_n, map_get(r, "running"), map_get(r, "retry"))
+        {'pr_state', issue_id, state, num} ->
+            r = handle_pr_state(db, running, retry, issue_id, state, num)
+            tick_loop(db, dbpath, port, tick_n, map_get(r, "running"), map_get(r, "retry"))
         {'gh_issues', company_id, items} ->
             _im = import_gh_issues(db, company_id, items)
             tick_loop(db, dbpath, port, tick_n, running, retry)
@@ -1660,7 +1663,8 @@ fun gh_label() {
 fun maybe_gh_poll(db, tick_n) {
     poll_ms = env_int("O_GH_POLL_S", 60) * 1000
     if ((tick_n * tick_interval()) % poll_ms < tick_interval()) {
-        gh_poll_each(Store.companies_with_github(db))
+        _i = gh_poll_each(Store.companies_with_github(db))
+        review_poll_each(db, Store.issues_in_review(db))
     } else {
         ""
     }
@@ -2075,6 +2079,90 @@ fun handle_gate_done(db, running, retry, run_id, issue_id, verdict, text, sessio
                 handle_ci_done(db, running, retry, run_id, issue_id, "in_review", "", verdict)
             }
         }
+    }
+}
+
+# ---- In Review poller (PR mode) ------------------------------------
+# An issue parks In Review when its PR is green but nobody merged it yet:
+# PR-only mode (O_PR_AUTOMERGE=0), GitHub refused the merge, or the merge
+# gate escalated. On every GitHub poll, O looks at each such PR:
+#   merged by a human  -> Done (pr.merged), like any merged change
+#   closed unmerged    -> Canceled (pr.closed)
+#   still open, parked by PR-only mode, and the merge gate is now on
+#                      -> adopted: handed to the maintainer (pr.adopted)
+# Gate escalations and refused merges are never re-adopted: they wait for a
+# human, and the poller only notices when that human merges or closes.
+fun review_poll_each(db, rows) {
+    if (length(rows) == 0) {
+        ""
+    } else {
+        r = hd(rows)
+        iid = map_get(r, "id")
+        last = Store.last_run_for_issue(db, iid)
+        parked = if (last == nil) { "" } else { str_or(map_get(last, "verify_output"), "") }
+        adoptable = if (merge_gate_enabled() == 'true' && string_starts_with(parked, "CI green on PR") == 'true') { 'true' } else { 'false' }
+        _s = spawn(review_poll_worker(self(), iid, map_get(r, "github_repo"), adoptable))
+        review_poll_each(db, tl(rows))
+    }
+}
+
+fun review_poll_worker(orch, issue_id, gh_repo, adoptable) {
+    owner = hd(string_split(gh_repo, "/"))
+    prs = gh_json(sq(f"repos/{gh_repo}/pulls?head={owner}:o/{issue_id}&state=all"))
+    num = if (prs == nil) { nil } else { if (length(prs) == 0) { nil } else { map_get(hd(prs), "number") } }
+    pr = if (num == nil) { nil } else { gh_json(f"repos/{gh_repo}/pulls/{num}") }
+    if (pr == nil) {
+        ""
+    } else {
+        if (map_get(pr, "merged") == 'true') {
+            send(orch, {'pr_state', issue_id, "merged", num})
+        } else { if (str_or(map_get(pr, "state"), "") == "closed") {
+            send(orch, {'pr_state', issue_id, "closed", num})
+        } else { if (adoptable == 'true') {
+            send(orch, {'pr_state', issue_id, "adopt", num})
+        } else {
+            ""
+        }}}
+    }
+}
+
+fun handle_pr_state(db, running, retry, issue_id, state, num) {
+    issue = Store.issue_row(db, issue_id)
+    still = if (issue == nil) { 'false' } else { if (str_or(map_get(issue, "status"), "") == "In Review") { 'true' } else { 'false' } }
+    if (still == 'false' || map_has_key(running, issue_id) == 'true') {
+        %{running: running, retry: retry}
+    } else {
+        company_id = map_get(issue, "company_id")
+        company = Store.company_row(db, company_id)
+        repo = str_or(map_get(company, "repo"), "")
+        last = Store.last_run_for_issue(db, issue_id)
+        run_id = if (last == nil) { "" } else { map_get(last, "id") }
+        home = getenv("HOME")
+        ws = f"{home}/.o/workspaces/{issue_id}"
+        if (state == "merged") {
+            _w = shell(f"git -C {sq(repo)} worktree remove {ws} --force")
+            _b = shell(f"git -C {sq(repo)} branch -D o/{issue_id}")
+            _r = if (string_length(run_id) > 0) { Store.run_set_state(db, run_id, "Succeeded") } else { "" }
+            _i = Store.issue_set_status(db, issue_id, "Done")
+            _g = Store.company_mark_green(db, company_id)
+            _a = Store.log_activity(db, company_id, "github", "pr.merged", issue_id)
+            %{running: running, retry: retry}
+        } else { if (state == "closed") {
+            _w = shell(f"git -C {sq(repo)} worktree remove {ws} --force")
+            _i = Store.issue_set_status(db, issue_id, "Canceled")
+            _a = Store.log_activity(db, company_id, "github", "pr.closed", issue_id)
+            %{running: running, retry: retry}
+        } else {
+            # adopt: back into the running map in the gate phase, then to the
+            # maintainer exactly as if CI had just gone green.
+            now = timestamp()
+            _i = Store.issue_set_status(db, issue_id, "Verifying")
+            _r = Store.run_set_state(db, run_id, "Verifying")
+            _a = Store.log_activity(db, company_id, "orchestrator", "pr.adopted", issue_id)
+            attempt = if (last == nil) { 1 } else { map_get(last, "attempt") }
+            info = %{run_id: run_id, worker_pid: nil, started_at: now, attempt: attempt, company_id: company_id, agent_id: map_get(issue, "assignee_agent_id"), phase: 'ci', workspace: ws}
+            handle_ci_green(db, map_put(running, issue_id, info), retry, run_id, issue_id, num)
+        }}
     }
 }
 
