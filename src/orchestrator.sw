@@ -825,21 +825,28 @@ fun parse_session(path) {
 # so the UI can show live activity. The final {type:"result"} event
 # carries cost/session/summary. These helpers walk the file after
 # the run completes and pull what we need.
-
+#
+# The LAST result event wins: when a run leaves background commands going,
+# the CLI emits an interim result ("still running…"), keeps the session alive
+# until they finish, and emits the real one after. Cost is cumulative too.
 fun find_result_event(lines) {
+    find_result_event_rev(Std.reverse([l for l in lines when string_contains(l, "\"result\"") == 'true']))
+}
+
+fun find_result_event_rev(lines) {
     if (length(lines) == 0) {
         %{}
     } else {
         line = hd(lines)
         if (string_length(line) == 0) {
-            find_result_event(tl(lines))
+            find_result_event_rev(tl(lines))
         } else {
             data = json_decode(line)
             if (data == nil) {
-                find_result_event(tl(lines))
+                find_result_event_rev(tl(lines))
             } else {
                 if (map_get(data, "type") == "result") { data }
-                else { find_result_event(tl(lines)) }
+                else { find_result_event_rev(tl(lines)) }
             }
         }
     }
@@ -2215,7 +2222,7 @@ fun gate_pr_message(job, cfg, rv, numstat, hist, diff, tier, evidence) {
 
 # The reviewer rubric (from the swarmrt reviewer brief, generalised).
 fun gate_rubric() {
-    "### Verdict\nEnd with exactly one line:\n- `VERDICT: APPROVE` means you built the change, ran the tests and the checks below, and found nothing blocking.\n- `VERDICT: REJECT: <findings>` means you found a blocking problem. List each one with a file:line and the input or sequence that triggers it.\n- `VERDICT: UNVERIFIED: <what you could not run>` means you could not build or run the change. Never answer APPROVE for a change you have not executed.\n\n### Required steps (report the result of each)\n1. **Build** with the repo's build command. A new warning in a file the diff touches is blocking.\n2. **Run the new and changed tests** in the checkout.\n3. **Prove each new test can fail.** O ran it without the change (above); also break the change on purpose and confirm the test fails. Look for checks that fall back to a default \"pass\" when a tool, file or platform feature is missing (/proc on macOS, a missing binary, an empty grep).\n4. **Run the suite the change could break,** including the tier's extra commands.\n5. **Probe beyond the issue's acceptance list.** Write and run at least two cases it does not mention, for the risks below that apply.\n\n### Risks to probe, by kind of change\n- **Language / parser:** run every example interpreted and compiled and diff the output; nesting, lambdas, comprehensions, deep tail recursion, every error path.\n- **Subprocess / fork / exec:** what happens to the child when the calling process is killed or times out (it must not be orphaned); only async-signal-safe calls between fork() and exec in a threaded program (open, dup2, close, chdir, setpgid, execve, _exit; malloc, setenv/unsetenv, stdio and locks are blocking bugs); every pipe and fd close-on-exec; several calls concurrently next to a slow one.\n- **Scheduler / runtime / IO / HTTP:** race windows (state read in two steps, a slot reused while in use, a wakeup lost between check and park); run the relevant test 20+ times under CPU load.\n- **Any change:** silent failures (success reported when a write failed), resource leaks on error paths, Linux vs macOS differences.\n\n### Also check\n- The diff does only what the issue asks: no unrelated edits, and no weakened, skipped or deleted tests.\n- Docs and examples match real behaviour: run doc examples whose output is shown.\n\nKeep the review short: findings first, ranked by severity, each with evidence (the command you ran and what it printed). Update NOTES.md. Then the verdict line."
+    "### Verdict\nEnd with exactly one line:\n- `VERDICT: APPROVE` means you built the change, ran the tests and the checks below, and found nothing blocking.\n- `VERDICT: REJECT: <findings>` means you found a blocking problem. List each one with a file:line and the input or sequence that triggers it.\n- `VERDICT: UNVERIFIED: <what you could not run>` means you could not build or run the change. Never answer APPROVE for a change you have not executed.\n\n### Required steps (report the result of each)\n1. **Build** with the repo's build command. A new warning in a file the diff touches is blocking.\n2. **Run the new and changed tests** in the checkout.\n3. **Prove each new test can fail.** O ran it without the change (above); also break the change on purpose and confirm the test fails. Look for checks that fall back to a default \"pass\" when a tool, file or platform feature is missing (/proc on macOS, a missing binary, an empty grep).\n4. **Run the suite the change could break,** including the tier's extra commands.\n5. **Probe beyond the issue's acceptance list.** Write and run at least two cases it does not mention, for the risks below that apply.\n\n### Risks to probe, by kind of change\n- **Language / parser:** run every example interpreted and compiled and diff the output; nesting, lambdas, comprehensions, deep tail recursion, every error path.\n- **Subprocess / fork / exec:** what happens to the child when the calling process is killed or times out (it must not be orphaned); only async-signal-safe calls between fork() and exec in a threaded program (open, dup2, close, chdir, setpgid, execve, _exit; malloc, setenv/unsetenv, stdio and locks are blocking bugs); every pipe and fd close-on-exec; several calls concurrently next to a slow one.\n- **Scheduler / runtime / IO / HTTP:** race windows (state read in two steps, a slot reused while in use, a wakeup lost between check and park); run the relevant test 20+ times under CPU load.\n- **Any change:** silent failures (success reported when a write failed), resource leaks on error paths, Linux vs macOS differences.\n\n### Also check\n- The diff does only what the issue asks: no unrelated edits, and no weakened, skipped or deleted tests.\n- Docs and examples match real behaviour: run doc examples whose output is shown.\n\nRun every command in the foreground and wait for it (give long ones a generous timeout); never start one in the background, because your verdict is read the moment you stop. Keep the review short: findings first, ranked by severity, each with evidence (the command you ran and what it printed). Update NOTES.md. Then the verdict line."
 }
 
 # The last "VERDICT:" line wins: APPROVE | REJECT: .. | UNVERIFIED: .. ("" if none).
