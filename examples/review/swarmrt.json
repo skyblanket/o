@@ -1,0 +1,16 @@
+{
+  "build": "make swc libswarmrt",
+  "suite": "make test-sw",
+  "test_runners": [
+    { "paths": ["tests/sw/test_"], "cmd": "./bin/swc build {file} -o /tmp/o-test-bin && timeout 120 /tmp/o-test-bin", "prove_fails": true },
+    { "paths": ["tests/sw/conform/"], "cmd": "d=$(mktemp -d) && ./bin/swc run {file} > $d/interp 2>&1; ./bin/swc build {file} -o $d/bin >/dev/null 2>&1 && $d/bin > $d/compiled 2>&1; diff $d/interp $d/compiled", "prove_fails": false }
+  ],
+  "required_checks": ["quickstart", "hardening-gates", "macos", "fuzz"],
+  "tiers": [
+    { "name": "docs", "paths": ["docs/", "README.md", "examples/"], "merge": "auto" },
+    { "name": "tests", "paths": ["tests/"], "merge": "auto" },
+    { "name": "language", "paths": ["src/swarmrt_lang.c", "src/swarmrt_parse", "lib/"], "merge": "auto", "extra": ["./tests/sw/run_conform.sh"] },
+    { "name": "runtime", "paths": ["src/", "Makefile"], "merge": "human", "extra": ["make test-full", "FUZZ_CC=gcc make tsan-gate"] }
+  ],
+  "default_merge": "human"
+}

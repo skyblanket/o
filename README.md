@@ -24,7 +24,7 @@ Postgres and no container: an embedded SQLite file is the whole control plane.
 | **Protected paths** | Nothing in the fence was touched, renamed or deleted. The tests that judge the agent sit behind it. |
 | **Review gate** | A second, read-only model approves the diff against the issue (`O_REVIEW=1`). |
 | **CI** | In PR mode, your repo's own checks go green on the PR (`ship: "pr"`). |
-| **Merge gate** | A long-lived maintainer model (Opus by default), with the whole repo in context, decides MERGE, CHANGES or ESCALATE (`O_MERGE_GATE=1`). |
+| **Merge gate** | O builds and runs the PR merged with main and proves new tests fail without the change. Then a long-lived maintainer (Opus by default) probes it and returns APPROVE, REJECT or UNVERIFIED (`O_MERGE_GATE=1`). |
 | **Post-merge verify** | Still green on main after the merge. If not, O auto-reverts and files a fix. |
 
 Every red verdict goes back to the agent with the actual failure output, so it
@@ -173,30 +173,69 @@ curl -s -X POST localhost:4100/api/companies -H 'Content-Type: application/json'
 - `ship: "merge"` (the default) keeps the local serialized merge, with
   post-merge verify and auto-revert.
 
-### Merge gate: a persistent maintainer
+### Merge gate: a persistent maintainer that runs the code
 
 With `O_MERGE_GATE=1`, a PR whose CI is green isn't merged automatically. It
 goes to one long-lived **maintainer** session per company (`O_MERGE_MODEL`,
-default `claude-opus-5-5`):
+default `claude-opus-5-5`), and nothing merges on reading alone.
 
-- **One session, resumed for every PR.** It learns the repo once and keeps that
-  context, re-reading files when it needs detail (after a compaction, say).
-  It works from `~/.o/maintainer/<company>/`, with each PR's checkout attached
-  read-only by `--add-dir`.
-- **`NOTES.md` is its durable memory.** It records conventions, pitfalls and
-  past decisions there. Every `O_MAINTAINER_ROTATE` reviews (default 25) it
-  starts a fresh session primed from `NOTES.md`, so it never drifts on a stale
-  view of the repo.
-- **Verdicts:**
-  - **MERGE**: O merges the PR.
-  - **CHANGES**: the findings go back to the builder (`red_merge_gate`), and
-    its next push updates the same PR.
-  - **ESCALATE**: the PR parks **In Review** for a human. A missing verdict
-    counts as ESCALATE.
-- PRs touching `O_ESCALATE_PATHS`, or larger than `O_ESCALATE_LINES` (default
-  1000), always go to a human. Every review is posted on its PR.
-- One review at a time: a single maintainer process serializes them, so a
-  session is never resumed twice at once.
+**1. O's own checks run first, with no model involved.** O makes a
+disposable clone of the PR **merged with current base**. It has no git
+remotes, and `GH_TOKEN` is stripped, so nothing in it can push. In that clone
+O runs the commands from `.o/review.json`:
+- the build
+- every new or changed test, which must pass on the PR **and fail on base
+  without the change**, so a test that can't fail is a REJECT
+- the suite
+- the extra commands of the change's risk tier
+
+The first unexpected result is a REJECT, and the model is never asked.
+
+**2. Then the maintainer reviews, building and probing in that clone.** It
+has Bash there, and a rubric that makes it look for reasons the change is
+wrong: kill the caller, check what runs after `fork()`, run concurrent calls,
+try another OS, look for tests that pass by default, and probe cases beyond
+the issue's list. Its session is resumed for every PR. `NOTES.md` in
+`~/.o/maintainer/<company>/` is its durable memory, and every
+`O_MAINTAINER_ROTATE` reviews (default 25) it starts a fresh session primed
+from `NOTES.md`.
+
+**3. The verdict is the last `VERDICT:` line.** The same protocol is used for
+the pre-PR screen.
+
+| Verdict | Result |
+|---|---|
+| `APPROVE` | Merged, unless the change's tier needs a human. |
+| `REJECT: <findings>` | `red_merge_gate`: the findings go to the builder, and its next push updates the same PR. |
+| `UNVERIFIED: <what couldn't run>` | Waits for a human. A missing verdict counts as UNVERIFIED, and so does an APPROVE from a session that ran no command at all. |
+
+**4. Evidence:** every decision is posted on the PR, with O's check log and
+every command the maintainer ran (taken from its tool calls, not its own
+summary).
+
+#### `.o/review.json`
+The file is read from the **base** branch, so a PR can't relax the checks
+that judge it. Protect `.o/` with `protected_paths`.
+
+```json
+{ "build": "make swc libswarmrt",
+  "suite": "make test-sw",
+  "test_runners": [
+    { "paths": ["tests/sw/test_"], "cmd": "./bin/swc build {file} -o /tmp/o-t && /tmp/o-t", "prove_fails": true } ],
+  "required_checks": ["quickstart", "hardening-gates", "macos", "fuzz"],
+  "tiers": [
+    { "name": "docs",     "paths": ["docs/", "README.md"], "merge": "auto" },
+    { "name": "language", "paths": ["src/swarmrt_lang.c", "lib/"], "merge": "auto", "extra": ["make test-sw"] },
+    { "name": "runtime",  "paths": ["src/"], "merge": "human", "extra": ["make test-full"] } ],
+  "default_merge": "human" }
+```
+
+- **CI must be green on the PR merged with current base:** every
+  `required_checks` name has to have reported success, and when base moves on,
+  O updates the PR branch and waits for CI again.
+- **One PR per issue:** when O gives up on an issue, it closes that issue's PR
+  with the reason, so a superseded attempt can't be merged. The follow-up issue
+  carries the `Closes #N` link.
 
 O acts with your GitHub token, and GitHub won't let a PR's author approve their
 own PR. So the maintainer's review is a comment, and the merge works as long as
@@ -297,7 +336,8 @@ The daemon reads its configuration from the environment. All are optional.
 | `O_MERGE_GATE` | unset | `1` sends every green PR to the persistent maintainer for MERGE / CHANGES / ESCALATE. |
 | `O_MERGE_MODEL` | `claude-opus-5-5` | the maintainer's model. |
 | `O_MAINTAINER_ROTATE` | `25` | reviews per maintainer session before a fresh one primed from `NOTES.md`. |
-| `O_ESCALATE_PATHS` / `O_ESCALATE_LINES` | unset / `1000` | PRs touching these path prefixes, or bigger than this, always go to a human. |
+| `O_ESCALATE_PATHS` / `O_ESCALATE_LINES` | unset / `1000` | PRs touching these path prefixes, or bigger than this, always go to a human (on top of `.o/review.json` tiers). |
+| `O_GATE_TIMEOUT_S` / `O_GATE_MAX_TURNS` | `3600` / `80` | wall-clock and turn caps for one gate review, checks included. |
 | `O_VERIFY_RERUNS` | `1` | post-merge verify re-runs before a red result counts as a regression. |
 
 ## API

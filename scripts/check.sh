@@ -1018,17 +1018,21 @@ case "$in" in
     if [ -n "$sid" ]; then echo "resume $sid" >> "$GHS/gate_calls"
     else n=$(( $(cat "$GHS/gate_ctr" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$GHS/gate_ctr"; sid="maint-$n"; echo "fresh $sid" >> "$GHS/gate_calls"; fi
     case "$in" in
-      *"[gate:changes]"*) v="VERDICT: CHANGES: add a regression test for the new path" ;;
-      *"[gate:escalate]"*) v="VERDICT: ESCALATE: this changes a public API" ;;
+      *"[gate:changes]"*) v="VERDICT: REJECT: add a regression test for the new path" ;;
+      *"[gate:escalate]"*) v="VERDICT: UNVERIFIED: could not run the fuzzer here" ;;
       *"[gate:silent]"*) v="I looked at it." ;;
-      *) v="VERDICT: MERGE" ;;
+      *) v="VERDICT: APPROVE" ;;
     esac
-    printf '{"type":"result","result":"Reviewed in context.\\n%s","total_cost_usd":0.02,"session_id":"%s"}' "$v" "$sid"
+    case "$in" in
+      *"[gate:nobash]"*) ;;
+      *) printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"make test"}}]}}' ;;
+    esac
+    printf '{"type":"result","result":"Reviewed in context.\\n%s","total_cost_usd":0.02,"session_id":"%s"}\n' "$v" "$sid"
     exit 0 ;;
 esac
 case "$in" in
-  *"[review:reject]"*) printf '%s' '{"type":"result","result":"REJECT: stub reviewer says the change is wrong","total_cost_usd":0.01}' ;;
-  *) printf '%s' '{"type":"result","result":"APPROVE","total_cost_usd":0.01}' ;;
+  *"[review:reject]"*) printf '%s' '{"type":"result","result":"Looked at it.\nVERDICT: REJECT: stub reviewer says the change is wrong","total_cost_usd":0.01}' ;;
+  *) printf '%s' '{"type":"result","result":"Looked at it.\nVERDICT: APPROVE","total_cost_usd":0.01}' ;;
 esac
 STUB
 chmod +x "$TMP4/claude-stub"
@@ -1047,7 +1051,7 @@ method=GET; path=""; head=""; bodyf=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -X) method="$2"; shift ;;
-    -f|-F) case "$2" in head=*) head="${2#head=}" ;; body=@*) bodyf="${2#body=@}" ;; esac; shift ;;
+    -f|-F) case "$2" in head=*) head="${2#head=}" ;; body=@*) bodyf="${2#body=@}" ;; state=*) newstate="${2#state=}" ;; esac; shift ;;
     *) path="$1" ;;
   esac
   shift
@@ -1070,6 +1074,16 @@ case "$method $path" in
       && git -c user.email=gh@x -c user.name=gh merge -q --no-ff --no-edit "origin/$b" \
       && git push -q origin main && touch "$GHS/merged_$n" \
       && echo "{\"merged\":true,\"sha\":\"$(git rev-parse HEAD)\"}" ;;
+  "PATCH repos/acme/widgets/pulls/"*)
+    n="${path#repos/acme/widgets/pulls/}"; [ "$newstate" = closed ] && touch "$GHS/closed_$n"; echo "{\"number\":$n}" ;;
+  "GET repos/acme/widgets/compare/"*)
+    spec="${path#repos/acme/widgets/compare/}"; cbase="${spec%%...*}"; csha="${spec#*...}"
+    nb="$(git -C "$GHS/remote.git" rev-list --count "$csha..$cbase" 2>/dev/null || echo 0)"; echo "{\"behind_by\":$nb}" ;;
+  "PUT repos/acme/widgets/pulls/"*/update-branch)
+    n="${path#repos/acme/widgets/pulls/}"; n="${n%/update-branch}"; b="$(cat "$GHS/pr_$n")"
+    tmp="$(mktemp -d)"; git clone -q "$GHS/remote.git" "$tmp/c" && cd "$tmp/c" && git checkout -q "$b" \
+      && git -c user.email=gh@x -c user.name=gh merge -q --no-edit origin/main && git push -q origin "$b" && touch "$GHS/updated_$n"
+    echo '{"message":"Updating pull request branch."}' ;;
   "DELETE repos/acme/widgets/git/refs/heads/"*) git -C "$GHS/remote.git" branch -q -D "${path#repos/acme/widgets/git/refs/heads/}" ;;
   "GET repos/acme/widgets/pulls/"*)
     n="${path#repos/acme/widgets/pulls/}"; b="$(cat "$GHS/pr_$n")"
@@ -1079,7 +1093,9 @@ case "$method $path" in
   "GET repos/acme/widgets/commits/"*/check-runs*)
     sha="${path#repos/acme/widgets/commits/}"; sha="${sha%%/*}"; b="$(cat "$GHS/sha_$sha" 2>/dev/null)"
     if listed fail_ci "$b"; then c=failure; else c=success; fi
-    echo "{\"check_runs\":[{\"name\":\"build\",\"status\":\"completed\",\"conclusion\":\"$c\"}]}" ;;
+    nm=build; listed only_lint "$b" && nm=lint
+    if listed hold_ci "$b"; then echo "{\"check_runs\":[{\"name\":\"$nm\",\"status\":\"in_progress\",\"conclusion\":null}]}"
+    else echo "{\"check_runs\":[{\"name\":\"$nm\",\"status\":\"completed\",\"conclusion\":\"$c\"}]}"; fi ;;
   "GET repos/acme/widgets/commits/"*/status) echo '{"state":"success","statuses":[]}' ;;
   "POST repos/acme/widgets/issues/"*/comments)
     n="${path#repos/acme/widgets/issues/}"; n="${n%/comments}"; cat "$bodyf" >> "$GHS/comments_$n"; echo '{"id":1}' ;;
@@ -1143,6 +1159,15 @@ SEEDGH="$TMP4/seedgh"
 git clone -q "$GHS/remote.git" "$SEEDGH"
 git -C "$SEEDGH" config user.email "o@example.com"; git -C "$SEEDGH" config user.name "O Test"
 cp "$SCRATCH/verify.sh" "$SEEDGH/verify.sh"; echo "gh project" > "$SEEDGH/README.md"
+mkdir -p "$SEEDGH/.o"
+cat > "$SEEDGH/.o/review.json" <<'JSON'
+{ "build": "true",
+  "suite": "true",
+  "test_runners": [ { "paths": ["tests/"], "cmd": "sh {file}", "prove_fails": true } ],
+  "required_checks": ["build"],
+  "tiers": [ { "name": "docs", "paths": ["docs/", "README.md"], "merge": "auto" },
+             { "name": "runtime", "paths": ["risky/"], "merge": "human", "extra": ["true"] } ] }
+JSON
 git -C "$SEEDGH" add -A; git -C "$SEEDGH" commit -q -m "seed gh project"; git -C "$SEEDGH" push -q origin main
 GHREPO="$TMP4/ghclone"
 git clone -q "$GHS/remote.git" "$GHREPO"
@@ -1168,7 +1193,7 @@ git -C "$GHREPO" worktree add -q "$TMP4/.o/workspaces/$IID_BLK" -b "o/$IID_BLK" 
 rm -rf "$TMP4/.o/workspaces/$IID_BLK"
 echo "o/$IID_CIF" > "$GHS/fail_ci"
 echo "o/$IID_BLK" > "$GHS/block_merge"
-echo '[{"number":7,"title":"[sim:good] from github","body":"filed on GitHub"},{"number":8,"title":"[sim:good] a PR, not an issue","body":"","pull_request":{"url":"x"}}]' > "$GHS/issues.json"
+echo '[{"number":7,"title":"[sim:good] from github","body":"filed on GitHub"},{"number":8,"title":"[sim:good] a PR, not an issue","body":"","pull_request":{"url":"x"}},{"number":9,"title":"[sim:no-commit] from github, never commits","body":"x"}]' > "$GHS/issues.json"
 ocurl -s -X POST "$BASE4/api/companies/$CIDG/agents" \
   -H 'Content-Type: application/json' -d '{"name":"Ghsim","runtime":"sim"}' >/dev/null
 IID_GH=""
@@ -1242,7 +1267,7 @@ git -C "$GHS/remote.git" log --oneline main | grep "o/$IID_GM" >/dev/null || {
   echo "--- activity for $IID_GM:"; sqlite3 "$TMP4/o.db" "SELECT verb FROM activity WHERE target='$IID_GM' ORDER BY ts"
   grep -v "\[orch\] tick" "$TMP4/daemon.log" | tail -25
   fail "gate: MERGE verdict did not merge the PR"; }
-grep -q "Gate decision" "$GHS/comments_$(pr_of "$IID_GM")" || fail "gate: no review comment posted on the merged PR"
+grep "Decision:" "$GHS/comments_$(pr_of "$IID_GM")" >/dev/null || fail "gate: no review comment posted on the merged PR"
 wait_status_at "$BASE4" "$IID_GE" "In Review" 120 || { tail -40 "$TMP4/daemon.log"; fail "gate: ESCALATE never parked In Review"; }
 wait_status_at "$BASE4" "$IID_GS" "In Review" 120 || fail "gate: missing VERDICT did not fail closed to In Review"
 wait_status_at "$BASE4" "$IID_GX" "Failed" 180 || { tail -40 "$TMP4/daemon.log"; fail "gate: CHANGES x3 never Failed"; }
@@ -1255,7 +1280,7 @@ nfresh="$(grep -c '^fresh' "$GHS/gate_calls")"; nres="$(grep -c '^resume' "$GHS/
 while read -r kind sid; do
   [ "$kind" = "resume" ] && ! grep -qx "fresh $sid" "$GHS/gate_calls" && fail "gate: resumed unknown session $sid"
 done < "$GHS/gate_calls"
-pass "gate: MERGE merged, CHANGES -> red_merge_gate -> Failed, ESCALATE/no-verdict -> In Review; reviews posted; session resumed ($nres) and rotated ($nfresh)"
+pass "gate: APPROVE merged, REJECT -> red_merge_gate -> Failed, UNVERIFIED/no-verdict -> In Review; reviews posted; session resumed ($nres) and rotated ($nfresh)"
 
 # ---- In Review poller --------------------------------------------------
 # With the gate now on, the PR that PR-only mode parked earlier is adopted and
@@ -1276,11 +1301,56 @@ wait_status_at "$BASE4" "$IID_BLK" "Done" 30 || fail "poller: a human merge was 
 touch "$GHS/closed_$(pr_of "$IID_GE")"
 wait_status_at "$BASE4" "$IID_GE" "Canceled" 30 || fail "poller: a closed PR was not Canceled"
 pass "poller: PR-only PR adopted + merged by the gate; refused/escalated never re-adopted; human merge -> Done; closed -> Canceled"
+
+# ---- gate v2: the reviewer brief ----------------------------------------
+# O's own checks run before any model (.o/review.json, read from base). A test
+# that passes WITHOUT the change is a REJECT. A runtime-tier change needs a
+# human even when approved. An APPROVE with no command run is UNVERIFIED. A PR
+# O gives up on is closed. CI must be green on the PR merged with CURRENT main
+# (O updates the branch when main moves). A GitHub issue's follow-up carries
+# "Closes #N".
+IID_RT="$(gh_issue '[sim:real-test] feature with a real test')"
+IID_VT="$(gh_issue '[sim:vacuous-test] feature with a test that cannot fail')"
+IID_RK="$(gh_issue '[sim:risky] runtime internals')"
+IID_NB="$(gh_issue '[sim:good] [gate:nobash] reviewer only reads')"
+wait_status_at "$BASE4" "$IID_RT" "Done" 120 || { tail -30 "$TMP4/daemon.log"; fail "gate2: change with a real test never merged"; }
+grep "fails WITHOUT the change" "$GHS/comments_$(pr_of "$IID_RT")" >/dev/null || fail "gate2: red-green evidence missing from the PR comment"
+grep "make test" "$GHS/comments_$(pr_of "$IID_RT")" >/dev/null || fail "gate2: maintainer's command log missing from the PR comment"
+wait_status_at "$BASE4" "$IID_VT" "Failed" 180 || { tail -30 "$TMP4/daemon.log"; fail "gate2: vacuous test never failed out"; }
+sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_VT' ORDER BY started_at DESC LIMIT 1" | grep "proves nothing" >/dev/null || fail "gate2: vacuous test not rejected as can't-fail"
+for _i in $(seq 1 20); do [ -f "$GHS/closed_$(pr_of "$IID_VT")" ] && break; sleep 1; done
+[ -f "$GHS/closed_$(pr_of "$IID_VT")" ] || fail "gate2: PR O gave up on was left open"
+git -C "$GHS/remote.git" log --oneline main | grep "o/$IID_VT" >/dev/null && fail "gate2: vacuous-test PR merged"
+wait_status_at "$BASE4" "$IID_RK" "In Review" 120 || fail "gate2: runtime-tier change did not wait for a human"
+sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_RK' ORDER BY started_at DESC LIMIT 1" | grep "human sign-off" >/dev/null || fail "gate2: runtime-tier reason not recorded"
+wait_status_at "$BASE4" "$IID_NB" "In Review" 120 || fail "gate2: APPROVE without running anything was not downgraded"
+sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_NB' ORDER BY started_at DESC LIMIT 1" | grep "without running" >/dev/null || fail "gate2: UNVERIFIED reason not recorded"
+IID_GH9="$(sqlite3 "$TMP4/o.db" "SELECT identifier FROM issue WHERE fingerprint='gh:9'")"
+[ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM issue WHERE fingerprint='verify-final:$IID_GH9' AND body LIKE '%Closes #9%'")" = "1" ] || fail "gate2: follow-up for GitHub #9 does not carry 'Closes #9'"
+pass "gate2: red-green (vacuous test -> REJECT, PR closed), runtime tier -> human, APPROVE w/o commands -> UNVERIFIED, evidence + command log on the PR, Closes #N inherited"
+IID_BH="$(gh_issue '[sim:good] lands after main moves')"
+echo "o/$IID_BH" >> "$GHS/hold_ci"
+for _i in $(seq 1 90); do [ -n "$(pr_of "$IID_BH" 2>/dev/null)" ] && break; sleep 1; done
+[ -n "$(pr_of "$IID_BH")" ] || fail "gate2: held PR never opened"
+tmpb="$(mktemp -d)"; git clone -q "$GHS/remote.git" "$tmpb/c"
+echo moved > "$tmpb/c/main-moved.txt"; git -C "$tmpb/c" add main-moved.txt
+git -C "$tmpb/c" -c user.email=h@x -c user.name=human commit -q -m "main moves on"; git -C "$tmpb/c" push -q origin main
+sed -i "\|o/$IID_BH|d" "$GHS/hold_ci"
+wait_status_at "$BASE4" "$IID_BH" "Done" 120 || { tail -30 "$TMP4/daemon.log"; fail "gate2: PR behind main never merged"; }
+[ -f "$GHS/updated_$(pr_of "$IID_BH")" ] || fail "gate2: O merged a PR that was behind main without updating it"
+pass "gate2: PR behind main is updated (update-branch) and re-checked before merge"
 restart_d4 O_MERGE_GATE=1 O_ESCALATE_PATHS=sim_
 IID_GF="$(gh_issue '[sim:good] maintainer says merge but path is fenced')"
 wait_status_at "$BASE4" "$IID_GF" "In Review" 120 || fail "gate: O_ESCALATE_PATHS did not force escalation"
 sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_GF' ORDER BY started_at DESC LIMIT 1" | grep "O_ESCALATE_PATHS" >/dev/null || fail "gate: forced escalation reason not recorded"
-pass "gate: O_ESCALATE_PATHS overrides a MERGE verdict -> In Review"
+pass "gate: O_ESCALATE_PATHS overrides an APPROVE -> In Review"
+restart_d4 O_MERGE_GATE=1 O_CI_TIMEOUT_S=6
+IID_RC="$(gh_issue '[sim:good] required check never reports')"
+echo "o/$IID_RC" >> "$GHS/only_lint"
+wait_status_at "$BASE4" "$IID_RC" "Failed" 200 || { tail -30 "$TMP4/daemon.log"; fail "required: PR without the required 'build' check did not time out"; }
+[ "$(sqlite3 "$TMP4/o.db" "SELECT verify_state FROM run WHERE issue_id='$IID_RC' ORDER BY started_at DESC LIMIT 1")" = "red_timeout" ] || fail "required: expected red_timeout"
+git -C "$GHS/remote.git" log --oneline main | grep "o/$IID_RC" >/dev/null && fail "required: merged without the required check"
+pass "required: a PR whose required check never passes is never merged (red_timeout)"
 
 # ============================================================
 # Agent sandbox — 5th daemon, O_SANDBOX=bwrap + O_API_TOKEN
