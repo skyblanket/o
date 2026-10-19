@@ -30,7 +30,10 @@ import Std
 export [start, chat_worker]
 
 # ---- tunables ------------------------------------------------
-fun max_concurrent() { 3 }        # PRD: configurable, default 10
+# Agent runs in flight across all companies. O_MAX_CONCURRENT overrides. Each
+# run (and its verify, review and gate) holds a scheduler thread while its
+# CLI runs, so keep SW_SCHEDULERS well above twice this.
+fun max_concurrent() { env_int("O_MAX_CONCURRENT", 3) }
 # Orchestrator tick and retry backoff, in ms. O_TICK_MS / O_BACKOFF_MS
 # override (the test suite runs at a fraction of a second).
 fun tick_interval()  { env_int("O_TICK_MS", 5000) }
