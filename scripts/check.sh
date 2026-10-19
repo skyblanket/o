@@ -1176,6 +1176,20 @@ wait_status_at "$BASE4" "$IID_BLK" "In Review" 90 || { tail -40 "$TMP4/daemon.lo
 sleep 6
 [ "$(sqlite3 "$TMP4/o.db" "SELECT status FROM issue WHERE id='$IID_BLK'")" = "In Review" ] || fail "github: In Review issue was re-dispatched"
 pass "github: merge refused by branch policy -> parked In Review, not re-dispatched"
+# PR-only mode: restart the same daemon with O_PR_AUTOMERGE=0; a green PR must
+# park In Review with nothing merged into the remote.
+kill "$DAEMON4_PID" 2>/dev/null || true; wait "$DAEMON4_PID" 2>/dev/null || true
+HOME="$TMP4" O_DB="$TMP4/o.db" O_PORT="$PORT4" O_NO_OPEN=1 O_REVIEW=1 O_CLAUDE_BIN="$TMP4/claude-stub" \
+  O_GH_BIN="$TMP4/gh-stub" GHS="$GHS" O_GH_POLL_S=2 O_CI_POLL_S=1 O_CI_SETTLE_S=0 O_PR_AUTOMERGE=0 \
+  ./bin/swarmd >>"$TMP4/daemon.log" 2>&1 &
+DAEMON4_PID=$!
+for _i in $(seq 1 30); do
+  [ "$(ocurl -s -o /dev/null -w '%{http_code}' "$BASE4/api/health" 2>/dev/null || true)" = "200" ] && break; sleep 0.5
+done
+IID_PRO="$(jget "$(ocurl -s -X POST "$BASE4/api/companies/$CIDG/issues" -H 'Content-Type: application/json' -d '{"title":"[sim:good] pr-only"}')" 'd["id"]')"
+wait_status_at "$BASE4" "$IID_PRO" "In Review" 90 || { tail -30 "$TMP4/daemon.log"; fail "pr-only: green PR never parked In Review"; }
+git -C "$GHS/remote.git" log --oneline main | grep -q "o/$IID_PRO" && fail "pr-only: PR was merged with O_PR_AUTOMERGE=0"
+pass "pr-only: O_PR_AUTOMERGE=0 leaves a green PR open, issue In Review, nothing merged"
 
 # ============================================================
 # Agent sandbox — 5th daemon, O_SANDBOX=bwrap + O_API_TOKEN

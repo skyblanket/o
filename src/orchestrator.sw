@@ -1759,7 +1759,12 @@ fun ci_poll(orch, run_id, issue_id, gh_repo, branch, num, pushed_at, deadline) {
     } else { if (timestamp() > deadline) {
         send(orch, {'ci_done', run_id, issue_id, "red_timeout", "", "CI did not finish within O_CI_TIMEOUT_S."})
     } else { if (pr != nil && verdict == "success" && (length(checks) > 0 || settled)) {
-        ci_merge(orch, run_id, issue_id, gh_repo, branch, num)
+        if (getenv("O_PR_AUTOMERGE") == "0") {
+            # PR-only mode: green PRs wait for a human to merge them.
+            send(orch, {'ci_done', run_id, issue_id, "in_review", "", "CI green on PR #" ++ to_string(num) ++ "; O_PR_AUTOMERGE=0, so it waits for a human to merge."})
+        } else {
+            ci_merge(orch, run_id, issue_id, gh_repo, branch, num)
+        }
     } else {
         _s = sleep(env_int("O_CI_POLL_S", 30) * 1000)
         ci_poll(orch, run_id, issue_id, gh_repo, branch, num, pushed_at, deadline)

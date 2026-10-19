@@ -255,6 +255,7 @@ The daemon reads its configuration from the environment. All are optional.
 | `O_GH_LABEL` | `o` | only open GitHub issues with this label are imported. |
 | `O_GH_POLL_S` | `60` | GitHub issue poll interval. |
 | `O_CI_POLL_S` / `O_CI_TIMEOUT_S` | `30` / `3600` | PR check poll interval / give-up deadline (`red_timeout`). |
+| `O_PR_AUTOMERGE` | `1` | set `0` for PR-only mode: a green PR parks in **In Review** for a human to merge. |
 | `O_CI_SETTLE_S` | `30` | how long a PR with no checks reported waits before counting as "no CI, green". |
 | `O_SANDBOX` | unset | `bwrap` confines agent + reviewer runs with bubblewrap (Linux). |
 | `O_SANDBOX_RW` | unset | extra comma-separated paths the sandbox keeps writable, if your agent CLI needs them. |
