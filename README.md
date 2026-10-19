@@ -142,8 +142,9 @@ O edits real repositories on its own. The guard rails are the point.
 ## GitHub in / out
 
 Point a company at a GitHub repo and O works its issue tracker and ships
-through its CI. `repo` must be a local clone whose `origin` is that repo; the
-`gh` CLI must be authenticated.
+through its CI. `repo` must be a local clone whose `origin` is that repo, and
+`github_repo` must be its `owner/name`. O talks to GitHub only through
+`gh api` (REST), so it needs an authenticated `gh`, but not GitHub's GraphQL API.
 
 ```sh
 curl -s -X POST localhost:4100/api/companies -H 'Content-Type: application/json' -d '{
@@ -238,6 +239,7 @@ The daemon reads its configuration from the environment. All are optional.
 | `O_CLAUDE_BIN` | `claude` on `PATH` | claude-code binary for the `claude-code` runtime. |
 | `O_SWARM_BIN` | `swarm-code` on `PATH` | binary for the `swarm-code` runtime. |
 | `O_MAX_TURNS` | `50` | per-run turn cap passed to claude-code. |
+| `O_STALL_TIMEOUT_S` | `600` | wall-clock cap on one agent run, in seconds. |
 | `O_VERIFY_TIMEOUT_S` | `600` | wall-clock cap on a single verify command. |
 | `O_GLOBAL_DAILY_CENTS` | unset | global daily spend ceiling across all companies; dispatch stops for the day when met. |
 | `O_SELF_FILE_CAP` | `10` | max auto/reflect issues one company may file per day. |
@@ -253,6 +255,7 @@ The daemon reads its configuration from the environment. All are optional.
 | `O_GH_LABEL` | `o` | only open GitHub issues with this label are imported. |
 | `O_GH_POLL_S` | `60` | GitHub issue poll interval. |
 | `O_CI_POLL_S` / `O_CI_TIMEOUT_S` | `30` / `3600` | PR check poll interval / give-up deadline (`red_timeout`). |
+| `O_PR_AUTOMERGE` | `1` | set `0` for PR-only mode: a green PR parks in **In Review** for a human to merge. |
 | `O_CI_SETTLE_S` | `30` | how long a PR with no checks reported waits before counting as "no CI, green". |
 | `O_SANDBOX` | unset | `bwrap` confines agent + reviewer runs with bubblewrap (Linux). |
 | `O_SANDBOX_RW` | unset | extra comma-separated paths the sandbox keeps writable, if your agent CLI needs them. |

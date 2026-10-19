@@ -31,7 +31,14 @@ export [start, chat_worker]
 # ---- tunables ------------------------------------------------
 fun max_concurrent() { 3 }        # PRD: configurable, default 10
 fun tick_interval()  { 5000 }     # PRD: 30000
-fun stall_timeout()  { 600000 }   # 10 min — real agent runs are slow
+# Wall-clock cap on one agent run (and the stall sweep's budget for it).
+# O_STALL_TIMEOUT_S overrides; default 600 (10 min). Raise it for repos
+# where real changes take longer.
+fun stall_timeout()  {
+    v = getenv("O_STALL_TIMEOUT_S")
+    n = if (v == nil) { nil } else { to_int(v) }
+    if (n == nil) { 600000 } else { n * 1000 }
+}
 fun backoff_base()   { 2000 }     # PRD: 10000
 fun max_backoff()    { 60000 }    # PRD: 300000
 fun max_attempts()   { 3 }        # after this many failed runs, the issue is marked Failed
@@ -1639,10 +1646,6 @@ fun gh_label() {
     if (v == nil) { "o" } else { v }
 }
 
-fun repo_flag(gh_repo) {
-    if (string_length(gh_repo) > 0) { f" -R {sq(gh_repo)}" } else { "" }
-}
-
 fun maybe_gh_poll(db, tick_n) {
     poll_ms = env_int("O_GH_POLL_S", 60) * 1000
     if ((tick_n * tick_interval()) % poll_ms < tick_interval()) {
@@ -1662,9 +1665,20 @@ fun gh_poll_each(rows) {
     }
 }
 
+# All GitHub calls go through `gh api` (REST). The higher-level gh commands
+# (`issue list`, `pr view --json`, `pr create`, `pr merge`) use GraphQL, which
+# some environments block; REST works wherever the token does.
+fun gh_api(args) {
+    shell(f"{gh_bin()} api {args}")
+}
+
+fun gh_json(args) {
+    r = gh_api(args)
+    if (elem(r, 0) == 0) { json_decode(elem(r, 1)) } else { nil }
+}
+
 fun gh_poll_worker(orch, company_id, gh_repo) {
-    r = shell(f"{gh_bin()} issue list{repo_flag(gh_repo)} --label {sq(gh_label())} --state open --json number,title,body --limit 50")
-    items = if (elem(r, 0) == 0) { json_decode(elem(r, 1)) } else { nil }
+    items = gh_json(sq(f"repos/{gh_repo}/issues?labels={gh_label()}&state=open&per_page=50"))
     if (items == nil) { "" } else { send(orch, {'gh_issues', company_id, items}) }
 }
 
@@ -1673,7 +1687,8 @@ fun import_gh_issues(db, company_id, items) {
         ""
     } else {
         it = hd(items)
-        num = map_get(it, "number")
+        # the REST issues list includes pull requests; never import those
+        num = if (map_get(it, "pull_request") == nil) { map_get(it, "number") } else { nil }
         title = str_or(map_get(it, "title"), "")
         body = str_or(map_get(it, "body"), "")
         id = if (num == nil) { nil } else { Store.issue_import_github(db, company_id, num, title, body) }
@@ -1702,57 +1717,80 @@ fun start_ci(db, running, retry, info, company, run_id, issue_id, now) {
 }
 
 fun ci_worker(orch, run_id, issue_id, ws, branch, base, gh_repo, title) {
-    gh = gh_bin()
-    rf = repo_flag(gh_repo)
     push = shell(f"git -C {ws} push -q --force-with-lease origin HEAD:refs/heads/{branch}")
     if (elem(push, 0) != 0) {
         send(orch, {'ci_done', run_id, issue_id, "red_ci", "", "git push failed:\n" ++ elem(push, 1)})
     } else {
-        have = shell(f"{gh} pr view {branch}{rf} --json number,url")
-        made = if (elem(have, 0) == 0) { have } else { shell(f"cd {ws} && {gh} pr create{rf} --base {sq(base)} --head {branch} --title {sq(title)} --body-file PR.md") }
-        if (elem(made, 0) != 0) {
-            send(orch, {'ci_done', run_id, issue_id, "red_ci", "", "gh pr create failed:\n" ++ elem(made, 1)})
+        owner = hd(string_split(gh_repo, "/"))
+        open_prs = gh_json(sq(f"repos/{gh_repo}/pulls?head={owner}:{branch}&state=open"))
+        existing = if (open_prs == nil) { nil } else { if (length(open_prs) == 0) { nil } else { map_get(hd(open_prs), "number") } }
+        made = if (existing == nil) {
+            gh_json(f"-X POST repos/{gh_repo}/pulls -f {sq("title=" ++ title)} -f head={branch} -f {sq("base=" ++ base)} -F body=@{ws}/PR.md")
         } else {
-            ci_poll(orch, run_id, issue_id, branch, gh, rf, timestamp(), timestamp() + ci_timeout_s() * 1000)
+            %{number: existing}
+        }
+        num = if (made == nil) { nil } else { map_get(made, "number") }
+        if (num == nil) {
+            send(orch, {'ci_done', run_id, issue_id, "red_ci", "", "opening the PR for " ++ branch ++ " failed (gh api repos/" ++ gh_repo ++ "/pulls)."})
+        } else {
+            ci_poll(orch, run_id, issue_id, gh_repo, branch, num, timestamp(), timestamp() + ci_timeout_s() * 1000)
         }
     }
 }
 
-# Poll the PR until its checks settle. An empty rollup right after a push may
-# just mean CI hasn't registered yet, so it only counts as "no CI, green" after
-# O_CI_SETTLE_S (default 30).
-fun ci_poll(orch, run_id, issue_id, branch, gh, rf, pushed_at, deadline) {
-    r = shell(f"{gh} pr view {branch}{rf} --json state,mergeable,statusCheckRollup")
-    d = if (elem(r, 0) == 0) { json_decode(elem(r, 1)) } else { nil }
-    checks = if (d == nil) { [] } else { list_or_empty(map_get(d, "statusCheckRollup")) }
-    mergeable = if (d == nil) { "" } else { str_or(map_get(d, "mergeable"), "") }
-    state = if (d == nil) { "" } else { str_or(map_get(d, "state"), "") }
+# Poll the PR until its checks settle. An empty check list right after a push
+# may just mean CI hasn't registered yet, so it only counts as "no CI, green"
+# after O_CI_SETTLE_S (default 30).
+fun ci_poll(orch, run_id, issue_id, gh_repo, branch, num, pushed_at, deadline) {
+    pr = gh_json(f"repos/{gh_repo}/pulls/{num}")
+    merged = if (pr == nil) { 'false' } else { if (map_get(pr, "merged") == 'true') { 'true' } else { 'false' } }
+    mstate = if (pr == nil) { "" } else { str_or(map_get(pr, "mergeable_state"), "") }
+    head = if (pr == nil) { nil } else { map_get(pr, "head") }
+    sha = if (head == nil) { "" } else { str_or(map_get(head, "sha"), "") }
+    checks = pr_checks(gh_repo, sha)
     verdict = classify_checks(checks, "success", "")
     settled = timestamp() - pushed_at >= env_int("O_CI_SETTLE_S", 30) * 1000
-    if (state == "MERGED") {
+    if (merged == 'true') {
         send(orch, {'ci_done', run_id, issue_id, "merged", "", ""})
-    } else { if (mergeable == "CONFLICTING") {
+    } else { if (mstate == "dirty") {
         send(orch, {'ci_done', run_id, issue_id, "conflict", "", "The PR for " ++ branch ++ " conflicts with its base branch."})
     } else { if (string_starts_with(verdict, "failed") == 'true') {
-        send(orch, {'ci_done', run_id, issue_id, "red_ci", "", "CI checks failed on the PR: " ++ string_sub(verdict, 7, string_length(verdict) - 7) ++ "\nRun `gh pr checks " ++ branch ++ "` (and `gh run view --log-failed`) for the logs."})
+        send(orch, {'ci_done', run_id, issue_id, "red_ci", "", "CI checks failed on PR #" ++ to_string(num) ++ ": " ++ string_sub(verdict, 7, string_length(verdict) - 7) ++ "\nSee `gh pr checks " ++ to_string(num) ++ " -R " ++ gh_repo ++ "` and `gh run view --log-failed` for the logs."})
     } else { if (timestamp() > deadline) {
         send(orch, {'ci_done', run_id, issue_id, "red_timeout", "", "CI did not finish within O_CI_TIMEOUT_S."})
-    } else { if (verdict == "success" && (length(checks) > 0 || settled)) {
-        ci_merge(orch, run_id, issue_id, branch, gh, rf)
+    } else { if (pr != nil && verdict == "success" && (length(checks) > 0 || settled)) {
+        if (getenv("O_PR_AUTOMERGE") == "0") {
+            # PR-only mode: green PRs wait for a human to merge them.
+            send(orch, {'ci_done', run_id, issue_id, "in_review", "", "CI green on PR #" ++ to_string(num) ++ "; O_PR_AUTOMERGE=0, so it waits for a human to merge."})
+        } else {
+            ci_merge(orch, run_id, issue_id, gh_repo, branch, num)
+        }
     } else {
         _s = sleep(env_int("O_CI_POLL_S", 30) * 1000)
-        ci_poll(orch, run_id, issue_id, branch, gh, rf, pushed_at, deadline)
+        ci_poll(orch, run_id, issue_id, gh_repo, branch, num, pushed_at, deadline)
     }}}}}
 }
 
-fun ci_merge(orch, run_id, issue_id, branch, gh, rf) {
-    m = shell(f"{gh} pr merge {branch}{rf} --merge --delete-branch")
-    if (elem(m, 0) == 0) {
-        v = shell(f"{gh} pr view {branch}{rf} --json mergeCommit")
-        d = if (elem(v, 0) == 0) { json_decode(elem(v, 1)) } else { nil }
-        mc = if (d == nil) { nil } else { map_get(d, "mergeCommit") }
-        sha = if (mc == nil) { "" } else { str_or(map_get(mc, "oid"), "") }
-        send(orch, {'ci_done', run_id, issue_id, "merged", sha, ""})
+# Every check on the head commit: check runs (Actions and apps) plus legacy
+# commit statuses, folded into one list for classify_checks.
+fun pr_checks(gh_repo, sha) {
+    if (string_length(sha) == 0) {
+        []
+    } else {
+        cr = gh_json(f"repos/{gh_repo}/commits/{sha}/check-runs?per_page=100")
+        st = gh_json(f"repos/{gh_repo}/commits/{sha}/status")
+        runs = if (cr == nil) { [] } else { list_or_empty(map_get(cr, "check_runs")) }
+        stats = if (st == nil) { [] } else { list_or_empty(map_get(st, "statuses")) }
+        runs ++ stats
+    }
+}
+
+fun ci_merge(orch, run_id, issue_id, gh_repo, branch, num) {
+    m = gh_api(f"-X PUT repos/{gh_repo}/pulls/{num}/merge -f merge_method=merge")
+    d = if (elem(m, 0) == 0) { json_decode(elem(m, 1)) } else { nil }
+    if (d != nil && map_get(d, "merged") == 'true') {
+        _del = gh_api(f"-X DELETE repos/{gh_repo}/git/refs/heads/{branch}")
+        send(orch, {'ci_done', run_id, issue_id, "merged", str_or(map_get(d, "sha"), ""), ""})
     } else {
         # Green, but GitHub won't merge it for us (required reviews, merge
         # queue, ...): park it for a human instead of burning attempts.
@@ -1764,19 +1802,19 @@ fun list_or_empty(v) {
     if (v == nil) { [] } else { v }
 }
 
-# Fold a statusCheckRollup into "success" | "pending" | "failed:<names>".
-# CheckRun entries carry status/conclusion; StatusContext entries carry state.
+# Fold a list of checks into "success" | "pending" | "failed:<names>". Check
+# runs carry status/conclusion; commit statuses carry state (case-insensitive).
 fun classify_checks(checks, acc, failed) {
     if (length(checks) == 0) {
         if (string_length(failed) > 0) { "failed:" ++ failed } else { acc }
     } else {
         c = hd(checks)
         name = str_or(map_get(c, "name"), str_or(map_get(c, "context"), "check"))
-        st = str_or(map_get(c, "status"), "")
-        concl = str_or(map_get(c, "conclusion"), "")
-        state = str_or(map_get(c, "state"), "")
-        bad = concl == "FAILURE" || concl == "CANCELLED" || concl == "TIMED_OUT" || concl == "ACTION_REQUIRED" || concl == "STARTUP_FAILURE" || state == "FAILURE" || state == "ERROR"
-        waiting = (string_length(st) > 0 && st != "COMPLETED") || state == "PENDING" || state == "EXPECTED"
+        st = string_lower(str_or(map_get(c, "status"), ""))
+        concl = string_lower(str_or(map_get(c, "conclusion"), ""))
+        state = string_lower(str_or(map_get(c, "state"), ""))
+        bad = concl == "failure" || concl == "cancelled" || concl == "timed_out" || concl == "action_required" || concl == "startup_failure" || state == "failure" || state == "error"
+        waiting = (string_length(st) > 0 && st != "completed") || state == "pending" || state == "expected"
         if (bad) {
             sep = if (string_length(failed) > 0) { ", " } else { "" }
             classify_checks(tl(checks), acc, failed ++ sep ++ name)
