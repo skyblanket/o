@@ -1085,6 +1085,7 @@ case "$in" in
     exit 0 ;;
 esac
 case "$in" in
+  *"[review:bare]"*) printf '%s' '{"type":"result","result":"Reviewed statically.\n\n**APPROVE**\n\nThe change covers the issue.","total_cost_usd":0.01}' ;;
   *"[review:reject]"*) printf '%s' '{"type":"result","result":"Looked at it.\nVERDICT: REJECT: stub reviewer says the change is wrong","total_cost_usd":0.01}' ;;
   *) printf '%s' '{"type":"result","result":"Looked at it.\nVERDICT: APPROVE","total_cost_usd":0.01}' ;;
 esac
@@ -1092,7 +1093,8 @@ STUB
 chmod +x "$TMP4/claude-stub"
 # gh stub: `gh api` (REST) against a bare repo standing in for GitHub. PUT
 # .../merge really merges the branch into the bare repo's main; check runs fail
-# for branches listed in $GHS/fail_ci; merges are refused for branches listed
+# for branches listed in $GHS/fail_ci (and for $GHS/flaky_ci until a
+# rerun-failed-jobs call); merges are refused for branches listed
 # in $GHS/block_merge. PR numbers map to branches through $GHS/pr_<n>.
 cat > "$TMP4/gh-stub" <<'STUB'
 #!/bin/sh
@@ -1146,10 +1148,15 @@ case "$method $path" in
     echo "{\"number\":$n,\"state\":\"$st\",\"merged\":$m,\"mergeable_state\":\"clean\",\"head\":{\"sha\":\"$sha\"}}" ;;
   "GET repos/acme/widgets/commits/"*/check-runs*)
     sha="${path#repos/acme/widgets/commits/}"; sha="${sha%%/*}"; b="$(cat "$GHS/sha_$sha" 2>/dev/null)"
-    if listed fail_ci "$b"; then c=failure; else c=success; fi
+    n="$(num_for "$b")"; c=success
+    listed fail_ci "$b" && c=failure
+    listed flaky_ci "$b" && [ ! -f "$GHS/rerun_$n" ] && c=failure
     nm=build; listed only_lint "$b" && nm=lint
-    if listed hold_ci "$b"; then echo "{\"check_runs\":[{\"name\":\"$nm\",\"status\":\"in_progress\",\"conclusion\":null}]}"
-    else echo "{\"check_runs\":[{\"name\":\"$nm\",\"status\":\"completed\",\"conclusion\":\"$c\"}]}"; fi ;;
+    du="https://github.com/acme/widgets/actions/runs/$n/job/1"
+    if listed hold_ci "$b"; then echo "{\"check_runs\":[{\"name\":\"$nm\",\"status\":\"in_progress\",\"conclusion\":null,\"details_url\":\"$du\"}]}"
+    else echo "{\"check_runs\":[{\"name\":\"$nm\",\"status\":\"completed\",\"conclusion\":\"$c\",\"details_url\":\"$du\"}]}"; fi ;;
+  "POST repos/acme/widgets/actions/runs/"*/rerun-failed-jobs)
+    n="${path#repos/acme/widgets/actions/runs/}"; n="${n%/rerun-failed-jobs}"; echo x >> "$GHS/rerun_$n"; echo '{}' ;;
   "GET repos/acme/widgets/commits/"*/status) echo '{"state":"success","statuses":[]}' ;;
   "POST repos/acme/widgets/issues/"*/comments)
     n="${path#repos/acme/widgets/issues/}"; n="${n%/comments}"; cat "$bodyf" >> "$GHS/comments_$n"; echo '{"id":1}' ;;
@@ -1187,7 +1194,9 @@ ocurl -s -X POST "$BASE4/api/companies/$CIDV/agents" \
   -H 'Content-Type: application/json' -d '{"name":"Revsim","runtime":"sim"}' >/dev/null
 IID_APP="$(jget "$(ocurl -s -X POST "$BASE4/api/companies/$CIDV/issues" -H 'Content-Type: application/json' -d '{"title":"[sim:good] reviewer approves"}')" 'd["id"]')"
 IID_REJ="$(jget "$(ocurl -s -X POST "$BASE4/api/companies/$CIDV/issues" -H 'Content-Type: application/json' -d '{"title":"[sim:good] [review:reject] reviewer rejects"}')" 'd["id"]')"
+IID_BARE="$(jget "$(ocurl -s -X POST "$BASE4/api/companies/$CIDV/issues" -H 'Content-Type: application/json' -d '{"title":"[sim:good] [review:bare] reviewer drops the VERDICT prefix"}')" 'd["id"]')"
 wait_status_at "$BASE4" "$IID_APP" "Done" 90 || { cat "$TMP4/daemon.log"; fail "review: approved change never Done"; }
+wait_status_at "$BASE4" "$IID_BARE" "Done" 90 || { tail -30 "$TMP4/daemon.log"; fail "review: a bare APPROVE line (no VERDICT: prefix) should pass the screen"; }
 git -C "$SCRATCHV" log --oneline main | grep "o/$IID_APP" >/dev/null || fail "review: approved change not merged"
 wait_status_at "$BASE4" "$IID_REJ" "Failed" 150 || { cat "$TMP4/daemon.log"; fail "review: rejected change never Failed"; }
 vs="$(sqlite3 "$TMP4/o.db" "SELECT verify_state FROM run WHERE issue_id='$IID_REJ' ORDER BY started_at DESC LIMIT 1")"
@@ -1270,6 +1279,8 @@ vs="$(sqlite3 "$TMP4/o.db" "SELECT verify_state FROM run WHERE issue_id='$IID_CI
 [ "$vs" = "red_ci" ] || fail "github: expected red_ci, got '$vs'"
 sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_CIF' ORDER BY started_at DESC LIMIT 1" | grep "build" >/dev/null \
   || fail "github: failing check name not passed to the retry prompt"
+sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_CIF' ORDER BY started_at DESC LIMIT 1" | grep "failed again after a re-run" >/dev/null \
+  || fail "github: a real CI failure should be re-run once before red_ci"
 git -C "$GHS/remote.git" log --oneline main | grep "o/$IID_CIF" >/dev/null && fail "github: red-CI PR was merged"
 pass "github: failing checks -> red_ci x3 -> Failed (check names in the retry tail), never merged"
 wait_status_at "$BASE4" "$IID_BLK" "In Review" 90 || { tail -40 "$TMP4/daemon.log"; fail "github: merge-refused issue never parked In Review"; }
@@ -1420,6 +1431,12 @@ IID_DOC="$(gh_issue '[sim:docs] docs-only change')"
 echo "o/$IID_DOC" >> "$GHS/only_lint"
 wait_status_at "$BASE4" "$IID_DOC" "Done" 120 || { tail -30 "$TMP4/daemon.log"; fail "tiered CI: a docs-only PR should merge on its tier's own required check (lint)"; }
 pass "tiered CI: a docs-only PR needs only its tier's required checks (lint, not build)"
+IID_FLK="$(gh_issue '[sim:good] ci flakes once')"
+echo "o/$IID_FLK" >> "$GHS/flaky_ci"
+wait_status_at "$BASE4" "$IID_FLK" "Done" 120 || { tail -30 "$TMP4/daemon.log"; fail "ci rerun: a check that passes on re-run should merge"; }
+[ -f "$GHS/rerun_$(pr_of "$IID_FLK")" ] || fail "ci rerun: failed jobs were not re-run"
+[ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM run WHERE issue_id='$IID_FLK' AND verify_state = 'red_ci'")" = "0" ] || fail "ci rerun: a flaky check was blamed on the change"
+pass "ci rerun: a failed check is re-run once; passing on re-run merges with no builder retry"
 
 # ============================================================
 # Agent sandbox — 5th daemon, O_SANDBOX=bwrap + O_API_TOKEN
