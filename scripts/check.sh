@@ -429,6 +429,7 @@ IID_NC="$(mk_issue '[sim:no-commit] nothing')"
 IID_PROT="$(mk_issue '[sim:protected] sneaky')"
 IID_BAD="$(mk_issue '[sim:bad-verify] break')"
 IID_REN="$(mk_issue '[sim:protected-rename] move it out')"
+IID_NH="$(mk_issue '[sim:needs-human] needs a protected file')"
 for x in "$IID_GOOD" "$IID_NC" "$IID_PROT" "$IID_BAD" "$IID_REN"; do
   [ -n "$x" ] || fail "verify-gate issue id missing"
 done
@@ -502,6 +503,14 @@ if wait_status "$IID_NC" "Failed" 120; then
 else
   cat "$TMP/daemon.log" || true; fail "[sim:no-commit] never reached Failed"
 fi
+
+# [sim:needs-human] — the builder says the task needs a protected path:
+# parked In Review with its ask, after ONE run, never Failed
+wait_status "$IID_NH" "In Review" 120 || { cat "$TMP/daemon.log" || true; fail "[sim:needs-human] never parked In Review"; }
+[ "$(last_verify_state "$IID_NH")" = "needs_human" ] || fail "[sim:needs-human] expected verify_state needs_human"
+[ "$(sqlite3 "$TMP/o.db" "SELECT COUNT(*) FROM run WHERE issue_id='$IID_NH'")" = "1" ] || fail "[sim:needs-human] was retried"
+sqlite3 "$TMP/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_NH'" | grep "keep.txt needs a line" >/dev/null || fail "[sim:needs-human] the builder's ask was not recorded"
+pass "verify-gate: [sim:needs-human] parks In Review with the protected change it needs, one run, no retries"
 
 # [sim:protected] — commit under protected/ -> red_protected, Failed
 if wait_status "$IID_PROT" "Failed" 120; then
@@ -1231,8 +1240,10 @@ cat > "$SEEDGH/.o-review.json" <<'JSON'
   "test_runners": [ { "paths": ["tests/"], "cmd": "sh {file}", "prove_fails": true } ],
   "required_checks": ["build"],
   "tiers": [ { "name": "docs", "paths": ["docs/", "README.md"], "merge": "auto", "required_checks": ["lint"] },
-             { "name": "runtime", "paths": ["risky/"], "merge": "human", "extra": ["true"] } ] }
+             { "name": "runtime", "paths": ["risky/"], "merge": "human", "extra": ["true"] },
+             { "name": "ext", "paths": ["ext/"], "merge": "auto", "extra": ["test ! -f ext/broken", "test -f broken-on-base-too"] } ] }
 JSON
+mkdir -p "$SEEDGH/tests"; echo 'exit 0' > "$SEEDGH/tests/existing.sh"
 git -C "$SEEDGH" add -A; git -C "$SEEDGH" commit -q -m "seed gh project"; git -C "$SEEDGH" push -q origin main
 GHREPO="$TMP4/ghclone"
 git clone -q "$GHS/remote.git" "$GHREPO"
@@ -1410,6 +1421,16 @@ sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_NB' ORD
 IID_GH9="$(sqlite3 "$TMP4/o.db" "SELECT identifier FROM issue WHERE fingerprint='gh:9'")"
 [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM issue WHERE fingerprint='verify-final:$IID_GH9' AND body LIKE '%Closes #9%'")" = "1" ] || fail "gate2: follow-up for GitHub #9 does not carry 'Closes #9'"
 pass "gate2: red-green (vacuous test -> REJECT, PR closed), runtime tier -> human, APPROVE w/o commands -> UNVERIFIED, evidence + command log on the PR, Closes #N inherited"
+IID_US="$(gh_issue '[sim:unskip-test] drop a skip guard')"
+IID_XO="$(gh_issue '[sim:ext-ok] ext change')"
+IID_XB="$(gh_issue '[sim:ext-broken] ext change that breaks its tier check')"
+wait_status_at "$BASE4" "$IID_US" "Done" 120 || { tail -30 "$TMP4/daemon.log"; fail "gate2: a modified test passing on base (an un-skip) was rejected"; }
+grep "modified, not added" "$GHS/comments_$(pr_of "$IID_US")" >/dev/null || fail "gate2: un-skip note missing from the PR comment"
+wait_status_at "$BASE4" "$IID_XO" "Done" 120 || { tail -30 "$TMP4/daemon.log"; fail "gate2: a tier check failing on base too blocked the PR"; }
+grep "also fails on base" "$GHS/comments_$(pr_of "$IID_XO")" >/dev/null || fail "gate2: pre-existing tier failure not noted on the PR"
+wait_status_at "$BASE4" "$IID_XB" "Failed" 200 || { tail -30 "$TMP4/daemon.log"; fail "gate2: a tier check the PR breaks did not block"; }
+sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_XB' ORDER BY started_at DESC LIMIT 1" | grep "passes on base without the change" >/dev/null || fail "gate2: PR-only tier failure reason not recorded"
+pass "gate2: modified test passing on base -> note, not REJECT; tier check failing on base too -> pre-existing; failing only with the PR (twice) -> REJECT"
 IID_BH="$(gh_issue '[sim:good] lands after main moves')"
 echo "o/$IID_BH" >> "$GHS/hold_ci"
 for _i in $(seq 1 90); do [ -n "$(pr_of "$IID_BH" 2>/dev/null)" ] && break; sleep 1; done
