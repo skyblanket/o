@@ -1233,7 +1233,7 @@ git -C "$SCRATCHV" log --oneline main | grep "o/$IID_REJ" >/dev/null && fail "re
 # is itself reviewed and may land review.pass rows of its own)
 npass="$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='review.pass' AND target='$IID_APP'")"
 nrej="$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='review.reject' AND target='$IID_REJ'")"
-[ "$npass" = "1" ] && [ "$nrej" = "3" ] || fail "review: expected 1 review.pass + 3 review.reject, got $npass + $nrej"
+[ "$npass" = "1" ] && [ "$nrej" = "3" ] || { sqlite3 "$TMP4/o.db" "SELECT attempt, state, verify_state, substr(replace(verify_output, char(10), ' '), 1, 120) FROM run WHERE issue_id='$IID_REJ' ORDER BY started_at"; sqlite3 "$TMP4/o.db" "SELECT verb FROM activity WHERE target='$IID_REJ' ORDER BY ts"; fail "review: expected 1 review.pass + 3 review.reject, got $npass + $nrej"; }
 pass "review gate: approve -> merged Done; reject x3 -> Failed red_review with reason, never merged"
 
 # ---- GitHub in/out (same daemon: review gate + gh stub) --------
