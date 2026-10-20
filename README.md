@@ -414,6 +414,8 @@ The daemon reads its configuration from the environment. All are optional.
 | `O_MERGE_GATE` | unset | `1` sends every green PR to the persistent maintainer for MERGE / CHANGES / ESCALATE. |
 | `O_MERGE_MODEL` | `claude-opus-5-5` | the maintainer's model. |
 | `O_MAINTAINER_ROTATE` | `25` | reviews per maintainer session before a fresh one primed from `NOTES.md`. |
+| `O_AGENT_ROTATE` | `10` | runs a builder's claude session serves before a fresh one (primed from its `~/.o/agents/<id>/NOTES.md`). |
+| `O_AGENT_MAX_CONTEXT` | `150000` | a builder's session is also rotated once its last run's context (input + cache tokens) exceeds this. |
 | `O_ESCALATE_PATHS` / `O_ESCALATE_LINES` | unset / `1000` | PRs touching these path prefixes, or bigger than this, always go to a human (on top of `.o-review.json` tiers). |
 | `O_GATE_TIMEOUT_S` / `O_GATE_MAX_TURNS` | `3600` / `80` | wall-clock and turn caps for one gate review, checks included. |
 | `O_PERSONAS` | unset | `1` turns on the daily persona pass (needs `O_SANDBOX=bwrap` or `O_PERSONAS_UNSANDBOXED=1`). |

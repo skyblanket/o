@@ -51,6 +51,12 @@ fun migrate(db) {
     # directory they were created in, so chat (stable ~/.o/chat/<id>)
     # cannot resume a session captured inside an issue worktree.
     _alt_cs = db_exec(db, "ALTER TABLE agent ADD COLUMN chat_session_id TEXT DEFAULT ''")
+    # The builder session's rotation state: the company it belongs to (it is
+    # never resumed for another), how many runs it has served, and the last
+    # run's context size (input tokens, cache reads included).
+    _alt_sco  = db_exec(db, "ALTER TABLE agent ADD COLUMN session_company TEXT DEFAULT ''")
+    _alt_srun = db_exec(db, "ALTER TABLE agent ADD COLUMN session_runs INTEGER DEFAULT 0")
+    _alt_stok = db_exec(db, "ALTER TABLE agent ADD COLUMN session_tokens INTEGER DEFAULT 0")
 
     # ---- self-improving loop columns (Phase 1) ----------------
     # Each errors harmlessly if the column is already present, so

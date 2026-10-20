@@ -14,9 +14,9 @@ export [next_id, companies, company_row, company_create, company_update,
         company_touch_reflect, companies_to_reflect, company_set_github, companies_with_github, company_set_maintainer, issues_in_review,
         issues_for, issue_row, issue_create, issue_create_auto, issue_create_with_origin, issue_open_fp_count, issue_import_github,
         issue_set_status, issue_assign, issue_update, open_issue_titles,
-        log_activity, activity_recent, activity_since, candidate_issues,
+        log_activity, log_activity_payload, activity_recent, activity_since, candidate_issues,
         failed_runs_for,
-        run_create, run_finish, run_set_state, run_set_verify, run_set_merge, last_run_for_issue, run_count_for_issue, runs_all, run_row,
+        run_create, run_finish, run_set_state, run_set_verify, run_set_merge, run_set_tokens, last_run_for_issue, run_count_for_issue, runs_all, run_row,
         agents_for, agent_row, agent_first_active, agent_create,
         agent_set_session, agent_set_chat_session,
         message_create, messages_for,
@@ -374,16 +374,16 @@ fun open_issue_titles(db, company_id) {
 # ---- agents ---------------------------------------------------
 
 fun agents_for(db, company_id) {
-    db_query(db, "SELECT id, company_id, name, role, department, model, runtime, repo, session_id, status, created_at FROM agent WHERE company_id = ? ORDER BY created_at ASC", [company_id])
+    db_query(db, "SELECT id, company_id, name, role, department, model, runtime, repo, session_id, session_company, session_runs, session_tokens, status, created_at FROM agent WHERE company_id = ? ORDER BY created_at ASC", [company_id])
 }
 
 fun agent_row(db, id) {
-    rows = db_query(db, "SELECT id, company_id, name, role, department, model, runtime, repo, session_id, chat_session_id, status, created_at FROM agent WHERE id = ?", [id])
+    rows = db_query(db, "SELECT id, company_id, name, role, department, model, runtime, repo, session_id, chat_session_id, session_company, session_runs, session_tokens, status, created_at FROM agent WHERE id = ?", [id])
     if (length(rows) == 0) { nil } else { hd(rows) }
 }
 
 fun agent_first_active(db, company_id) {
-    rows = db_query(db, "SELECT id, company_id, name, role, runtime, repo, session_id, status FROM agent WHERE company_id = ? AND status = 'active' ORDER BY created_at ASC LIMIT 1", [company_id])
+    rows = db_query(db, "SELECT id, company_id, name, role, runtime, repo, session_id, session_company, session_runs, session_tokens, status FROM agent WHERE company_id = ? AND status = 'active' ORDER BY created_at ASC LIMIT 1", [company_id])
     if (length(rows) == 0) { nil } else { hd(rows) }
 }
 
@@ -394,10 +394,11 @@ fun agent_create(db, company_id, name, role, runtime, model, repo) {
 }
 
 # Persist the agent's runtime session id — the durable conversation
-# thread it resumes on every issue. Written after each run completes,
-# so the agent accumulates context across all the work it does.
-fun agent_set_session(db, agent_id, session_id) {
-    _u = db_query(db, "UPDATE agent SET session_id = ? WHERE id = ?", [session_id, agent_id])
+# thread it resumes on every issue — with the company it belongs to, the runs
+# it has served and the last run's context size. Written after each run
+# completes; an empty session_id retires the session (see rotation_reason).
+fun agent_set_session(db, agent_id, session_id, company_id, runs, tokens) {
+    _u = db_query(db, "UPDATE agent SET session_id = ?, session_company = ?, session_runs = ?, session_tokens = ? WHERE id = ?", [session_id, company_id, runs, tokens, agent_id])
     agent_id
 }
 
@@ -456,6 +457,14 @@ fun run_set_merge(db, run_id, sha) {
     run_id
 }
 
+# The run's context size in tokens (input + cache reads + cache writes of its
+# last turn): the measure session rotation is judged by, kept per run so the
+# effect of rotation is visible in the run history.
+fun run_set_tokens(db, run_id, tokens) {
+    _u = db_query(db, "UPDATE run SET tokens_in = ? WHERE id = ?", [tokens, run_id])
+    run_id
+}
+
 # The latest run for an issue by start time — carries the verify verdict +
 # output the next attempt's structured-retry prompt reads. nil if none.
 fun run_count_for_issue(db, issue_id) {
@@ -469,7 +478,7 @@ fun last_run_for_issue(db, issue_id) {
 }
 
 fun runs_all(db) {
-    db_query(db, "SELECT id, issue_id, agent_id, attempt, state, workspace_path, started_at, ended_at, cost_cents, verify_state, merge_sha FROM run ORDER BY started_at DESC LIMIT 100", [])
+    db_query(db, "SELECT id, issue_id, agent_id, attempt, state, workspace_path, started_at, ended_at, cost_cents, tokens_in, verify_state, merge_sha FROM run ORDER BY started_at DESC LIMIT 100", [])
 }
 
 fun run_row(db, id) {
@@ -504,6 +513,13 @@ fun approval_set(db, id, status) {
 fun log_activity(db, company_id, actor, verb, target) {
     id = next_id("act")
     _ins = db_query(db, "INSERT INTO activity (id, company_id, actor, verb, target, ts) VALUES (?, ?, ?, ?, ?, ?)", [id, company_id, actor, verb, target, timestamp()])
+    id
+}
+
+# The same, with a payload: the reason behind an event such as agent.rotated.
+fun log_activity_payload(db, company_id, actor, verb, target, payload) {
+    id = next_id("act")
+    _ins = db_query(db, "INSERT INTO activity (id, company_id, actor, verb, target, payload, ts) VALUES (?, ?, ?, ?, ?, ?, ?)", [id, company_id, actor, verb, target, payload, timestamp()])
     id
 }
 

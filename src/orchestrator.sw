@@ -117,7 +117,8 @@ fun agent_env() {
 #   - .git/config and .git/hooks re-mounted READ-ONLY on top: both can make
 #     git run commands (hooks, core.fsmonitor, aliases), which O's own git
 #     calls on the main repo would otherwise execute outside the sandbox;
-#   - ~/.o (control-plane DB, other issues' worktrees) hidden behind a tmpfs;
+#   - ~/.o (control-plane DB, other issues' worktrees) hidden behind a tmpfs,
+#     except the agent's own memory dir (~/.o/agents/<id>), writable;
 #   - a private PID namespace, so swarmd's environment (O_API_TOKEN) is not
 #     readable through /proc.
 # Mount order matters: /tmp and O_SANDBOX_RW go first, then the repo is
@@ -139,12 +140,13 @@ fun rw_each(paths) {
     }
 }
 
-fun sandbox_prefix(ws, repo) {
+fun sandbox_prefix(ws, repo, notes) {
     if (getenv("O_SANDBOX") == "bwrap" && string_length(repo) > 0) {
         home = getenv("HOME")
         git = f"{repo}/.git"
+        memory = if (string_length(notes) > 0) { f" --bind-try {sq(notes)} {sq(notes)}" } else { "" }
         "bwrap --die-with-parent --unshare-pid --ro-bind / / --dev /dev --proc /proc --bind /tmp /tmp" ++ extra_rw_binds(getenv("O_SANDBOX_RW")) ++
-            f" --ro-bind {sq(repo)} {sq(repo)} --tmpfs {sq(home)}/.o --bind {sq(ws)} {sq(ws)}" ++
+            f" --ro-bind {sq(repo)} {sq(repo)} --tmpfs {sq(home)}/.o --bind {sq(ws)} {sq(ws)}" ++ memory ++
             f" --bind {sq(git)} {sq(git)} --ro-bind-try {sq(git)}/config {sq(git)}/config --ro-bind-try {sq(git)}/hooks {sq(git)}/hooks" ++
             f" --bind-try {sq(home)}/.claude {sq(home)}/.claude --bind-try {sq(home)}/.claude.json {sq(home)}/.claude.json -- "
     } else {
@@ -364,6 +366,8 @@ fun tick_loop(db, dbpath, port, tick_n, running, retry) {
             qc = map_size(nq)
             print(f"[orch] tick {tick_n}  running={rc}  retry={qc}")
             tick_loop(db, dbpath, port, tick_n + 1, nr, nq)
+        {'run_context', run_id, issue_id, tokens} ->
+            tick_loop(db, dbpath, port, tick_n, handle_run_context(db, running, run_id, issue_id, tokens), retry)
         {'run_done', run_id, issue_id, outcome, cost, session_id} ->
             r = handle_done(db, running, retry, run_id, issue_id, outcome, cost, session_id)
             tick_loop(db, dbpath, port, tick_n, map_get(r, "running"), map_get(r, "retry"))
@@ -694,9 +698,14 @@ fun dispatch_one(db, issue, iid, attempt, running, now) {
         repo = if (string_length(company_repo) > 0) { company_repo } else { agent_repo }
         protected = str_or(map_get(company, "protected_paths"), "")
         # The agent's durable runtime session — empty on its first ever
-        # run, then resumed on every issue after, so it accumulates context.
+        # run, then resumed on every issue after, until rotation_reason
+        # retires it. Rotation clears it, so this run starts fresh.
         rawses = map_get(agent, "session_id")
-        session_id = if (rawses == nil) { "" } else { rawses }
+        stored = if (rawses == nil) { "" } else { rawses }
+        why = rotation_reason(agent, company_id, stored)
+        _rot = if (string_length(why) > 0) { rotate_session(db, company_id, agent_id, why) } else { "" }
+        session_id = if (string_length(why) > 0) { "" } else { stored }
+        fresh = string_length(session_id) == 0
         home = getenv("HOME")
         workspace = f"{home}/.o/workspaces/{iid}"
         title = str_or(map_get(issue, "title"), "")
@@ -705,19 +714,26 @@ fun dispatch_one(db, issue, iid, attempt, running, now) {
         # reads the PREVIOUS run's verify verdict (not the one we're about to
         # insert, which would sort first by started_at).
         rebase_onto = if (string_length(repo) > 0) { company_base(company, repo) } else { "main" }
-        prompt = dispatch_prompt(db, iid, title, body, repo, protected, rebase_onto, attempt)
+        notes_dir = agent_notes_dir(agent_id)
+        _n = ensure_agent_notes(notes_dir, agent_id)
+        notes_path = f"{notes_dir}/NOTES.md"
+        notes = if (fresh) { str_or(file_read(notes_path), "") } else { "" }
+        prompt = dispatch_prompt(db, iid, title, body, repo, protected, rebase_onto, attempt) ++ memory_block(notes_path, notes)
         run_id = Store.run_create(db, iid, agent_id, attempt, "Running", workspace)
         _s = Store.issue_set_status(db, iid, "In Progress")
         _as = Store.issue_assign(db, iid, agent_id)
         _a = Store.log_activity(db, company_id, "orchestrator", "run.dispatch", iid)
         ident = map_get(issue, "identifier")
-        resumed = if (string_length(session_id) > 0) { "resume" } else { "fresh" }
+        resumed = if (fresh) { "fresh" } else { "resume" }
         model = builder_model(agent, attempt)
         print(f"[orch] dispatch {ident} via {runtime} ({resumed} session, attempt {attempt}, model {model})")
         sim_outcome = if (runtime == "sim") { decide_outcome(issue, attempt) } else { 'none' }
         start = worktree_start(company, repo)
-        wpid = spawn(run_worker(self(), run_id, iid, runtime, prompt, workspace, repo, session_id, sim_outcome, title, protected, start, model))
-        map_put(running, iid, %{run_id: run_id, worker_pid: wpid, started_at: now, attempt: attempt, company_id: company_id, agent_id: agent_id, phase: 'agent', workspace: workspace})
+        wpid = spawn(run_worker(self(), run_id, iid, runtime, prompt, workspace, repo, session_id, sim_outcome, title, protected, start, model, notes_dir))
+        # resumed + session_runs: what persist_session needs to count this run
+        # against the session it ran in, or to start its count if it made a new one.
+        runs_before = if (fresh) { 0 } else { agent_num(agent, "session_runs") }
+        map_put(running, iid, %{run_id: run_id, worker_pid: wpid, started_at: now, attempt: attempt, company_id: company_id, agent_id: agent_id, phase: 'agent', workspace: workspace, resumed: session_id, session_runs: runs_before + 1})
     }
 }
 
@@ -737,14 +753,14 @@ fun builder_model(agent, attempt) {
     }
 }
 
-fun run_worker(orch, run_id, issue_id, runtime, prompt, workspace, repo, session_id, sim_outcome, title, protected, start, model) {
+fun run_worker(orch, run_id, issue_id, runtime, prompt, workspace, repo, session_id, sim_outcome, title, protected, start, model, notes) {
     if (runtime == "sim") {
         run_sim(orch, run_id, issue_id, sim_outcome, workspace, repo, title, protected, start)
     } else {
         if (runtime == "swarm-code") {
-            run_swarm_code(orch, run_id, issue_id, prompt, workspace, repo, start)
+            run_swarm_code(orch, run_id, issue_id, prompt, workspace, repo, start, notes)
         } else {
-            run_claude_code(orch, run_id, issue_id, prompt, workspace, repo, session_id, start, model)
+            run_claude_code(orch, run_id, issue_id, prompt, workspace, repo, session_id, start, model, notes)
         }
     }
 }
@@ -758,7 +774,7 @@ fun run_worker(orch, run_id, issue_id, runtime, prompt, workspace, repo, session
 # CONTINUES across every issue it's handed. The (possibly new)
 # session id is parsed back out and returned in run_done, where the
 # orchestrator persists it onto the agent.
-fun run_claude_code(orch, run_id, issue_id, prompt, workspace, repo, session_id, start, model) {
+fun run_claude_code(orch, run_id, issue_id, prompt, workspace, repo, session_id, start, model, notes) {
     if (string_length(repo) > 0) {
         prepare_worktree(repo, workspace, issue_id, start)
     } else {
@@ -767,18 +783,18 @@ fun run_claude_code(orch, run_id, issue_id, prompt, workspace, repo, session_id,
     if (ws_missing(repo, workspace)) {
         send(orch, {'run_done', run_id, issue_id, 'crashed', 0, ""})
     } else {
-        run_claude_code_in(orch, run_id, issue_id, prompt, workspace, repo, session_id, model)
+        run_claude_code_in(orch, run_id, issue_id, prompt, workspace, repo, session_id, model, notes)
     }
 }
 
-fun run_claude_code_in(orch, run_id, issue_id, prompt, workspace, repo, session_id, model) {
+fun run_claude_code_in(orch, run_id, issue_id, prompt, workspace, repo, session_id, model, notes) {
     _w = file_write(f"{workspace}/PROMPT.txt", prompt)
     bin = claude_bin()
     resume = if (string_length(session_id) > 0) { f" --resume {session_id}" } else { "" }
     # stream-json: one JSON event per turn so the UI can watch the
     # agent work live. The final {type:"result"} event carries cost
     # and session — parse_stream_* find it after the run.
-    sbx = sandbox_prefix(workspace, repo)
+    sbx = sandbox_prefix(workspace, repo, notes)
     first = claude_once(workspace, bin, resume, sbx, model)
     # A stored session id can go stale (session pruned, CLI or machine
     # changed, or an inherited parent id — see agent_env), and `--resume`
@@ -791,6 +807,7 @@ fun run_claude_code_in(orch, run_id, issue_id, prompt, workspace, repo, session_
     code = elem(result, 0)
     cost = run_cost(code, parse_stream_cost(f"{workspace}/stream.jsonl"))
     new_session = parse_stream_session(f"{workspace}/stream.jsonl")
+    _ctx = send(orch, {'run_context', run_id, issue_id, parse_stream_context(f"{workspace}/stream.jsonl")})
     if (code == 0) {
         send(orch, {'run_done', run_id, issue_id, 'succeeded', cost, new_session})
     } else {
@@ -895,6 +912,38 @@ fun parse_stream_session(path) {
     if (s == nil) { "" } else { s }
 }
 
+# The run's context size: the input the LAST turn sent, cache reads and cache
+# writes included (a resumed session is mostly cache reads, so input_tokens
+# alone would read near zero). Read from the last assistant event, not the
+# result event, whose usage may be summed over every turn of the run.
+fun parse_stream_context(path) {
+    if (file_exists(path) == 'true') {
+        last_turn_context_rev(Std.reverse([l for l in string_split(file_read(path), "\n") when string_contains(l, "\"usage\"") == 'true']))
+    } else {
+        0
+    }
+}
+
+fun last_turn_context_rev(lines) {
+    if (length(lines) == 0) {
+        0
+    } else {
+        data = json_decode(hd(lines))
+        msg = if (data == nil) { nil } else { map_get(data, "message") }
+        usage = if (msg == nil) { nil } else { map_get(msg, "usage") }
+        if (usage == nil) {
+            last_turn_context_rev(tl(lines))
+        } else {
+            usage_count(usage, "input_tokens") + usage_count(usage, "cache_read_input_tokens") + usage_count(usage, "cache_creation_input_tokens")
+        }
+    }
+}
+
+fun usage_count(usage, key) {
+    v = map_get(usage, key)
+    if (v == nil) { 0 } else { v }
+}
+
 # swarm-code runtime — the swarmrt-native coding agent. Driven through
 # swarm-code's headless mode: the prompt is piped on stdin to
 # `swarm-code -p --json`, which runs the agent to task-completion,
@@ -905,7 +954,7 @@ fun parse_stream_session(path) {
 # swarm-code-native equivalent of the claude-code session resume. No
 # cost or session id flows back: swarm-code reports neither, and its
 # continuity is the journal, not an id O has to thread.
-fun run_swarm_code(orch, run_id, issue_id, prompt, workspace, repo, start) {
+fun run_swarm_code(orch, run_id, issue_id, prompt, workspace, repo, start, notes) {
     if (string_length(repo) > 0) {
         prepare_worktree(repo, workspace, issue_id, start)
     } else {
@@ -914,14 +963,14 @@ fun run_swarm_code(orch, run_id, issue_id, prompt, workspace, repo, start) {
     if (ws_missing(repo, workspace)) {
         send(orch, {'run_done', run_id, issue_id, 'crashed', 0, ""})
     } else {
-        run_swarm_code_in(orch, run_id, issue_id, prompt, workspace, repo)
+        run_swarm_code_in(orch, run_id, issue_id, prompt, workspace, repo, notes)
     }
 }
 
-fun run_swarm_code_in(orch, run_id, issue_id, prompt, workspace, repo) {
+fun run_swarm_code_in(orch, run_id, issue_id, prompt, workspace, repo, notes) {
     _w = file_write(f"{workspace}/PROMPT.txt", prompt)
     bin = swarm_bin()
-    cmd = f"cd {workspace} && cat PROMPT.txt | {agent_env()} SWARM_CODE_CWD={workspace} {sandbox_prefix(workspace, repo)}{bin} -p --json > result.json 2> err.log"
+    cmd = f"cd {workspace} && cat PROMPT.txt | {agent_env()} SWARM_CODE_CWD={workspace} {sandbox_prefix(workspace, repo, notes)}{bin} -p --json > result.json 2> err.log"
     # shell_managed: see run_claude_code — plain shell() caps at 120s + orphans.
     result = shell_managed(cmd, stall_timeout())
     code = elem(result, 0)
@@ -1297,15 +1346,92 @@ fun decide_outcome(issue, attempt) {
     }
 }
 
+# ---- builder session rotation ---------------------------------
+# A builder's claude session is resumed on every issue it works, so its context
+# only grows, and every resumed run re-reads all of it. It is retired (a fresh
+# session starts, primed from NOTES.md) when it has served O_AGENT_ROTATE runs,
+# when its last run's context exceeded O_AGENT_MAX_CONTEXT tokens, or when the
+# agent now works a different company: one repo's context is never carried
+# into another. Returns the reason, or "" to resume the stored session.
+fun rotation_reason(agent, company_id, stored) {
+    if (string_length(stored) == 0) {
+        ""
+    } else {
+        if (str_or(map_get(agent, "session_company"), "") != company_id) {
+            "company"
+        } else {
+            if (agent_num(agent, "session_runs") >= env_int("O_AGENT_ROTATE", 10)) {
+                "runs"
+            } else {
+                if (agent_num(agent, "session_tokens") > env_int("O_AGENT_MAX_CONTEXT", 150000)) { "context" } else { "" }
+            }
+        }
+    }
+}
+
+# Retire the agent's session before this run starts fresh, and log why.
+fun rotate_session(db, company_id, agent_id, why) {
+    _c = Store.agent_set_session(db, agent_id, "", "", 0, 0)
+    Store.log_activity_payload(db, company_id, "orchestrator", "agent.rotated", agent_id, why)
+}
+
+fun agent_num(agent, key) {
+    v = map_get(agent, key)
+    if (v == nil) { 0 } else { v }
+}
+
+# ---- builder memory: ~/.o/agents/<id>/NOTES.md ----------------
+# The builder's durable memory, kept the way the merge gate's maintainer keeps
+# its own. Rotation drops the conversation, not this file. Every prompt points
+# at it; a fresh session is also primed with its contents, since it has no
+# earlier conversation to recall them from. It lives outside the workspace,
+# so nothing in it is ever committed.
+fun agent_notes_dir(agent_id) {
+    home = getenv("HOME")
+    f"{home}/.o/agents/{agent_id}"
+}
+
+fun ensure_agent_notes(dir, agent_id) {
+    _mk = shell(f"mkdir -p {sq(dir)}")
+    if (file_exists(f"{dir}/NOTES.md") == 'false') {
+        file_write(f"{dir}/NOTES.md", "# Notes for agent " ++ agent_id ++ "\n\nDurable memory across issues: conventions, architecture, pitfalls. Short, not a diary.\n")
+    } else {
+        ""
+    }
+}
+
+fun memory_block(notes_path, notes) {
+    told = "\n\n## Your memory\nYour durable notes are at " ++ notes_path ++ ". Your conversation is reset from time to time; that file is not. Before you finish, update it with conventions, architecture and pitfalls worth knowing next time. Keep it short: a few dozen lines, not a diary."
+    if (string_length(notes) > 0) { told ++ "\n\nYour notes so far:\n" ++ notes } else { told }
+}
+
 # Persist the agent's runtime session id once a run reports one, so
 # the next issue resumes the same conversation. Runs even on a failed
 # attempt — a crashed run may still have opened a session worth keeping.
+# A run that resumed the stored session keeps counting it; one that opened
+# a new session (fresh, or a stale id replaced) starts that session at 1.
 fun persist_session(db, info, session_id) {
     if (string_length(session_id) > 0) {
-        _u = Store.agent_set_session(db, map_get(info, "agent_id"), session_id)
+        same = session_id == map_get(info, "resumed")
+        runs = if (same) { map_get(info, "session_runs") } else { 1 }
+        ctx = map_get(info, "context")
+        tokens = if (ctx == nil) { 0 } else { ctx }
+        _u = Store.agent_set_session(db, map_get(info, "agent_id"), session_id, map_get(info, "company_id"), runs, tokens)
         ""
     } else {
         ""
+    }
+}
+
+# A finished run's context size, from the worker. Kept on the run row for
+# measurement and on the running entry, for persist_session.
+fun handle_run_context(db, running, run_id, issue_id, tokens) {
+    info = map_get(running, issue_id)
+    if (info == nil) {
+        running
+    } else {
+        _t = Store.run_set_tokens(db, run_id, tokens)
+        map_put(running, issue_id, map_put(info, "context", tokens))
     }
 }
 
@@ -1673,7 +1799,7 @@ fun review_worker(orch, run_id, issue_id, ws, repo, base, title, body, vcmd) {
     bin = claude_bin()
     model = str_or(getenv("O_REVIEW_MODEL"), "sonnet")
     mflag = if (string_length(model) == 0) { "" } else { f" --model {sq(model)}" }
-    cmd = f"cd {ws} && cat REVIEW.txt | {agent_env()} {sandbox_prefix(ws, repo)}{bin} -p{mflag} --max-turns 10 --allowedTools Read,Grep,Glob --output-format json > review.json 2> review.err"
+    cmd = f"cd {ws} && cat REVIEW.txt | {agent_env()} {sandbox_prefix(ws, repo, "")}{bin} -p{mflag} --max-turns 10 --allowedTools Read,Grep,Glob --output-format json > review.json 2> review.err"
     r = shell_managed(cmd, stall_timeout())
     cost = run_cost(elem(r, 0), parse_cost(f"{ws}/review.json"))
     text = chat_reply_claude(f"{ws}/review.json")
