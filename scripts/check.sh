@@ -1559,7 +1559,7 @@ git -C "$SCRATCHS" init -q -b main
 git -C "$SCRATCHS" config user.email "o@example.com"; git -C "$SCRATCHS" config user.name "O Test"
 cp "$SCRATCH/verify.sh" "$SCRATCHS/verify.sh"; echo "sandbox project" > "$SCRATCHS/README.md"
 # a change carrying slow.txt makes its FIRST verify hang (the restart test below)
-printf '%s\n' 'if [ -f slow.txt ] && [ ! -f .slept ]; then : > .slept; sleep 120; fi' >> "$SCRATCHS/verify.sh"
+sed -i '/^exit 0$/i if [ -f slow.txt ] \&\& [ ! -f .slept ]; then : > .slept; sleep 120; fi' "$SCRATCHS/verify.sh"
 echo '{ "tiers": [ { "name": "core", "paths": ["core/"], "merge": "auto", "builder": "sonnet" } ] }' > "$SCRATCHS/.o-review.json"
 git -C "$SCRATCHS" add -A; git -C "$SCRATCHS" commit -q -m "seed sandbox project"
 cat > "$TMP5/agent-stub" <<'STUB'
