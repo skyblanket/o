@@ -422,7 +422,7 @@ fun do_tick(db, dbpath, port, tick_n, running, retry) {
     sr = map_get(swept, "running")
     sq = map_get(swept, "retry")
     cands = Store.candidate_issues(db)
-    slots = dispatch_slots(db, map_size(sr))
+    slots = dispatch_slots(db, busy_slots(sr))
     dispatch_batch(db, cands, slots, sr, sq, now)
 }
 
@@ -534,6 +534,13 @@ fun phase_timeout(phase) {
     else { if (phase == 'merge') { 1200000 }
     else { if (phase == 'ci') { ci_timeout_s() * 1000 + 120000 }
     else { if (phase == 'gate') { gate_timeout_ms() * 2 + 120000 } else { stall_timeout() + 60000 } }}}
+}
+
+# Slots are for agent work (build, verify, review). An issue waiting on
+# GitHub CI, the merge gate or a merge holds no slot, so a few slow CI runs
+# can't stall the backlog.
+fun busy_slots(running) {
+    length([k for k in map_keys(running) when Std.any(['agent', 'verify', 'review'], fn(p) { default_phase(map_get(map_get(running, k), "phase")) == p })])
 }
 
 fun default_phase(p) {
