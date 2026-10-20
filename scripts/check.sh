@@ -791,8 +791,10 @@ fi
 # ---- stage j2: CRASH RECOVERY keeps attempt counts -------------
 # The retry map is in memory. Simulate a daemon dying mid-run: stop it, plant
 # two issues stuck "In Progress" with orphaned Running runs, restart on the
-# same DB. One already spent all 3 attempts -> Failed without re-running; one
-# spent 1 -> re-dispatched as attempt 2 (not 1) and finishes Done.
+# same DB. A restart is not an attempt: one interrupted at attempt 1 is
+# re-dispatched as attempt 1 and finishes Done. One interrupted at attempt 3
+# for the second time (already Abandoned there once) has it counted ->
+# Failed without re-running, so a run that kills the daemon can't loop.
 kill "$DAEMON_PID" 2>/dev/null || true; wait "$DAEMON_PID" 2>/dev/null || true
 AG1="$(sqlite3 "$TMP/o.db" "SELECT id FROM agent WHERE company_id='$CID' LIMIT 1")"
 now_ms="$(($(date +%s) * 1000))"
@@ -803,6 +805,7 @@ INSERT INTO issue (id, company_id, identifier, title, body, status, priority, so
 INSERT INTO run (id, issue_id, agent_id, attempt, state, started_at) VALUES
   ('run_rec_a', 'iss_rec_spent', '$AG1', 1, 'Failed',  $now_ms - 3),
   ('run_rec_b', 'iss_rec_spent', '$AG1', 2, 'Failed',  $now_ms - 2),
+  ('run_rec_c0', 'iss_rec_spent', '$AG1', 3, 'Abandoned', $now_ms - 2),
   ('run_rec_c', 'iss_rec_spent', '$AG1', 3, 'Running', $now_ms - 1),
   ('run_rec_d', 'iss_rec_one',   '$AG1', 1, 'Running', $now_ms - 1);
 SQL
@@ -816,14 +819,14 @@ for _i in $(seq 1 40); do
 done
 [ -n "$up" ] || { tail -20 "$TMP/daemon.log"; fail "restarted daemon never came up"; }
 wait_status "iss_rec_spent" "Failed" 30 || fail "recovery: issue with 3 spent attempts was not Failed"
-[ "$(sqlite3 "$TMP/o.db" "SELECT COUNT(*) FROM run WHERE issue_id='iss_rec_spent'")" = "3" ] \
+[ "$(sqlite3 "$TMP/o.db" "SELECT COUNT(*) FROM run WHERE issue_id='iss_rec_spent'")" = "4" ] \
   || fail "recovery: exhausted issue was re-run after restart"
 [ "$(sqlite3 "$TMP/o.db" "SELECT state FROM run WHERE id='run_rec_c'")" = "Abandoned" ] \
   || fail "recovery: orphaned Running run not marked Abandoned"
 wait_status "iss_rec_one" "Done" 60 || { tail -20 "$TMP/daemon.log"; fail "recovery: issue with 1 spent attempt never Done"; }
-[ "$(sqlite3 "$TMP/o.db" "SELECT MIN(attempt) FROM run WHERE issue_id='iss_rec_one' AND id != 'run_rec_d'")" = "2" ] \
-  || fail "recovery: re-dispatch did not continue at attempt 2"
-pass "recovery: restart keeps attempt counts (exhausted -> Failed, partial -> attempt 2), orphan run Abandoned"
+[ "$(sqlite3 "$TMP/o.db" "SELECT MIN(attempt) FROM run WHERE issue_id='iss_rec_one' AND id != 'run_rec_d'")" = "1" ] \
+  || fail "recovery: an interrupted run should be re-dispatched at the same attempt (1)"
+pass "recovery: a restart is not an attempt (same attempt, same model); interrupted twice at the last attempt -> Failed; orphan run Abandoned"
 
 # ============================================================
 # Phase-4 stages — self-feedback loop (2nd daemon, tight breakers)
@@ -1222,7 +1225,7 @@ wait_status_at "$BASE4" "$IID_BARE" "Done" 90 || { tail -30 "$TMP4/daemon.log"; 
 git -C "$SCRATCHV" log --oneline main | grep "o/$IID_APP" >/dev/null || fail "review: approved change not merged"
 wait_status_at "$BASE4" "$IID_REJ" "Failed" 150 || { cat "$TMP4/daemon.log"; fail "review: rejected change never Failed"; }
 vs="$(sqlite3 "$TMP4/o.db" "SELECT verify_state FROM run WHERE issue_id='$IID_REJ' ORDER BY started_at DESC LIMIT 1")"
-[ "$vs" = "red_review" ] || fail "review: expected red_review, got '$vs'"
+[ "$vs" = "red_review" ] || { sqlite3 "$TMP4/o.db" "SELECT attempt,state,verify_state,started_at,substr(verify_output,1,120) FROM run WHERE issue_id='$IID_REJ' ORDER BY started_at" || true; sqlite3 "$TMP4/o.db" "SELECT ts,verb FROM activity WHERE target='$IID_REJ' ORDER BY ts" || true; fail "review: expected red_review, got '$vs'"; }
 sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_REJ' ORDER BY started_at DESC LIMIT 1" | grep "stub reviewer says" >/dev/null \
   || fail "review: rejection reason not recorded for the retry prompt"
 git -C "$SCRATCHV" log --oneline main | grep "o/$IID_REJ" >/dev/null && fail "review: rejected change was merged"
@@ -1230,7 +1233,7 @@ git -C "$SCRATCHV" log --oneline main | grep "o/$IID_REJ" >/dev/null && fail "re
 # is itself reviewed and may land review.pass rows of its own)
 npass="$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='review.pass' AND target='$IID_APP'")"
 nrej="$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='review.reject' AND target='$IID_REJ'")"
-[ "$npass" = "1" ] && [ "$nrej" = "3" ] || fail "review: expected 1 review.pass + 3 review.reject, got $npass + $nrej"
+[ "$npass" = "1" ] && [ "$nrej" = "3" ] || { sqlite3 "$TMP4/o.db" "SELECT attempt, state, verify_state, substr(replace(verify_output, char(10), ' '), 1, 120) FROM run WHERE issue_id='$IID_REJ' ORDER BY started_at"; sqlite3 "$TMP4/o.db" "SELECT verb FROM activity WHERE target='$IID_REJ' ORDER BY ts"; fail "review: expected 1 review.pass + 3 review.reject, got $npass + $nrej"; }
 pass "review gate: approve -> merged Done; reject x3 -> Failed red_review with reason, never merged"
 
 # ---- GitHub in/out (same daemon: review gate + gh stub) --------
@@ -1341,8 +1344,9 @@ restart_d4() {  # extra env assignments as args
     ./bin/swarmd >>"$TMP4/daemon.log" 2>&1 &
   DAEMON4_PID=$!
   for _i in $(seq 1 30); do
-    [ "$(ocurl -s -o /dev/null -w '%{http_code}' "$BASE4/api/health" 2>/dev/null || true)" = "200" ] && break; sleep 0.5
+    [ "$(ocurl -s -o /dev/null -w '%{http_code}' "$BASE4/api/health" 2>/dev/null || true)" = "200" ] && return 0; sleep 0.5
   done
+  tail -30 "$TMP4/daemon.log"; fail "restart_d4 ($*): the daemon never answered /api/health"
 }
 gh_issue() { jget "$(ocurl -s -X POST "$BASE4/api/companies/$CIDG/issues" -H 'Content-Type: application/json' -d "{\"title\":\"$1\"}")" 'd["id"]'; }
 pr_of() { grep -lx "o/$1" "$GHS"/pr_* | head -1 | sed 's|.*/pr_||'; }
@@ -1366,7 +1370,7 @@ grep "Decision:" "$GHS/comments_$(pr_of "$IID_GM")" >/dev/null || fail "gate: no
 wait_status_at "$BASE4" "$IID_GE" "In Review" 120 || { tail -40 "$TMP4/daemon.log"; fail "gate: ESCALATE never parked In Review"; }
 wait_status_at "$BASE4" "$IID_GS" "In Review" 120 || fail "gate: missing VERDICT did not fail closed to In Review"
 wait_status_at "$BASE4" "$IID_GX" "Failed" 180 || { tail -40 "$TMP4/daemon.log"; fail "gate: CHANGES x3 never Failed"; }
-[ "$(sqlite3 "$TMP4/o.db" "SELECT verify_state FROM run WHERE issue_id='$IID_GX' ORDER BY started_at DESC LIMIT 1")" = "red_merge_gate" ] || fail "gate: CHANGES not recorded as red_merge_gate"
+[ "$(sqlite3 "$TMP4/o.db" "SELECT verify_state FROM run WHERE issue_id='$IID_GX' ORDER BY started_at DESC LIMIT 1")" = "red_merge_gate" ] || { sqlite3 "$TMP4/o.db" "SELECT attempt,state,verify_state,started_at,substr(verify_output,1,150) FROM run WHERE issue_id='$IID_GX' ORDER BY started_at" || true; sqlite3 "$TMP4/o.db" "SELECT ts,verb,payload FROM activity WHERE target='$IID_GX' ORDER BY ts" || true; grep -v '^\[orch\] tick' "$TMP4/daemon.log" | grep -i "$IID_GX\|resume\|recover" | tail -20; fail "gate: CHANGES not recorded as red_merge_gate"; }
 sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_GX' ORDER BY started_at DESC LIMIT 1" | grep "regression test" >/dev/null || fail "gate: maintainer findings not passed to the retry"
 for i in "$IID_GE" "$IID_GX"; do git -C "$GHS/remote.git" log --oneline main | grep "o/$i" >/dev/null && fail "gate: $i was merged without a MERGE verdict"; done
 nres="$(grep -c '^resume' "$GHS/gate_calls" || true)"
@@ -1554,6 +1558,10 @@ mkdir -p "$SCRATCHS" "$TMP5/.o"
 git -C "$SCRATCHS" init -q -b main
 git -C "$SCRATCHS" config user.email "o@example.com"; git -C "$SCRATCHS" config user.name "O Test"
 cp "$SCRATCH/verify.sh" "$SCRATCHS/verify.sh"; echo "sandbox project" > "$SCRATCHS/README.md"
+# a change carrying slow.txt makes the FIRST verify of it hang, once per suite
+# (the restart test below); later verifies, and changes cut from a main that
+# carries slow.txt, never sleep
+sed -i "/^exit 0\$/i if [ -f slow.txt ] \\&\\& [ ! -f '$TMP5/slept-once' ]; then : > '$TMP5/slept-once'; : > .slept; sleep 120; fi" "$SCRATCHS/verify.sh"
 echo '{ "tiers": [ { "name": "core", "paths": ["core/"], "merge": "auto", "builder": "sonnet" } ] }' > "$SCRATCHS/.o-review.json"
 git -C "$SCRATCHS" add -A; git -C "$SCRATCHS" commit -q -m "seed sandbox project"
 cat > "$TMP5/agent-stub" <<'STUB'
@@ -1572,6 +1580,8 @@ p="$p token_procs:$n"
 echo "$p" > probes.txt
 date +%s%N > run-stamp.txt
 echo "$*" > "$SBX_ARGS"
+echo call >> "$SBX_ARGS.calls"
+if grep -q SLOWVERIFY PROMPT.txt 2>/dev/null; then echo slow > slow.txt; git add slow.txt; fi
 git add probes.txt run-stamp.txt && git commit -q -m "sandbox probes"
 printf '%s\n' '{"type":"result","total_cost_usd":0.01,"session_id":"sbx-1"}'
 STUB
@@ -1613,6 +1623,43 @@ IID_SBX2="$(jget "$(ocurl -s -X POST "$BASE5/api/companies/$CIDS/issues" -H 'Con
 wait_status_at "$BASE5" "$IID_SBX2" "Done" 90 || { tail -30 "$TMP5/daemon.log"; fail "tier builder: core issue never Done"; }
 grep -- "--model sonnet " "$TMP5/agent-args" >/dev/null || { cat "$TMP5/agent-args"; fail "tier builder: an issue naming a builder=sonnet tier's path should start on sonnet"; }
 pass "tier builder: an issue naming a tier path with builder=sonnet starts on sonnet"
+# ---- o#19: one daemon per DB; a kill -9 mid-verify resumes, not rebuilds ----
+O_DB="$TMP5/.o/o.db" HOME="$TMP5" O_PORT=$((PORT5 + 1)) O_NO_OPEN=1 ./bin/swarmd >"$TMP5/second.log" 2>&1 &
+SECOND=$!
+for _i in $(seq 1 20); do kill -0 "$SECOND" 2>/dev/null || break; sleep 0.5; done
+kill -0 "$SECOND" 2>/dev/null && { kill "$SECOND"; fail "single instance: a second daemon on the same DB kept running"; }
+grep -q "already running" "$TMP5/second.log" || { cat "$TMP5/second.log"; fail "single instance: second daemon did not say why it refused"; }
+pass "single instance: a second daemon on the same DB refuses to start, naming the holder"
+IID_SLOW="$(jget "$(ocurl -s -X POST "$BASE5/api/companies/$CIDS/issues" -H 'Content-Type: application/json' -d '{"title":"SLOWVERIFY probe"}')" 'd["id"]')"
+for _i in $(seq 1 60); do [ -f "$TMP5/.o/workspaces/$IID_SLOW/.slept" ] && break; sleep 1; done
+[ -f "$TMP5/.o/workspaces/$IID_SLOW/.slept" ] || { tail -20 "$TMP5/daemon.log"; fail "restart: slow verify never started"; }
+sleep 1
+SLOWPID="$(for d in /proc/[0-9]*; do [ "$(readlink $d/cwd 2>/dev/null)" = "$TMP5/.o/workspaces/$IID_SLOW" ] && grep -q '^sleep' $d/cmdline 2>/dev/null && echo "${d#/proc/}"; done | head -1 || true)"
+[ -n "$SLOWPID" ] || fail "restart: could not find the verify's sleep"
+calls_before="$(wc -l < "$TMP5/agent-args.calls")"
+kill -9 "$DAEMON5_PID"; wait "$DAEMON5_PID" 2>/dev/null || true
+kill -0 "$SLOWPID" 2>/dev/null || fail "restart: the verify died with the daemon (test needs it orphaned)"
+HOME="$TMP5" O_DB="$TMP5/.o/o.db" O_PORT="$PORT5" O_NO_OPEN=1 O_SANDBOX=bwrap O_API_TOKEN="$TOK" GH_TOKEN=fake-gh-token \
+  O_CLAUDE_BIN="$TMP5/agent-stub" SBX_REPO="$SCRATCHS" SBX_ARGS="$TMP5/agent-args" ./bin/swarmd >>"$TMP5/daemon.log" 2>&1 &
+DAEMON5_PID=$!
+for _i in $(seq 1 30); do [ "$(ocurl -s -o /dev/null -w '%{http_code}' "$BASE5/api/health" 2>/dev/null || true)" = "200" ] && break; sleep 0.5; done
+for _i in $(seq 1 10); do kill -0 "$SLOWPID" 2>/dev/null || break; sleep 0.5; done
+kill -0 "$SLOWPID" 2>/dev/null && { grep -v '^\[orch\] tick' "$TMP5/daemon.log" | tail -25; ps -o pid,ppid,args -p "$SLOWPID" || true; readlink "/proc/$SLOWPID/cwd" || true; fail "restart: the orphaned verify was not killed at boot"; }
+wait_status_at "$BASE5" "$IID_SLOW" "Done" 90 || { grep -v '^\[orch\] tick' "$TMP5/daemon.log" | tail -40; sqlite3 "$TMP5/.o/o.db" "SELECT attempt,state,verify_state,substr(verify_output,1,200) FROM run WHERE issue_id='$IID_SLOW' ORDER BY started_at" || true; sqlite3 "$TMP5/.o/o.db" "SELECT ts,verb,payload FROM activity WHERE target='$IID_SLOW' ORDER BY ts" || true; ps -ef | grep -v grep | grep "$TMP5" || true; fail "restart: interrupted issue never Done"; }
+[ "$(sqlite3 "$TMP5/.o/o.db" "SELECT COUNT(*) FROM activity WHERE verb='run.resume' AND target='$IID_SLOW'")" = "1" ] || fail "restart: committed work was not resumed at verify"
+[ "$(wc -l < "$TMP5/agent-args.calls")" = "$calls_before" ] || fail "restart: the agent was run again for work it had already committed"
+[ "$(sqlite3 "$TMP5/.o/o.db" "SELECT MAX(attempt) FROM run WHERE issue_id='$IID_SLOW'")" = "1" ] || fail "restart: the restart counted as an attempt"
+pass "restart: kill -9 mid-verify -> orphan killed at boot, committed work resumes at verify, same attempt, agent not re-run"
+DRAIN="$(ocurl -s -X POST "$BASE5/api/orchestrator/drain" -H 'Content-Type: application/json' -H "Authorization: Bearer $TOK" -d '{"on":true}')"
+[ "$(jget "$DRAIN" 'd["draining"]')" = "True" ] || { echo "$DRAIN"; fail "drain: POST /api/orchestrator/drain did not report draining"; }
+sc="$(ocurl -s -o /dev/null -w '%{http_code}' -X POST "$BASE5/api/orchestrator/drain" -H 'Content-Type: application/json' -d '{"on":false}')"
+[ "$sc" = "401" ] || fail "drain: un-draining without the token should be 401, got $sc"
+IID_DR="$(jget "$(ocurl -s -X POST "$BASE5/api/companies/$CIDS/issues" -H 'Content-Type: application/json' -d '{"title":"waits for the drain"}')" 'd["id"]')"
+sleep 4
+[ "$(sqlite3 "$TMP5/.o/o.db" "SELECT COUNT(*) FROM run WHERE issue_id='$IID_DR'")" = "0" ] || fail "drain: an issue was dispatched while draining"
+ocurl -s -X POST "$BASE5/api/orchestrator/drain" -H 'Content-Type: application/json' -H "Authorization: Bearer $TOK" -d '{"on":false}' >/dev/null
+wait_status_at "$BASE5" "$IID_DR" "Done" 90 || { grep -v '^\[orch\] tick' "$TMP5/daemon.log" | tail -30; sqlite3 "$TMP5/.o/o.db" "SELECT attempt,state,verify_state,substr(verify_output,1,300) FROM run WHERE issue_id='$IID_DR' ORDER BY started_at" || true; sqlite3 "$TMP5/.o/o.db" "SELECT ts,verb FROM activity WHERE target='$IID_DR' ORDER BY ts" || true; fail "drain: dispatch did not resume after un-draining"; }
+pass "drain: POST /api/orchestrator/drain (token-guarded) stops new dispatch; un-drain resumes it"
 else
   echo "SKIP: agent sandbox stage (unprivileged bwrap unavailable here)"
 fi

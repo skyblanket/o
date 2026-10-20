@@ -42,6 +42,15 @@ fun main() {
     db_env = getenv("O_DB")
     dbpath = if (db_env == nil) { f"{dir}/o.db" } else { db_env }
 
+    port0 = resolve_port()
+    holder = instance_holder(dbpath)
+    if (string_length(holder) > 0) {
+        # One daemon per DB: two orchestrators on one DB re-dispatch the same
+        # issues and fight over its rows.
+        print(f"FATAL: another O daemon (pid {holder}) is already running on {dbpath}; stop it first.")
+    } else { if (port_in_use(port0) == 'true') {
+        print(f"FATAL: port {port0} already answers /api/health; another daemon is on it. Set O_PORT or stop it.")
+    } else {
     db = db_open(dbpath)
     if (db < 0) {
         print(f"FATAL: could not open control-plane database at {dbpath}")
@@ -51,7 +60,7 @@ fun main() {
         # The port is resolved BEFORE the orchestrator starts so the tick loop
         # can hand a reflection worker the daemon's own base URL (it files
         # improvement issues back through the REST API on 127.0.0.1:{port}).
-        port = resolve_port()
+        port = port0
         Orchestrator.start(dbpath, port)
 
         http_listen(port)
@@ -67,6 +76,28 @@ fun main() {
 
         Router.serve(db, dbpath)
     }
+    }}
+}
+
+# The pid of a live O daemon holding this DB's lock file (<db>.pid), or "".
+# This process's own pid is $PPID of the shell it spawns; it takes the lock
+# when nobody live holds it.
+fun instance_holder(dbpath) {
+    me = string_trim(elem(shell("echo $PPID"), 1))
+    lock = dbpath ++ ".pid"
+    held = if (file_exists(lock) == 'true') { string_trim(file_read(lock)) } else { "" }
+    # live = that pid still has this DB open (a pid reused by another process,
+    # even another swarmd on another DB, does not count)
+    probe = "h=" ++ Orchestrator.sq(held) ++ "; case \"$h\" in ''|*[!0-9]*) exit 1 ;; esac; p=$(realpath -m " ++ Orchestrator.sq(dbpath) ++ ") && ls -l /proc/$h/fd 2>/dev/null | grep -qF -- \" $p\""
+    live = string_length(held) > 0 && held != me && elem(shell(probe), 0) == 0
+    if (live) { held } else {
+        _w = file_write(lock, me ++ "\n")
+        ""
+    }
+}
+
+fun port_in_use(port) {
+    if (elem(shell(f"curl -s -f -m 2 -o /dev/null http://127.0.0.1:{port}/api/health"), 0) == 0) { 'true' } else { 'false' }
 }
 
 # HTTP port — O_PORT env override, default 4100. Lets a second

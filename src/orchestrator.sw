@@ -359,6 +359,7 @@ fun sim_cost() { 300 }
 fun start(dbpath, port) {
     db = db_open(dbpath)
     _bt = db_exec(db, "PRAGMA busy_timeout=5000")
+    _rec = boot_recovery(db, dbpath)
     # dbpath + port are threaded into the tick loop so do_tick can spawn a
     # reflection worker its own DB connection string and the daemon's base URL.
     orch = spawn(tick_loop(db, dbpath, port, 0, %{}, %{}))
@@ -375,6 +376,61 @@ fun start(dbpath, port) {
     print(f"  orchestrator  started (tick {interval}ms, max {cap} concurrent)")
     orch
 }
+
+# ---- boot recovery (o#19) ---------------------------------------
+# Before the first tick, so nothing races it (the tick loop is the only other
+# writer): undo what a crash or a restart left behind.
+#   1. kill orphans: processes still running in this DB's workspaces or gate
+#      dirs (agents, verifies, compilers from the previous daemon)
+#   2. park PRs that were in CI or the gate: their PR is open, so the In
+#      Review poller re-adopts them instead of a rebuild
+#   3. clear a drain left on by the previous daemon
+# Interrupted builds and verifies are recovered at dispatch (same attempt;
+# committed work resumes at verify): recovered_attempt, resume_at_verify.
+fun boot_recovery(db, dbpath) {
+    home = getenv("HOME")
+    ids = [map_get(r, "id") for r in db_query(db, "SELECT id FROM issue", [])]
+    cids = [map_get(r, "id") for r in db_query(db, "SELECT id FROM company", [])]
+    roots = [f"{home}/.o/workspaces/{i}" for i in ids] ++ [f"{home}/.o/maintainer/{c}" for c in cids]
+    lst = dbpath ++ ".roots"
+    _w = file_write(lst, Std.join(roots, "\n") ++ "\n")
+    # a process whose cwd is one of those roots, or under one, is an orphan;
+    # never this daemon (the shell's $PPID) or the shell itself
+    k = shell("n=0; me=$PPID; for d in /proc/[0-9]*; do p=${d#/proc/}; [ \"$p\" = \"$me\" ] && continue; [ \"$p\" = \"$$\" ] && continue; c=$(readlink $d/cwd 2>/dev/null) || continue; while IFS= read -r r; do [ -n \"$r\" ] || continue; case \"$c/\" in \"$r\"/*) kill -9 $p 2>/dev/null && n=$((n+1)); break ;; esac; done < " ++ sq(lst) ++ "; done; echo $n")
+    killed = string_trim(elem(k, 1))
+    _o = if (killed != "0" && killed != "") { Store.log_activity(db, "", "orchestrator", "recovery.orphans_killed", killed) } else { "" }
+    _p1 = if (killed != "0" && killed != "") { print(f"[orch] recovery: killed {killed} orphaned processes from the previous daemon") } else { "" }
+    parked = park_inflight_prs(db, db_query(db, "SELECT id, company_id FROM issue WHERE status IN ('In Progress', 'Verifying')", []), 0)
+    _p2 = if (parked > 0) { print(f"[orch] recovery: parked {parked} PRs that were in CI or the gate, for re-adoption") } else { "" }
+    _d = shell(f"rm -f {sq(dbpath ++ ".drain")}")
+    ""
+}
+
+fun park_inflight_prs(db, rows, n) {
+    if (length(rows) == 0) { n } else {
+        r = hd(rows)
+        iid = map_get(r, "id")
+        lv = db_query(db, "SELECT verb FROM activity WHERE target = ? AND verb IN ('run.dispatch', 'run.resume', 'verify.start', 'review.start', 'ci.start', 'gate.start', 'pr.adopted', 'ci.fail', 'verify.fail', 'gate.reject') ORDER BY ts DESC LIMIT 1", [iid])
+        verb = if (length(lv) == 0) { "" } else { map_get(hd(lv), "verb") }
+        last = Store.last_run_for_issue(db, iid)
+        lst = if (last == nil) { "" } else { str_or(map_get(last, "state"), "") }
+        live = lst == "Running" || lst == "Verifying"
+        if (live && (verb == "ci.start" || verb == "gate.start" || verb == "pr.adopted")) {
+            _v = Store.run_set_verify(db, map_get(last, "id"), "in_review", "CI green on PR (parked by a restart; adopt into the gate)")
+            _s = Store.run_set_state(db, map_get(last, "id"), "InReview")
+            _i = Store.issue_set_status(db, iid, "In Review")
+            _a = Store.log_activity(db, map_get(r, "company_id"), "orchestrator", "recovery.parked", iid)
+            park_inflight_prs(db, tl(rows), n + 1)
+        } else {
+            park_inflight_prs(db, tl(rows), n)
+        }
+    }
+}
+
+# Drain (POST /api/orchestrator/drain): while <db>.drain exists, nothing new is
+# dispatched; in-flight runs finish. An operator drains, waits for
+# busy_slots to reach 0, then restarts without killing work.
+fun draining(dbpath) { file_exists(dbpath ++ ".drain") }
 
 fun ticker_loop(orch, interval) {
     sleep(interval)
@@ -427,7 +483,7 @@ fun tick_loop(db, dbpath, port, tick_n, running, retry) {
             _pd = handle_persona_done(db, prun_id, pcost, pcode, ptext, verdicts)
             tick_loop(db, dbpath, port, tick_n, running, retry)
         {'snapshot', from} ->
-            send(from, {'snapshot_reply', %{tick: tick_n, running: map_size(running), retrying: map_size(retry), tick_interval_ms: tick_interval(), max_concurrent: max_concurrent()}})
+            send(from, {'snapshot_reply', %{tick: tick_n, running: map_size(running), busy: busy_slots(running), retrying: map_size(retry), tick_interval_ms: tick_interval(), max_concurrent: max_concurrent(), draining: draining(dbpath)}})
             tick_loop(db, dbpath, port, tick_n, running, retry)
     }
 }
@@ -444,7 +500,7 @@ fun do_tick(db, dbpath, port, tick_n, running, retry) {
     sr = map_get(swept, "running")
     sq = map_get(swept, "retry")
     cands = Store.candidate_issues(db)
-    slots = dispatch_slots(db, busy_slots(sr))
+    slots = if (draining(dbpath) == 'true') { 0 } else { dispatch_slots(db, busy_slots(sr)) }
     dispatch_batch(db, cands, slots, sr, sq, now)
 }
 
@@ -665,7 +721,8 @@ fun dispatch_batch(db, cands, slots, running, retry, now) {
                         _a = Store.log_activity(db, cid, "orchestrator", "run.failed_final", iid)
                         dispatch_batch(db, tl(cands), slots, running, map_remove(retry, iid), now)
                     } else {
-                        running2 = dispatch_one(db, issue, iid, attempt, running, now)
+                        recovered = map_has_key(retry, iid) == 'false' && str_or(map_get(issue, "status"), "") == "Verifying"
+                        running2 = if (recovered && has_committed_work(db, issue, iid) == 'true') { resume_at_verify(db, issue, iid, attempt, running, now) } else { dispatch_one(db, issue, iid, attempt, running, now) }
                         retry2 = map_remove(retry, iid)
                         dispatch_batch(db, tl(cands), slots - 1, running2, retry2, now)
                     }
@@ -673,6 +730,32 @@ fun dispatch_batch(db, cands, slots, running, retry, now) {
             }
         }
     }
+}
+
+# A run a restart interrupted after its agent committed: the worktree and the
+# branch survive, so skip the agent and pick up at verify.
+fun has_committed_work(db, issue, iid) {
+    company = Store.company_row(db, map_get(issue, "company_id"))
+    repo = str_or(map_get(company, "repo"), "")
+    ws = getenv("HOME") ++ "/.o/workspaces/" ++ iid
+    if (string_length(repo) == 0 || file_exists(ws) == 'false') { 'false' } else {
+        base = company_base(company, repo)
+        n = string_trim(elem(shell(f"git -C {sq(ws)} rev-list --count {sq(base)}..HEAD"), 1))
+        if (n != "" && n != "0" && elem(shell(f"git -C {sq(ws)} diff --quiet {sq(base)}...HEAD"), 0) != 0) { 'true' } else { 'false' }
+    }
+}
+
+fun resume_at_verify(db, issue, iid, attempt, running, now) {
+    company_id = map_get(issue, "company_id")
+    agent = pick_agent(db, company_id, map_get(issue, "assignee_agent_id"))
+    agent_id = if (agent == nil) { "" } else { map_get(agent, "id") }
+    ws = getenv("HOME") ++ "/.o/workspaces/" ++ iid
+    run_id = Store.run_create(db, iid, agent_id, attempt, "Running", ws)
+    _a = Store.log_activity(db, company_id, "orchestrator", "run.resume", iid)
+    print(f"[orch] resume {str_or(map_get(issue, "identifier"), iid)} at verify (attempt {attempt}): its committed work survived a restart")
+    # handle_done takes it from here, exactly as if the agent had just finished
+    _s = send(self(), {'run_done', run_id, iid, 'succeeded', 0, ""})
+    map_put(running, iid, %{run_id: run_id, worker_pid: nil, started_at: now, attempt: attempt, company_id: company_id, agent_id: agent_id, phase: 'agent', workspace: ws})
 }
 
 # The attempt number for an issue that is NOT in the in-memory retry map.
@@ -689,7 +772,15 @@ fun recovered_attempt(db, issue, iid) {
         } else {
             lst = str_or(map_get(last, "state"), "")
             _ab = if (lst == "Running" || lst == "Verifying") { Store.run_set_state(db, map_get(last, "id"), "Abandoned") } else { "" }
-            Store.run_count_for_issue(db, iid) + 1
+            # A restart is not an attempt: the interrupted run's attempt (and so
+            # its model) is reused. Interrupted twice at the same attempt, it
+            # counts, so a run that keeps killing the daemon still ends.
+            at = map_get(last, "attempt")
+            if (lst == "Running" || lst == "Verifying" || lst == "Abandoned") {
+                if (Store.abandoned_at(db, iid, at) >= 2) { at + 1 } else { at }
+            } else {
+                Store.run_count_for_issue(db, iid) + 1
+            }
         }
     } else {
         1

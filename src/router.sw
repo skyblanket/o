@@ -76,6 +76,19 @@ fun approvals_required() {
 }
 
 # Ask the orchestrator process for a live scheduling snapshot.
+# POST /api/orchestrator/drain {"on": true|false}: stop (or resume) new
+# dispatch; in-flight runs finish. Token-guarded like every non-issue write.
+fun route_drain(dbpath, conn, method, body) {
+    if (method != 'POST') {
+        respond(conn, 405, err_json("POST {\"on\": true|false}"))
+    } else {
+        d = json_decode(body)
+        on = d != nil && map_get(d, "on") == 'true'
+        _f = if (on) { file_write(dbpath ++ ".drain", "") } else { shell("rm -f '" ++ dbpath ++ ".drain'") }
+        orch_snapshot(conn)
+    }
+}
+
 fun orch_snapshot(conn) {
     send(whereis('orchestrator'), {'snapshot', self()})
     receive {
@@ -181,6 +194,7 @@ fun route(db, dbpath, conn, method, path, body) {
         "/api/runs" -> respond(conn, 200, json_encode(Store.runs_all(db)))
         "/api/activity" -> respond(conn, 200, json_encode(Store.activity_recent(db)))
         "/api/orchestrator" -> orch_snapshot(conn)
+        "/api/orchestrator/drain" -> route_drain(dbpath, conn, method, body)
         "/api/fs" -> route_fs(conn, method, body)
         "/api/approvals" -> route_approvals(db, conn, method)
         "/api/companies" -> route_companies(db, conn, method, body)

@@ -473,6 +473,12 @@ fun run_set_merge(db, run_id, sha) {
 
 # The latest run for an issue by start time — carries the verify verdict +
 # output the next attempt's structured-retry prompt reads. nil if none.
+# How many of an issue's runs a restart interrupted at this attempt.
+fun abandoned_at(db, issue_id, attempt) {
+    rows = db_query(db, "SELECT COUNT(*) AS n FROM run WHERE issue_id = ? AND attempt = ? AND state = 'Abandoned'", [issue_id, attempt])
+    if (length(rows) == 0) { 0 } else { map_get(hd(rows), "n") }
+}
+
 fun run_count_for_issue(db, issue_id) {
     rows = db_query(db, "SELECT COUNT(*) AS n FROM run WHERE issue_id = ?", [issue_id])
     if (length(rows) == 0) { 0 } else { map_get(hd(rows), "n") }
