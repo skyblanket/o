@@ -1059,11 +1059,15 @@ cat > "$TMP4/claude-stub" <<'STUB'
 in="$(cat)"
 case "$in" in
   *"== Review PR #"*)
-    # merge-gate maintainer: log fresh vs resumed session, keep a session id
-    sid=""; prev=""
-    for a in "$@"; do [ "$prev" = "--resume" ] && sid="$a"; prev="$a"; done
-    if [ -n "$sid" ]; then echo "resume $sid" >> "$GHS/gate_calls"
-    else n=$(( $(cat "$GHS/gate_ctr" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$GHS/gate_ctr"; sid="maint-$n"; echo "fresh $sid" >> "$GHS/gate_calls"; fi
+    # merge-gate reviewer: one fresh session per PR (log any --resume), whether
+    # the shared notes reached the prompt, and how many reviews overlap.
+    case " $* " in *" --resume "*) echo "resume" >> "$GHS/gate_calls" ;; *) echo "fresh" >> "$GHS/gate_calls" ;; esac
+    case "$in" in *"lesson from an earlier review"*) echo seen >> "$GHS/gate_notes_seen" ;; esac
+    sid="gate-$$"
+    ( flock 9; n=$(( $(cat "$GHS/gate_inflight" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$GHS/gate_inflight"
+      [ "$n" -gt "$(cat "$GHS/gate_peak" 2>/dev/null || echo 0)" ] && echo "$n" > "$GHS/gate_peak" ) 9>"$GHS/gate.lock"
+    sleep 2
+    ( flock 9; echo $(( $(cat "$GHS/gate_inflight") - 1 )) > "$GHS/gate_inflight" ) 9>"$GHS/gate.lock"
     case "$in" in
       *"[gate:changes]"*) v="VERDICT: REJECT: add a regression test for the new path" ;;
       *"[gate:escalate]"*) v="VERDICT: UNVERIFIED: could not run the fuzzer here" ;;
@@ -1077,7 +1081,7 @@ case "$in" in
     # An interim result first, as the CLI emits when commands are still running
     # in the background: O must read the LAST result event, not this one.
     printf '{"type":"result","result":"The suite is still running in the background.","total_cost_usd":0.01,"session_id":"%s"}\n' "$sid"
-    printf '{"type":"result","result":"Reviewed in context.\\n%s","total_cost_usd":0.02,"session_id":"%s"}\n' "$v" "$sid"
+    printf '{"type":"result","result":"Reviewed in context.\\nNOTE: lesson from an earlier review: run the stub suite\\n%s","total_cost_usd":0.02,"session_id":"%s"}\n' "$v" "$sid"
     exit 0 ;;
 esac
 case "$in" in
@@ -1288,11 +1292,11 @@ git -C "$GHS/remote.git" log --oneline main | grep "o/$IID_PRO" >/dev/null && fa
 pass "pr-only: O_PR_AUTOMERGE=0 leaves a green PR open, issue In Review, nothing merged"
 
 # ---- merge gate: persistent maintainer (O_MERGE_GATE=1) ----------------
-# Restart with the gate on and a rotation every 3 reviews. The stub maintainer
+# Restart with the gate on. The stub maintainer
 # answers by title marker. MERGE -> merged into the remote; CHANGES ->
 # red_merge_gate on every attempt -> Failed; ESCALATE and a missing VERDICT
-# (fail-closed) -> In Review. Every review is posted on its PR, and the
-# session is resumed between PRs and rotated on schedule.
+# (fail-closed) -> In Review. Every review is posted on its PR; each PR gets
+# its own fresh reviewer, the reviews overlap, and NOTE lines carry over.
 restart_d4() {  # extra env assignments as args
   kill "$DAEMON4_PID" 2>/dev/null || true; wait "$DAEMON4_PID" 2>/dev/null || true
   env HOME="$TMP4" O_DB="$TMP4/o.db" O_PORT="$PORT4" O_NO_OPEN=1 O_REVIEW=1 O_CLAUDE_BIN="$TMP4/claude-stub" \
@@ -1308,7 +1312,7 @@ pr_of() { grep -lx "o/$1" "$GHS"/pr_* | head -1 | sed 's|.*/pr_||'; }
 # The PR-only PR parked above is adopted by the gate next; hold its CI so the
 # poller test below can prove an adopted PR still waits for its checks.
 echo "o/$IID_PRO" >> "$GHS/hold_ci"
-restart_d4 O_MERGE_GATE=1 O_MAINTAINER_ROTATE=3
+restart_d4 O_MERGE_GATE=1
 IID_GM="$(gh_issue '[sim:good] gate merges')"
 IID_GX="$(gh_issue '[sim:good] [gate:changes] needs work')"
 IID_GE="$(gh_issue '[sim:good] [gate:escalate] api change')"
@@ -1327,13 +1331,13 @@ wait_status_at "$BASE4" "$IID_GX" "Failed" 180 || { tail -40 "$TMP4/daemon.log";
 [ "$(sqlite3 "$TMP4/o.db" "SELECT verify_state FROM run WHERE issue_id='$IID_GX' ORDER BY started_at DESC LIMIT 1")" = "red_merge_gate" ] || fail "gate: CHANGES not recorded as red_merge_gate"
 sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_GX' ORDER BY started_at DESC LIMIT 1" | grep "regression test" >/dev/null || fail "gate: maintainer findings not passed to the retry"
 for i in "$IID_GE" "$IID_GX"; do git -C "$GHS/remote.git" log --oneline main | grep "o/$i" >/dev/null && fail "gate: $i was merged without a MERGE verdict"; done
-nfresh="$(grep -c '^fresh' "$GHS/gate_calls")"; nres="$(grep -c '^resume' "$GHS/gate_calls")"
-[ "$nres" -ge 2 ] || fail "gate: maintainer session never resumed (fresh=$nfresh resume=$nres)"
-[ "$nfresh" -ge 2 ] || fail "gate: maintainer session never rotated with O_MAINTAINER_ROTATE=3 (fresh=$nfresh resume=$nres)"
-while read -r kind sid; do
-  [ "$kind" = "resume" ] && ! grep -qx "fresh $sid" "$GHS/gate_calls" && fail "gate: resumed unknown session $sid"
-done < "$GHS/gate_calls"
-pass "gate: APPROVE merged, REJECT -> red_merge_gate -> Failed, UNVERIFIED/no-verdict -> In Review; reviews posted; session resumed ($nres) and rotated ($nfresh)"
+nres="$(grep -c '^resume' "$GHS/gate_calls" || true)"
+[ "${nres:-0}" = "0" ] || fail "gate: a review resumed a session (each PR should get a fresh one)"
+[ "$(cat "$GHS/gate_peak")" -ge 2 ] || fail "gate: reviews never overlapped (peak $(cat "$GHS/gate_peak")); they should run in parallel"
+grep "lesson from an earlier review" "$TMP4/.o/maintainer/$CIDG/NOTES.md" >/dev/null || fail "gate: a review's NOTE line was not added to the shared notes"
+[ -s "$GHS/gate_notes_seen" ] || fail "gate: later reviews did not get the shared notes in their prompt"
+pass "gate: APPROVE merged, REJECT -> red_merge_gate -> Failed, UNVERIFIED/no-verdict -> In Review; reviews posted"
+pass "gate: one fresh session per PR, reviews in parallel (peak $(cat "$GHS/gate_peak")), shared notes carried to later reviews"
 
 # ---- In Review poller --------------------------------------------------
 # With the gate now on, the PR that PR-only mode parked earlier is adopted and

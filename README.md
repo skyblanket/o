@@ -24,7 +24,7 @@ Postgres and no container: an embedded SQLite file is the whole control plane.
 | **Protected paths** | Nothing in the fence was touched, renamed or deleted. The tests that judge the agent sit behind it. |
 | **Review gate** | A second, read-only model approves the diff against the issue (`O_REVIEW=1`). |
 | **CI** | In PR mode, your repo's own checks go green on the PR (`ship: "pr"`). |
-| **Merge gate** | O builds and runs the PR merged with main and proves new tests fail without the change. Then a long-lived maintainer (Opus by default) probes it and returns APPROVE, REJECT or UNVERIFIED (`O_MERGE_GATE=1`). |
+| **Merge gate** | O builds and runs the PR merged with main and proves new tests fail without the change. Then a reviewer of its own (Opus by default, reviews in parallel, sharing the repo's notes) probes it and returns APPROVE, REJECT or UNVERIFIED (`O_MERGE_GATE=1`). |
 | **Post-merge verify** | Still green on main after the merge. If not, O auto-reverts and files a fix. |
 
 Every red verdict goes back to the agent with the actual failure output, so it
@@ -194,11 +194,12 @@ curl -s -X POST localhost:4100/api/companies -H 'Content-Type: application/json'
 - `ship: "merge"` (the default) keeps the local serialized merge, with
   post-merge verify and auto-revert.
 
-### Merge gate: a persistent maintainer that runs the code
+### Merge gate: a reviewer that runs the code
 
-With `O_MERGE_GATE=1`, a PR whose CI is green isn't merged automatically. It
-goes to one long-lived **maintainer** session per company (`O_MERGE_MODEL`,
-default `claude-opus-5-5`), and nothing merges on reading alone.
+With `O_MERGE_GATE=1`, a PR whose CI is green isn't merged automatically.
+Each PR gets its **own reviewer** (`O_MERGE_MODEL`, default `claude-opus-5-5`)
+in its own workspace, so reviews run in parallel with no queue, and nothing
+merges on reading alone.
 
 **1. O's own checks run first, with no model involved.** O makes a
 disposable clone of the PR **merged with current base**. It has no git
@@ -207,19 +208,24 @@ O runs the commands from `.o-review.json`:
 - the build
 - every new or changed test, which must pass on the PR **and fail on base
   without the change**, so a test that can't fail is a REJECT
-- the suite
+- the suite, but only when the repo names no `required_checks`: otherwise CI
+  already ran it on this same merge commit
 - the extra commands of the change's risk tier
 
 The first unexpected result is a REJECT, and the model is never asked.
 
-**2. Then the maintainer reviews, building and probing in that clone.** It
+**2. Then the reviewer probes, building and running in that clone.** It
 has Bash there, and a rubric that makes it look for reasons the change is
 wrong: kill the caller, check what runs after `fork()`, run concurrent calls,
 try another OS, look for tests that pass by default, and probe cases beyond
-the issue's list. Its session is resumed for every PR. `NOTES.md` in
-`~/.o/maintainer/<company>/` is its durable memory, and every
-`O_MAINTAINER_ROTATE` reviews (default 25) it starts a fresh session primed
-from `NOTES.md`.
+the issue's list. It is told what O and CI already ran, so it doesn't repeat
+them.
+
+**Shared context:** every review starts with the repo's shared notes,
+`~/.o/maintainer/<company>/NOTES.md`, in its prompt. A review can end with up
+to three `NOTE: <lesson>` lines (a convention, a pitfall, how to test an
+area). O, the only writer, appends them for the next reviews, deduped and
+capped.
 
 **3. The verdict is the last `VERDICT:` line.** The same protocol is used for
 the pre-PR screen.
@@ -418,9 +424,8 @@ The daemon reads its configuration from the environment. All are optional.
 | `O_CI_SETTLE_S` | `30` | how long a PR with no checks reported waits before counting as "no CI, green". |
 | `O_SANDBOX` | unset | `bwrap` confines agent + reviewer runs with bubblewrap (Linux). |
 | `O_SANDBOX_RW` | unset | extra comma-separated paths the sandbox keeps writable, if your agent CLI needs them. |
-| `O_MERGE_GATE` | unset | `1` sends every green PR to the persistent maintainer for MERGE / CHANGES / ESCALATE. |
-| `O_MERGE_MODEL` | `claude-opus-5-5` | the maintainer's model. |
-| `O_MAINTAINER_ROTATE` | `25` | reviews per maintainer session before a fresh one primed from `NOTES.md`. |
+| `O_MERGE_GATE` | unset | `1` sends every green PR to a merge-gate reviewer of its own (APPROVE / REJECT / UNVERIFIED), reviews in parallel. |
+| `O_MERGE_MODEL` | `claude-opus-5-5` | the merge-gate reviewer's model. |
 | `O_ESCALATE_PATHS` / `O_ESCALATE_LINES` | unset / `1000` | PRs touching these path prefixes, or bigger than this, always go to a human (on top of `.o-review.json` tiers). |
 | `O_GATE_TIMEOUT_S` / `O_GATE_MAX_TURNS` | `3600` / `80` | wall-clock and turn caps for one gate review, checks included. |
 | `O_PERSONAS` | unset | `1` turns on the daily persona pass (needs `O_SANDBOX=bwrap` or `O_PERSONAS_UNSANDBOXED=1`). |
