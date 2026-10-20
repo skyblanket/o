@@ -1477,6 +1477,24 @@ grep "also fails on base" "$GHS/comments_$(pr_of "$IID_XO")" >/dev/null || fail 
 wait_status_at "$BASE4" "$IID_XB" "Failed" 200 || { tail -30 "$TMP4/daemon.log"; fail "gate2: a tier check the PR breaks did not block"; }
 sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_XB' ORDER BY started_at DESC LIMIT 1" | grep "passes on base without the change" >/dev/null || fail "gate2: PR-only tier failure reason not recorded"
 pass "gate2: modified test passing on base -> note, not REJECT; tier check failing on base too -> pre-existing; failing only with the PR (twice) -> REJECT"
+
+# Gate cache: a check's result is kept by content (tree + command). XC1's merge
+# is refused (main doesn't move), so XC2 is gated on the same base and its
+# base re-judge of the pre-existing tier failure comes from the cache.
+# (wait for every other GitHub issue to settle first, auto-filed fixes too, so
+# nothing merges between the two gates)
+for _i in $(seq 1 120); do
+  [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM issue WHERE company_id='$CIDG' AND status IN ('Backlog','Todo','In Progress','Verifying')")" = "0" ] && break; sleep 1
+done
+IID_XC1="$(gh_issue '[sim:ext-ok] ext change, merge refused')"
+echo "o/$IID_XC1" >> "$GHS/block_merge"
+wait_status_at "$BASE4" "$IID_XC1" "In Review" 120 || { tail -30 "$TMP4/daemon.log"; fail "gate cache: the merge-refused PR never parked"; }
+IID_XC2="$(gh_issue '[sim:ext-ok] ext change on the same base')"
+wait_status_at "$BASE4" "$IID_XC2" "Done" 120 || { tail -30 "$TMP4/daemon.log"; fail "gate cache: the second PR never Done"; }
+grep -q "also fails on base" "$GHS/comments_$(pr_of "$IID_XC2")" || fail "gate cache: the cached base result lost the pre-existing note"
+grep -q "cached" "$GHS/comments_$(pr_of "$IID_XC2")" || fail "gate cache: a PR on the same base re-ran checks it could reuse"
+ls "$TMP4/.o/gate-cache/"*.code >/dev/null 2>&1 || fail "gate cache: nothing was stored"
+pass "gate cache: checks are kept by tree + command; a PR on the same base reuses them"
 IID_BH="$(gh_issue '[sim:good] lands after main moves')"
 echo "o/$IID_BH" >> "$GHS/hold_ci"
 for _i in $(seq 1 90); do [ -n "$(pr_of "$IID_BH" 2>/dev/null)" ] && break; sleep 1; done

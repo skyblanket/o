@@ -92,7 +92,7 @@ fun instance_holder(dbpath) {
     # nor does an orphaned child of the old daemon that inherited its handle.
     # (no `exit` in a shell() command: the runtime then waits ~2 min for it)
     probe = "h=" ++ Orchestrator.sq(held) ++ "; case \"$h\" in ''|*[!0-9]*) false ;; *) tr '\\0' ' ' < /proc/$h/cmdline 2>/dev/null | grep -q swarmd && p=$(realpath -m " ++ Orchestrator.sq(dbpath) ++ ") && ls -l /proc/$h/fd 2>/dev/null | grep -qF -- \" $p\" ;; esac"
-    live = string_length(held) > 0 && held != me && elem(shell(probe), 0) == 0
+    live = string_length(held) > 0 && held != me && elem(Orchestrator.sh(probe), 0) == 0
     if (live) { held } else {
         _w = file_write(lock, me ++ "\n")
         ""
@@ -100,7 +100,7 @@ fun instance_holder(dbpath) {
 }
 
 fun port_in_use(port) {
-    if (elem(shell(f"curl --noproxy '*' -s -f -m 2 -o /dev/null http://127.0.0.1:{port}/api/health"), 0) == 0) { 'true' } else { 'false' }
+    if (elem(Orchestrator.sh(f"curl --noproxy '*' -s -f -m 2 -o /dev/null http://127.0.0.1:{port}/api/health"), 0) == 0) { 'true' } else { 'false' }
 }
 
 # HTTP port — O_PORT env override, default 4100. Lets a second
