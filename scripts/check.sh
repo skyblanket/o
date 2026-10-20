@@ -542,6 +542,40 @@ assert "merge.done" in verbs, verbs
 PY
 pass "GET /api/activity contains verify.pass, verify.fail and merge.done"
 
+# ---- stage g2: retries stay on the same model unless the agent escalates ----
+# A verify that fails once and then passes is a flake: shipped, no retry. A
+# real failure retries on the SAME model. Only an agent that ends its run with
+# "ESCALATE:" moves the next attempt up the ladder.
+cat > "$TMP/vcount.sh" <<'SH'
+#!/bin/sh
+# vcount.sh <counter-file> <failing-calls>: fail the first N calls, then pass.
+n=$(( $(cat "$1" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$1"
+[ "$n" -le "$2" ] && { echo "planned failure $n"; exit 1; }
+exit 0
+SH
+mkco_v() {  # <name> <prefix> <verify_cmd>
+  jget "$(ocurl -s -X POST "$BASE/api/companies" -H 'Content-Type: application/json' \
+    -d "{\"name\":\"$1\",\"issue_prefix\":\"$2\",\"budget_monthly_cents\":1000000,\"repo\":\"$SCRATCH\",\"verify_cmd\":\"$3\"}")" 'd["id"]'
+}
+CFLK="$(mkco_v 'Flaky Co' FLK "sh $TMP/vcount.sh $TMP/cnt_flk 1")"
+CREAL="$(mkco_v 'Real Co' REL "sh $TMP/vcount.sh $TMP/cnt_rel 2")"
+for c in "$CFLK" "$CREAL"; do ocurl -s -X POST "$BASE/api/companies/$c/agents" -H 'Content-Type: application/json' -d '{"name":"Sim","runtime":"sim"}' >/dev/null; done
+IFLK="$(jget "$(ocurl -s -X POST "$BASE/api/companies/$CFLK/issues" -H 'Content-Type: application/json' -d '{"title":"[sim:good] flaky verify"}')" 'd["id"]')"
+IREAL="$(jget "$(ocurl -s -X POST "$BASE/api/companies/$CREAL/issues" -H 'Content-Type: application/json' -d '{"title":"[sim:good] fails for real once"}')" 'd["id"]')"
+IESC="$(mk_issue '[sim:escalate] too hard for haiku')"
+wait_status "$IFLK" "Done" 90 || { tail -30 "$TMP/daemon.log"; fail "flaky: a verify that passes on rerun should ship"; }
+[ "$(sqlite3 "$TMP/o.db" "SELECT COUNT(*) FROM run WHERE issue_id='$IFLK'")" = "1" ] || fail "flaky: a flake must not cost a retry"
+sqlite3 "$TMP/o.db" "SELECT COUNT(*) FROM activity WHERE verb='verify.flaky' AND target='$IFLK'" | grep -x 1 >/dev/null || fail "flaky: verify.flaky not logged"
+pass "flaky: fail-then-pass verify ships on the first run (verify.flaky logged, no retry)"
+wait_status "$IREAL" "Done" 120 || { tail -30 "$TMP/daemon.log"; fail "real failure: issue never recovered on retry"; }
+grep "dispatch REL-1 .*attempt 2, model haiku" "$TMP/daemon.log" >/dev/null || { grep "dispatch REL-1" "$TMP/daemon.log"; fail "real failure: the retry should stay on haiku"; }
+pass "same model: a real test failure retries on haiku with the verdict, no climb"
+wait_status "$IESC" "Done" 120 || { tail -30 "$TMP/daemon.log"; fail "escalate: issue never finished after escalating"; }
+EID="$(sqlite3 "$TMP/o.db" "SELECT identifier FROM issue WHERE id='$IESC'")"
+grep "dispatch $EID .*attempt 1, model haiku" "$TMP/daemon.log" >/dev/null && grep "dispatch $EID .*attempt 2, model sonnet" "$TMP/daemon.log" >/dev/null \
+  || { grep "dispatch $EID" "$TMP/daemon.log"; fail "escalate: ESCALATE on haiku should move the next attempt to sonnet"; }
+pass "escalate: only the agent's ESCALATE moves the next attempt up (haiku -> sonnet)"
+
 # ---- stage h: AUTO-REVERT on regression -----------------------
 # A [sim:regress] issue commits `boom` (green in the worktree because PROMPT.txt
 # sits untracked beside it) but regresses main after merge (boom without
