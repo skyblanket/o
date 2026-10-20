@@ -245,7 +245,7 @@ that judge it. Protect `.o-review.json` with `protected_paths`. (It is a root fi
     { "paths": ["tests/sw/test_"], "cmd": "./bin/swc build {file} -o /tmp/o-t && /tmp/o-t", "prove_fails": true } ],
   "required_checks": ["quickstart", "hardening-gates", "macos", "fuzz"],
   "tiers": [
-    { "name": "docs",     "paths": ["docs/", "README.md"], "merge": "auto" },
+    { "name": "docs",     "paths": ["docs/", "README.md"], "merge": "auto", "required_checks": ["quickstart"] },
     { "name": "language", "paths": ["src/swarmrt_lang.c", "lib/"], "merge": "auto", "extra": ["make test-sw"] },
     { "name": "runtime",  "paths": ["src/"], "merge": "human", "extra": ["make test-full"] } ],
   "default_merge": "human" }
@@ -254,6 +254,12 @@ that judge it. Protect `.o-review.json` with `protected_paths`. (It is a root fi
 - **CI must be green on the PR merged with current base:** every
   `required_checks` name has to have reported success, and when base moves on,
   O updates the PR branch and waits for CI again.
+- **CI by tier:** a tier can set its own `required_checks`, so a docs change
+  waits for the quick check, not a 14-minute sanitizer job. A PR needs the
+  union over the files it touches. A file in no tier, or in a tier without the
+  key, needs the top-level list.
+- **Adopted PRs wait for CI too:** a PR picked back up from In Review (for
+  example after a restart) goes through the same CI wait before the gate.
 - **One PR per issue:** when O gives up on an issue, it closes that issue's PR
   with the reason, so a superseded attempt can't be merged. The follow-up issue
   carries the `Closes #N` link.
