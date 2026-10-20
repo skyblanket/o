@@ -1344,8 +1344,9 @@ restart_d4() {  # extra env assignments as args
     ./bin/swarmd >>"$TMP4/daemon.log" 2>&1 &
   DAEMON4_PID=$!
   for _i in $(seq 1 30); do
-    [ "$(ocurl -s -o /dev/null -w '%{http_code}' "$BASE4/api/health" 2>/dev/null || true)" = "200" ] && break; sleep 0.5
+    [ "$(ocurl -s -o /dev/null -w '%{http_code}' "$BASE4/api/health" 2>/dev/null || true)" = "200" ] && return 0; sleep 0.5
   done
+  tail -30 "$TMP4/daemon.log"; fail "restart_d4 ($*): the daemon never answered /api/health"
 }
 gh_issue() { jget "$(ocurl -s -X POST "$BASE4/api/companies/$CIDG/issues" -H 'Content-Type: application/json' -d "{\"title\":\"$1\"}")" 'd["id"]'; }
 pr_of() { grep -lx "o/$1" "$GHS"/pr_* | head -1 | sed 's|.*/pr_||'; }

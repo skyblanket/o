@@ -413,7 +413,8 @@ fun park_inflight_prs(db, rows, n) {
         lv = db_query(db, "SELECT verb FROM activity WHERE target = ? AND verb IN ('run.dispatch', 'run.resume', 'verify.start', 'review.start', 'ci.start', 'gate.start', 'pr.adopted', 'ci.fail', 'verify.fail', 'gate.reject') ORDER BY ts DESC LIMIT 1", [iid])
         verb = if (length(lv) == 0) { "" } else { map_get(hd(lv), "verb") }
         last = Store.last_run_for_issue(db, iid)
-        live = last != nil && (map_get(last, "state") == "Running" || map_get(last, "state") == "Verifying")
+        lst = if (last == nil) { "" } else { str_or(map_get(last, "state"), "") }
+        live = lst == "Running" || lst == "Verifying"
         if (live && (verb == "ci.start" || verb == "gate.start" || verb == "pr.adopted")) {
             _v = Store.run_set_verify(db, map_get(last, "id"), "in_review", "CI green on PR (parked by a restart; adopt into the gate)")
             _s = Store.run_set_state(db, map_get(last, "id"), "InReview")
