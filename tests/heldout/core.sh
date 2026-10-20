@@ -155,7 +155,7 @@ FP="no-signal:$CIDD"
 DAY_MINUS1="(strftime('%s','now')*1000/86400000)-1"
 # 900/1000 spent, 0 greens, stale day -> next rollover trips the breaker
 # (threshold 1) and auto-files ONE origin=auto issue fingerprinted $FP.
-sqlite3 "$TMP/o.db" "UPDATE company SET spent_today_cents=900, greens_today=0, no_signal_days=0, status='active', pause_reason='', budget_day=$DAY_MINUS1 WHERE id='$CIDD'"
+sqlite3 -cmd ".timeout 5000" "$TMP/o.db" "UPDATE company SET spent_today_cents=900, greens_today=0, no_signal_days=0, status='active', pause_reason='', budget_day=$DAY_MINUS1 WHERE id='$CIDD'"
 
 # ---- helpers for the concurrent polls ------------------------
 wait_status() {
@@ -169,7 +169,7 @@ wait_status() {
   return 1
 }
 last_verify_state() {
-  sqlite3 "$TMP/o.db" "SELECT verify_state FROM run WHERE issue_id='$1' ORDER BY started_at DESC LIMIT 1"
+  sqlite3 -cmd ".timeout 5000" "$TMP/o.db" "SELECT verify_state FROM run WHERE issue_id='$1' ORDER BY started_at DESC LIMIT 1"
 }
 
 # ---- invariant 3: a sim issue reaches Done -------------------
@@ -206,25 +206,25 @@ fi
 # fingerprint fork-bomb hole.
 created_ok=""
 for _i in $(seq 1 25); do
-  n="$(sqlite3 "$TMP/o.db" "SELECT COUNT(*) FROM issue WHERE company_id='$CIDD' AND fingerprint='$FP' AND origin='auto'")"
-  ncr="$(sqlite3 "$TMP/o.db" "SELECT COUNT(*) FROM activity WHERE verb='selffile.created' AND target='$FP'")"
+  n="$(sqlite3 -cmd ".timeout 5000" "$TMP/o.db" "SELECT COUNT(*) FROM issue WHERE company_id='$CIDD' AND fingerprint='$FP' AND origin='auto'")"
+  ncr="$(sqlite3 -cmd ".timeout 5000" "$TMP/o.db" "SELECT COUNT(*) FROM activity WHERE verb='selffile.created' AND target='$FP'")"
   if [ "${n:-0}" = "1" ] && [ "${ncr:-0}" = "1" ]; then created_ok="1"; break; fi
   sleep 1
 done
 [ -n "$created_ok" ] || { cat "$TMP/daemon.log" || true; fail "dedup: first no-signal trip did not file exactly one $FP issue (n=${n:-?} created=${ncr:-?})"; }
 
 # re-arm: spend high again with zero greens on a stale day -> second trip
-sqlite3 "$TMP/o.db" "UPDATE company SET spent_today_cents=900, greens_today=0, budget_day=$DAY_MINUS1 WHERE id='$CIDD'"
+sqlite3 -cmd ".timeout 5000" "$TMP/o.db" "UPDATE company SET spent_today_cents=900, greens_today=0, budget_day=$DAY_MINUS1 WHERE id='$CIDD'"
 duped_ok=""
 for _i in $(seq 1 25); do
-  nd="$(sqlite3 "$TMP/o.db" "SELECT COUNT(*) FROM activity WHERE verb='selffile.duped' AND target='$FP'")"
+  nd="$(sqlite3 -cmd ".timeout 5000" "$TMP/o.db" "SELECT COUNT(*) FROM activity WHERE verb='selffile.duped' AND target='$FP'")"
   if [ "${nd:-0}" -ge 1 ]; then duped_ok="1"; break; fi
   sleep 1
 done
 [ -n "$duped_ok" ] || { cat "$TMP/daemon.log" || true; fail "dedup: selffile.duped never logged for $FP after re-trip"; }
 
 # still exactly ONE open issue carrying the fingerprint (no fork bomb)
-nopen="$(sqlite3 "$TMP/o.db" "SELECT COUNT(*) FROM issue WHERE company_id='$CIDD' AND fingerprint='$FP' AND status NOT IN ('Done','Canceled','Failed','Reverted')")"
+nopen="$(sqlite3 -cmd ".timeout 5000" "$TMP/o.db" "SELECT COUNT(*) FROM issue WHERE company_id='$CIDD' AND fingerprint='$FP' AND status NOT IN ('Done','Canceled','Failed','Reverted')")"
 [ "$nopen" = "1" ] || fail "dedup: expected exactly 1 OPEN $FP issue, got $nopen"
 pass "invariant 6: self-file dedup — re-trip yields 1 open $FP issue + selffile.duped"
 

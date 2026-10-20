@@ -1150,13 +1150,14 @@ case "$method $path" in
     sha="${path#repos/acme/widgets/commits/}"; sha="${sha%%/*}"; b="$(cat "$GHS/sha_$sha" 2>/dev/null)"
     n="$(num_for "$b")"; c=success
     listed fail_ci "$b" && c=failure
-    listed flaky_ci "$b" && [ ! -f "$GHS/rerun_$n" ] && c=failure
+    listed flaky_ci "$b" && [ ! -f "$GHS/rerun_$n" ] && [ ! -f "$GHS/updated_$n" ] && c=failure
     nm=build; listed only_lint "$b" && nm=lint
     du="https://github.com/acme/widgets/actions/runs/$n/job/1"
     ex=""; listed extra_fail "$b" && ex=",{\"name\":\"macos\",\"status\":\"completed\",\"conclusion\":\"failure\",\"details_url\":\"$du\"}"
     if listed hold_ci "$b"; then echo "{\"check_runs\":[{\"name\":\"$nm\",\"status\":\"in_progress\",\"conclusion\":null,\"details_url\":\"$du\"}]}"
     else echo "{\"check_runs\":[{\"name\":\"$nm\",\"status\":\"completed\",\"conclusion\":\"$c\",\"details_url\":\"$du\"}$ex]}"; fi ;;
   "POST repos/acme/widgets/actions/runs/"*/rerun-failed-jobs)
+    [ -f "$GHS/no_actions" ] && { echo '{"message":"Resource not accessible by integration"}'; echo "gh: HTTP 403" >&2; exit 1; }
     n="${path#repos/acme/widgets/actions/runs/}"; n="${n%/rerun-failed-jobs}"; echo x >> "$GHS/rerun_$n"; echo '{}' ;;
   "GET repos/acme/widgets/commits/"*/status) echo '{"state":"success","statuses":[]}' ;;
   "POST repos/acme/widgets/issues/"*/comments)
@@ -1300,6 +1301,8 @@ for _i in $(seq 1 30); do
 done
 IID_PRO="$(jget "$(ocurl -s -X POST "$BASE4/api/companies/$CIDG/issues" -H 'Content-Type: application/json' -d '{"title":"[sim:good] pr-only"}')" 'd["id"]')"
 wait_status_at "$BASE4" "$IID_PRO" "In Review" 90 || { tail -30 "$TMP4/daemon.log"; fail "pr-only: green PR never parked In Review"; }
+IID_PRF="$(jget "$(ocurl -s -X POST "$BASE4/api/companies/$CIDG/issues" -H 'Content-Type: application/json' -d '{"title":"[sim:good] pr-only, CI fails once adopted"}')" 'd["id"]')"
+wait_status_at "$BASE4" "$IID_PRF" "In Review" 90 || { tail -30 "$TMP4/daemon.log"; fail "pr-only: second green PR never parked In Review"; }
 git -C "$GHS/remote.git" log --oneline main | grep "o/$IID_PRO" >/dev/null && fail "pr-only: PR was merged with O_PR_AUTOMERGE=0"
 pass "pr-only: O_PR_AUTOMERGE=0 leaves a green PR open, issue In Review, nothing merged"
 
@@ -1324,6 +1327,7 @@ pr_of() { grep -lx "o/$1" "$GHS"/pr_* | head -1 | sed 's|.*/pr_||'; }
 # The PR-only PR parked above is adopted by the gate next; hold its CI so the
 # poller test below can prove an adopted PR still waits for its checks.
 echo "o/$IID_PRO" >> "$GHS/hold_ci"
+echo "o/$IID_PRF" >> "$GHS/fail_ci"
 restart_d4 O_MERGE_GATE=1
 IID_GM="$(gh_issue '[sim:good] gate merges')"
 IID_GX="$(gh_issue '[sim:good] [gate:changes] needs work')"
@@ -1362,6 +1366,9 @@ git -C "$GHS/remote.git" log --oneline main | grep "o/$IID_PRO" >/dev/null && fa
 [ "$(sqlite3 "$TMP4/o.db" "SELECT status FROM issue WHERE id='$IID_PRO'")" != "Done" ] || fail "poller: adopted PR marked Done before CI finished"
 sed -i "\|o/$IID_PRO|d" "$GHS/hold_ci"
 wait_status_at "$BASE4" "$IID_PRO" "Done" 90 || { tail -30 "$TMP4/daemon.log"; fail "poller: PR-only parked PR was not adopted by the gate"; }
+wait_status_at "$BASE4" "$IID_PRF" "Failed" 200 || { tail -30 "$TMP4/daemon.log"; fail "poller: an adopted PR whose CI fails stayed In Review instead of going back to its builder"; }
+[ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='run.dispatch' AND target='$IID_PRF'")" -ge 2 ] || fail "poller: no builder retry after the adopted PR's CI failed"
+pass "poller: an adopted PR whose CI fails goes back to its builder (not stuck In Review)"
 git -C "$GHS/remote.git" log --oneline main | grep "o/$IID_PRO" >/dev/null || fail "poller: adopted PR not merged"
 [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='pr.adopted' AND target='$IID_PRO'")" = "1" ] || fail "poller: pr.adopted not logged once"
 [ "$(sqlite3 "$TMP4/o.db" "SELECT status FROM issue WHERE id='$IID_BLK'")" = "In Review" ] || fail "poller: a refused merge left In Review"
@@ -1439,6 +1446,22 @@ wait_status_at "$BASE4" "$IID_FLK" "Done" 120 || { tail -30 "$TMP4/daemon.log"; 
 [ -f "$GHS/rerun_$(pr_of "$IID_FLK")" ] || fail "ci rerun: failed jobs were not re-run"
 [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM run WHERE issue_id='$IID_FLK' AND verify_state = 'red_ci'")" = "0" ] || fail "ci rerun: a flaky check was blamed on the change"
 pass "ci rerun: a failed check is re-run once; passing on re-run merges with no builder retry"
+# A token without Actions write can't re-run jobs (403). A PR behind base is
+# updated instead, which runs CI again with base's fixes.
+touch "$GHS/no_actions"
+IID_FL2="$(gh_issue '[sim:good] ci flakes, no rerun permission')"
+echo "o/$IID_FL2" >> "$GHS/flaky_ci"; echo "o/$IID_FL2" >> "$GHS/hold_ci"
+for _i in $(seq 1 60); do [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='ci.start' AND target='$IID_FL2'")" -ge 1 ] && break; sleep 1; done
+tmpf="$(mktemp -d)"; git clone -q "$GHS/remote.git" "$tmpf/c"
+echo fix > "$tmpf/c/base-fix.txt"; git -C "$tmpf/c" add base-fix.txt
+git -C "$tmpf/c" -c user.email=h@x -c user.name=human commit -q -m "base moves on"
+for _i in 1 2 3 4 5; do git -C "$tmpf/c" push -q origin main 2>/dev/null && break; git -C "$tmpf/c" -c user.email=h@x -c user.name=human pull -q --rebase origin main; done
+sed -i "\|o/$IID_FL2|d" "$GHS/hold_ci"
+wait_status_at "$BASE4" "$IID_FL2" "Done" 120 || { tail -30 "$TMP4/daemon.log"; fail "ci rerun: with no Actions permission, a PR behind base should be updated and re-checked"; }
+[ -f "$GHS/updated_$(pr_of "$IID_FL2")" ] || fail "ci rerun: the PR behind base was not updated"
+[ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM run WHERE issue_id='$IID_FL2' AND verify_state = 'red_ci'")" = "0" ] || fail "ci rerun: the flaky check was blamed on the change"
+rm -f "$GHS/no_actions"
+pass "ci rerun: no rerun permission (403) -> a PR behind base is updated and its CI runs again"
 restart_d4 O_MERGE_GATE=1 O_MAX_CONCURRENT=1
 IID_SL1="$(gh_issue '[sim:good] waits on slow CI')"
 echo "o/$IID_SL1" >> "$GHS/hold_ci"
