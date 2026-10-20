@@ -1153,8 +1153,9 @@ case "$method $path" in
     listed flaky_ci "$b" && [ ! -f "$GHS/rerun_$n" ] && c=failure
     nm=build; listed only_lint "$b" && nm=lint
     du="https://github.com/acme/widgets/actions/runs/$n/job/1"
+    ex=""; listed extra_fail "$b" && ex=",{\"name\":\"macos\",\"status\":\"completed\",\"conclusion\":\"failure\",\"details_url\":\"$du\"}"
     if listed hold_ci "$b"; then echo "{\"check_runs\":[{\"name\":\"$nm\",\"status\":\"in_progress\",\"conclusion\":null,\"details_url\":\"$du\"}]}"
-    else echo "{\"check_runs\":[{\"name\":\"$nm\",\"status\":\"completed\",\"conclusion\":\"$c\",\"details_url\":\"$du\"}]}"; fi ;;
+    else echo "{\"check_runs\":[{\"name\":\"$nm\",\"status\":\"completed\",\"conclusion\":\"$c\",\"details_url\":\"$du\"}$ex]}"; fi ;;
   "POST repos/acme/widgets/actions/runs/"*/rerun-failed-jobs)
     n="${path#repos/acme/widgets/actions/runs/}"; n="${n%/rerun-failed-jobs}"; echo x >> "$GHS/rerun_$n"; echo '{}' ;;
   "GET repos/acme/widgets/commits/"*/status) echo '{"state":"success","statuses":[]}' ;;
@@ -1429,14 +1430,24 @@ git -C "$GHS/remote.git" log --oneline main | grep "o/$IID_RC" >/dev/null && fai
 pass "required: a PR whose required check never passes is never merged (red_timeout)"
 IID_DOC="$(gh_issue '[sim:docs] docs-only change')"
 echo "o/$IID_DOC" >> "$GHS/only_lint"
+echo "o/$IID_DOC" >> "$GHS/extra_fail"
 wait_status_at "$BASE4" "$IID_DOC" "Done" 120 || { tail -30 "$TMP4/daemon.log"; fail "tiered CI: a docs-only PR should merge on its tier's own required check (lint)"; }
-pass "tiered CI: a docs-only PR needs only its tier's required checks (lint, not build)"
+pass "tiered CI: a docs-only PR needs only its tier's required checks (lint, not build; a failing macos it doesn't need is ignored)"
 IID_FLK="$(gh_issue '[sim:good] ci flakes once')"
 echo "o/$IID_FLK" >> "$GHS/flaky_ci"
 wait_status_at "$BASE4" "$IID_FLK" "Done" 120 || { tail -30 "$TMP4/daemon.log"; fail "ci rerun: a check that passes on re-run should merge"; }
 [ -f "$GHS/rerun_$(pr_of "$IID_FLK")" ] || fail "ci rerun: failed jobs were not re-run"
 [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM run WHERE issue_id='$IID_FLK' AND verify_state = 'red_ci'")" = "0" ] || fail "ci rerun: a flaky check was blamed on the change"
 pass "ci rerun: a failed check is re-run once; passing on re-run merges with no builder retry"
+restart_d4 O_MERGE_GATE=1 O_MAX_CONCURRENT=1
+IID_SL1="$(gh_issue '[sim:good] waits on slow CI')"
+echo "o/$IID_SL1" >> "$GHS/hold_ci"
+for _i in $(seq 1 60); do [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='ci.start' AND target='$IID_SL1'")" -ge 1 ] && break; sleep 1; done
+IID_SL2="$(gh_issue '[sim:good] dispatched while the other waits on CI')"
+wait_status_at "$BASE4" "$IID_SL2" "Done" 120 || { tail -30 "$TMP4/daemon.log"; fail "slots: a PR waiting on CI held the only agent slot"; }
+sed -i "\|o/$IID_SL1|d" "$GHS/hold_ci"
+wait_status_at "$BASE4" "$IID_SL1" "Done" 120 || { tail -30 "$TMP4/daemon.log"; fail "slots: the held PR never merged after its CI finished"; }
+pass "slots: a PR waiting on CI holds no agent slot (O_MAX_CONCURRENT=1, a second issue ships meanwhile)"
 
 # ============================================================
 # Agent sandbox — 5th daemon, O_SANDBOX=bwrap + O_API_TOKEN
