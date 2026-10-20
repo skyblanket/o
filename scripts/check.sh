@@ -32,6 +32,24 @@ TMP5=""
 DAEMON6_PID=""
 TMP6=""
 
+# O_KEEP_TMP=1 keeps every daemon's dir (DBs, logs, workspaces) for a post-mortem
+rmtmp() { if [ -n "${O_KEEP_TMP:-}" ]; then echo "kept: $1" >&2; else rm -rf "$1" 2>/dev/null || true; fi; }
+# A random port in [base, base+span) that nothing listens on (parallel suites
+# would otherwise collide, and the daemon refuses a port that answers).
+free_port() {
+  for _i in $(seq 1 50); do
+    p=$(($1 + RANDOM % $2))
+    (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null || { echo "$p"; return 0; }
+  done
+  echo $(($1 + RANDOM % $2))
+}
+# One daemon per DB (o#19): before a restart the old one must be gone, not just
+# signalled, or the new one rightly refuses to start.
+stop_daemon() {
+  kill "$1" 2>/dev/null || true; wait "$1" 2>/dev/null || true
+  for _i in $(seq 1 40); do kill -0 "$1" 2>/dev/null || return 0; sleep 0.25; done
+  kill -9 "$1" 2>/dev/null || true
+}
 cleanup() {
   if [ -n "$DAEMON_PID" ]; then
     kill "$DAEMON_PID" 2>/dev/null || true
@@ -46,10 +64,10 @@ cleanup() {
     wait "$DAEMON3_PID" 2>/dev/null || true
   fi
   if [ -n "$TMP" ]; then
-    rm -rf "$TMP" 2>/dev/null || true
+    rmtmp "$TMP"
   fi
   if [ -n "$TMP2" ]; then
-    rm -rf "$TMP2" 2>/dev/null || true
+    rmtmp "$TMP2"
   fi
   if [ -n "$DAEMON4_PID" ]; then
     kill "$DAEMON4_PID" 2>/dev/null || true
@@ -60,20 +78,20 @@ cleanup() {
     wait "$DAEMON5_PID" 2>/dev/null || true
   fi
   if [ -n "$TMP5" ]; then
-    rm -rf "$TMP5" 2>/dev/null || true
+    rmtmp "$TMP5"
   fi
   if [ -n "$DAEMON6_PID" ]; then
     kill "$DAEMON6_PID" 2>/dev/null || true
     wait "$DAEMON6_PID" 2>/dev/null || true
   fi
   if [ -n "$TMP6" ]; then
-    rm -rf "$TMP6" 2>/dev/null || true
+    rmtmp "$TMP6"
   fi
   if [ -n "$TMP4" ]; then
-    rm -rf "$TMP4" 2>/dev/null || true
+    rmtmp "$TMP4"
   fi
   if [ -n "$TMP3" ]; then
-    rm -rf "$TMP3" 2>/dev/null || true
+    rmtmp "$TMP3"
   fi
 }
 trap cleanup EXIT
@@ -114,7 +132,7 @@ fi
 
 # ---- stage b: boot daemon on temp DB + random port ----------
 TMP="$(mktemp -d)"
-PORT=$((4200 + RANDOM % 400))
+PORT="$(free_port 4200 400)"
 BASE="http://127.0.0.1:${PORT}"
 
 # HOME is redirected into $TMP so the daemon's per-issue git worktrees
@@ -795,7 +813,7 @@ fi
 # re-dispatched as attempt 1 and finishes Done. One interrupted at attempt 3
 # for the second time (already Abandoned there once) has it counted ->
 # Failed without re-running, so a run that kills the daemon can't loop.
-kill "$DAEMON_PID" 2>/dev/null || true; wait "$DAEMON_PID" 2>/dev/null || true
+stop_daemon "$DAEMON_PID"
 AG1="$(sqlite3 "$TMP/o.db" "SELECT id FROM agent WHERE company_id='$CID' LIMIT 1")"
 now_ms="$(($(date +%s) * 1000))"
 sqlite3 "$TMP/o.db" <<SQL
@@ -834,7 +852,7 @@ pass "recovery: a restart is not an attempt (same attempt, same model); interrup
 # A second daemon with O_SELF_FILE_CAP=2 + O_NO_SIGNAL_DAYS=2 so the auto-file
 # daily cap and the no-signal breaker fire quickly and observably.
 TMP2="$(mktemp -d)"
-PORT2=$((4650 + RANDOM % 300))
+PORT2="$(free_port 4650 300)"
 BASE2="http://127.0.0.1:${PORT2}"
 HOME="$TMP2" O_DB="$TMP2/o.db" O_PORT="$PORT2" O_NO_OPEN=1 O_SELF_FILE_CAP=2 O_NO_SIGNAL_DAYS=2 \
   ./bin/swarmd >"$TMP2/daemon.log" 2>&1 &
@@ -981,7 +999,7 @@ pass "no-signal: 2nd rollover paused company (pause_reason=no-signal), diagnosti
 # company has a repo + verify_cmd but NO agent — so dispatch skips it and the
 # stage stays deterministic (nothing consumes the reflect-filed Backlog issue).
 TMP3="$(mktemp -d)"
-PORT3=$((4980 + RANDOM % 300))
+PORT3="$(free_port 4980 300)"
 BASE3="http://127.0.0.1:${PORT3}"
 
 # The stub stands in for `claude -p`. It scrapes the /issues endpoint out of
@@ -1074,7 +1092,7 @@ pass "reflect: at-most-once per day (single reflect.spawn after extra ticks)"
 # reviewer alone decides: approve -> merged Done; reject -> red_review on every
 # attempt -> Failed, with the reviewer's reason recorded as the verify tail.
 TMP4="$(mktemp -d)"
-PORT4=$((5300 + RANDOM % 300))
+PORT4="$(free_port 5300 300)"
 BASE4="http://127.0.0.1:${PORT4}"
 cat > "$TMP4/claude-stub" <<'STUB'
 #!/bin/sh
@@ -1140,7 +1158,8 @@ case "$method $path" in
   "GET repos/acme/widgets/issues?"*) cat "$GHS/issues.json" ;;
   "GET repos/acme/widgets/pulls?head="*)
     b="${path#*head=acme:}"; b="${b%%&*}"; n="$(num_for "$b")"
-    if [ -n "$n" ]; then echo "[{\"number\":$n}]"; else echo "[]"; fi ;;
+    ma=""; [ -n "$n" ] && [ -f "$GHS/merged_$n" ] && ma=',"merged_at":"2026-01-01T00:00:00Z"'
+    if [ -n "$n" ]; then echo "[{\"number\":$n$ma}]"; else echo "[]"; fi ;;
   "POST repos/acme/widgets/pulls")
     n=$(( $(ls "$GHS" | grep -c '^pr_') + 1 )); echo "$head" > "$GHS/pr_$n"
     cp "$bodyf" "$GHS/body_$(printf '%s' "$head" | tr '/' '_')"
@@ -1316,7 +1335,7 @@ sleep 6
 pass "github: merge refused by branch policy -> parked In Review, not re-dispatched"
 # PR-only mode: restart the same daemon with O_PR_AUTOMERGE=0; a green PR must
 # park In Review with nothing merged into the remote.
-kill "$DAEMON4_PID" 2>/dev/null || true; wait "$DAEMON4_PID" 2>/dev/null || true
+stop_daemon "$DAEMON4_PID"
 HOME="$TMP4" O_DB="$TMP4/o.db" O_PORT="$PORT4" O_NO_OPEN=1 O_REVIEW=1 O_CLAUDE_BIN="$TMP4/claude-stub" \
   O_GH_BIN="$TMP4/gh-stub" GHS="$GHS" O_GH_POLL_S=2 O_CI_POLL_S=1 O_CI_SETTLE_S=0 O_PR_AUTOMERGE=0 \
   ./bin/swarmd >>"$TMP4/daemon.log" 2>&1 &
@@ -1338,7 +1357,7 @@ pass "pr-only: O_PR_AUTOMERGE=0 leaves a green PR open, issue In Review, nothing
 # (fail-closed) -> In Review. Every review is posted on its PR; each PR gets
 # its own fresh reviewer, the reviews overlap, and NOTE lines carry over.
 restart_d4() {  # extra env assignments as args
-  kill "$DAEMON4_PID" 2>/dev/null || true; wait "$DAEMON4_PID" 2>/dev/null || true
+  stop_daemon "$DAEMON4_PID"
   env HOME="$TMP4" O_DB="$TMP4/o.db" O_PORT="$PORT4" O_NO_OPEN=1 O_REVIEW=1 O_CLAUDE_BIN="$TMP4/claude-stub" \
     O_GH_BIN="$TMP4/gh-stub" GHS="$GHS" O_GH_POLL_S=2 O_CI_POLL_S=1 O_CI_SETTLE_S=0 "$@" \
     ./bin/swarmd >>"$TMP4/daemon.log" 2>&1 &
@@ -1539,6 +1558,34 @@ git -C "$GHS/remote.git" log --oneline main | grep "o/$IID_EXT" >/dev/null && fa
 sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_EXT' ORDER BY started_at DESC LIMIT 1" | grep "PR-only" >/dev/null || fail "pr-only owners: reason not recorded"
 pass "pr-only owners: a repo outside O_AUTOMERGE_OWNERS gets gated PRs, never merges"
 
+# Self-checks (o#42), every O_SELF_CHECK_S and on the first tick:
+#   a PR a human merged while its issue sat Failed -> Done
+#   In Review with a red latest run -> Backlog
+#   a worktree whose git link is gone -> removed (dispatch recreates it)
+# and a builder's NEEDS_HUMAN ask is posted on the GitHub issue.
+ncif="$(pr_of "$IID_CIF")"; [ -n "$ncif" ] || fail "self-check: no PR for the red-CI issue"
+touch "$GHS/merged_$ncif"
+sqlite3 "$TMP4/o.db" "UPDATE issue SET status='In Review' WHERE id='$IID_NF'"
+WS_EXT="$TMP4/.o/workspaces/$IID_EXT"
+mkdir -p "$WS_EXT"; echo "gitdir: $TMP4/nowhere" > "$WS_EXT/.git"
+echo '[{"number":901,"title":"[sim:needs-human] from github, touches a protected path","body":"x"}]' > "$GHS/issues.json"
+restart_d4 O_MERGE_GATE=1 O_AUTO_FILE=0 O_SELF_CHECK_S=2
+wait_status_at "$BASE4" "$IID_CIF" "Done" 30 || { grep -v '^\[orch\] tick' "$TMP4/daemon.log" | tail -20; fail "self-check: a Failed issue whose PR a human merged never Done"; }
+[ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='selfcheck.unstranded' AND target='$IID_NF'")" -ge 1 ] || fail "self-check: In Review with a red latest run was not moved to Backlog"
+[ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='selfcheck.worktree_repaired' AND target='$IID_EXT'")" = "1" ] || fail "self-check: a broken worktree was not repaired"
+[ -e "$WS_EXT" ] && fail "self-check: the broken worktree is still there"
+for _i in $(seq 1 60); do grep -q "O needs a human" "$GHS/comments_901" 2>/dev/null && break; sleep 1; done
+grep -q "O needs a human" "$GHS/comments_901" 2>/dev/null || { grep -v '^\[orch\] tick' "$TMP4/daemon.log" | tail -20; fail "needs-human: the ask was not posted on GitHub issue #901"; }
+pass "self-check: merged-while-Failed -> Done, stranded In Review -> Backlog, broken worktree repaired; NEEDS_HUMAN posted on the GitHub issue"
+echo '[]' > "$GHS/issues.json"
+
+# Daily cap: said once a day, not every tick
+restart_d4 O_MERGE_GATE=1 O_AUTO_FILE=0 O_GLOBAL_DAILY_CENTS=1
+sleep 4
+ncap="$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='budget.capped'")"
+[ "$ncap" = "1" ] || fail "budget: expected budget.capped logged once, got $ncap"
+pass "budget: the global daily cap logs budget.capped once, not every tick"
+
 # ============================================================
 # Agent sandbox — 5th daemon, O_SANDBOX=bwrap + O_API_TOKEN
 # ============================================================
@@ -1550,7 +1597,7 @@ pass "pr-only owners: a repo outside O_AUTOMERGE_OWNERS gets gated PRs, never me
 # Skipped (with a note) where unprivileged bwrap can't run.
 if command -v bwrap >/dev/null 2>&1 && bwrap --ro-bind / / --unshare-pid --proc /proc true 2>/dev/null; then
 TMP5="$(mktemp -d)"
-PORT5=$((5650 + RANDOM % 300))
+PORT5="$(free_port 5650 300)"
 BASE5="http://127.0.0.1:${PORT5}"
 TOK="sbx-test-token"
 SCRATCHS="$TMP5/projs"
@@ -1672,7 +1719,7 @@ fi
 # answers RESULT: FIXED unless the scenario title says "still". Unsandboxed by
 # explicit opt-in so the stage runs where bwrap doesn't.
 TMP6="$(mktemp -d)"
-PORT6=$((5950 + RANDOM % 200))
+PORT6="$(free_port 5950 200)"
 BASE6="http://127.0.0.1:${PORT6}"
 cat > "$TMP6/claude-stub" <<'STUB'
 #!/usr/bin/env bash
