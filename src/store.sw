@@ -431,6 +431,18 @@ fun run_create(db, issue_id, agent_id, attempt, state, workspace_path) {
     id
 }
 
+# Add a later stage's cost (review, merge gate) to the run, on top of the
+# builder's cost that run_finish stored.
+fun run_add_cost(db, run_id, cost_cents) {
+    db_query(db, "UPDATE run SET cost_cents = cost_cents + CAST(ROUND(?) AS INTEGER) WHERE id = ?", [cost_cents, run_id])
+}
+
+# Everything an issue's runs have cost, in cents.
+fun issue_cost(db, iid) {
+    rows = db_query(db, "SELECT COALESCE(SUM(cost_cents), 0) AS c FROM run WHERE issue_id = ?", [iid])
+    if (length(rows) == 0) { 0 } else { map_get(hd(rows), "c") }
+}
+
 fun run_finish(db, run_id, state, cost_cents) {
     _u = db_query(db, "UPDATE run SET state = ?, ended_at = ?, cost_cents = CAST(ROUND(?) AS INTEGER) WHERE id = ?", [state, timestamp(), cost_cents, run_id])
     run_id

@@ -137,7 +137,8 @@ O edits real repositories on its own. The guard rails are the point.
 - **Protected paths.** Each company declares `protected_paths`. An agent may not
   change them; a commit that does is rejected (`red_protected`) before it can
   merge. Renames count as touching both paths, and the agent's prompt lists the
-  fence. A builder whose task needs a protected file commits nothing and ends
+  fence. Agents get no GitHub token, and every `git push` from inside a run is
+  rewritten to an unusable URL: only O pushes, after verify and review. A builder whose task needs a protected file commits nothing and ends
   with `NEEDS_HUMAN: <the change>`: the issue parks In Review with that ask
   (`run.needs_human`) instead of burning its attempts. The test harness and this loop's own invariants live behind it, so an
   agent maintaining O cannot edit the checks that gate its merges.
@@ -272,6 +273,14 @@ that judge it. Protect `.o-review.json` with `protected_paths`. (It is a root fi
   key, needs the top-level list.
   Only the required checks decide: other jobs on the PR are neither waited
   for nor blamed.
+- **Gate model by tier:** a tier may name a lighter `gate_model` (e.g.
+  `"sonnet"` for docs). A PR gets it only when every file it touches is in a
+  tier that names one (the strongest of them); otherwise `O_MERGE_MODEL`.
+- **Parked PRs stay mergeable:** when an approved PR waiting on a human starts
+  conflicting with base, O hands it back to its builder for a rebase (once per
+  head commit), and it comes back for sign-off.
+- **No empty changes:** a branch whose commits net out to nothing is
+  `red_no_commit` at verify, and an empty PR is rejected without a model.
 - **A failed CI job is re-run once** (per head commit) before the change is
   blamed. Runner and mirror hiccups pass on the re-run; a failure that repeats
   goes back to the builder as `red_ci`. `O_CI_RERUN=0` turns it off.

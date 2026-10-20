@@ -104,8 +104,17 @@ fun swarm_bin() {
 #     inside a Claude Code session, the child `claude -p` inherits that
 #     session's id and reports it as its own; O then stores it and every later
 #     `--resume` fails ("No conversation found"). Scrub so agents get their own.
+# Agents never push or call GitHub: O does that itself (start_ci) after
+# verify and review. Their env loses the GitHub tokens, and two extra git
+# config entries (GIT_CONFIG_COUNT/KEY_n, appended after any the host set)
+# rewrite every https/ssh push URL to an unusable scheme, so a stray
+# `git push` from an agent fails instead of landing unreviewed code.
 fun agent_env() {
-    "env -u O_API_TOKEN -u CLAUDECODE -u CLAUDE_CODE_SESSION_ID -u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_REMOTE_SESSION_ID"
+    "env -u O_API_TOKEN -u CLAUDECODE -u CLAUDE_CODE_SESSION_ID -u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_REMOTE_SESSION_ID" ++
+        " -u GH_TOKEN -u GITHUB_TOKEN -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN" ++
+        " \"GIT_CONFIG_KEY_${GIT_CONFIG_COUNT:-0}=url.o-no-push://.pushInsteadOf\" \"GIT_CONFIG_VALUE_${GIT_CONFIG_COUNT:-0}=https://\"" ++
+        " \"GIT_CONFIG_KEY_$((${GIT_CONFIG_COUNT:-0}+1))=url.o-no-push://.pushInsteadOf\" \"GIT_CONFIG_VALUE_$((${GIT_CONFIG_COUNT:-0}+1))=git@\"" ++
+        " \"GIT_CONFIG_COUNT=$((${GIT_CONFIG_COUNT:-0}+2))\""
 }
 
 # ---- agent sandbox (O_SANDBOX=bwrap) --------------------------
@@ -304,9 +313,11 @@ fun dispatch_prompt(db, iid, title, body, repo, protected, rebase_onto, attempt)
 }
 
 fun dispatch_prompt_base(db, iid, title, body, repo, protected, rebase_onto, attempt) {
-    if (attempt > 1) {
-        lastrun = Store.last_run_for_issue(db, iid)
-        vstate = if (lastrun == nil) { "" } else { str_or(map_get(lastrun, "verify_state"), "") }
+    lastrun = Store.last_run_for_issue(db, iid)
+    vstate = if (lastrun == nil) { "" } else { str_or(map_get(lastrun, "verify_state"), "") }
+    # A parked PR sent back for a rebase starts a fresh attempt count but
+    # must still get the conflict prompt.
+    if (attempt > 1 || vstate == "conflict") {
         if (is_retry_verdict(vstate) == 'true') {
             vout = if (lastrun == nil) { "" } else { str_or(map_get(lastrun, "verify_output"), "") }
             build_retry_prompt(title, body, repo, protected, rebase_onto, vstate, vout)
@@ -1339,7 +1350,8 @@ fun sim_marker(title) {
     else { if (string_contains(title, "[sim:unskip-test]") == 'true') { "unskip-test" }
     else { if (string_contains(title, "[sim:ext-ok]") == 'true') { "ext-ok" }
     else { if (string_contains(title, "[sim:ext-broken]") == 'true') { "ext-broken" }
-    else { "good" }}}}}}}}}}}}
+    else { if (string_contains(title, "[sim:net-empty]") == 'true') { "net-empty" }
+    else { "good" }}}}}}}}}}}}}
 }
 
 # Carry out the marker's action in the worktree. Every case except no-commit
@@ -1383,9 +1395,13 @@ fun sim_act(workspace, issue_id, marker, protected) {
                     sim_commit(workspace, f"ext/ok_{issue_id}.txt", "fine")
                 } else { if (marker == "ext-broken") {
                     sim_commit(workspace, "ext/broken", "breaks the ext tier check")
+                } else { if (marker == "net-empty") {
+                    # two commits that cancel out: commits exist, no net change
+                    _c = sim_commit(workspace, f"sim_{issue_id}.txt", "ok")
+                    shell(f"cd {workspace} && git rm -q sim_{issue_id}.txt && git commit -q -m sim-undo")
                 } else {
                     sim_commit(workspace, f"sim_{issue_id}.txt", "ok")
-                }}}}}}}}
+                }}}}}}}}}
                 }
             }
         }
@@ -1525,8 +1541,11 @@ fun account_cost(db, company_id, cost) {
 fun run_verify(orch, run_id, issue_id, ws, repo, base, verify_cmd, protected) {
     rc = shell(f"git -C {ws} rev-list --count {base}..HEAD")
     count = string_trim(elem(rc, 1))
-    if (count == "0") {
-        send(orch, {'verify_done', run_id, issue_id, "red_no_commit", ""})
+    # Commits that net out to nothing (reverted, or the branch reset to base)
+    # are no change either: never pay review, CI and the gate for them.
+    empty = count == "0" || elem(shell(f"git -C {ws} diff --quiet {base}...HEAD"), 0) == 0
+    if (empty) {
+        send(orch, {'verify_done', run_id, issue_id, "red_no_commit", (if (count == "0") { "" } else { "The branch's commits make no net change against " ++ base ++ "." })})
     } else {
         # --no-renames: with rename detection on (git's default), a moved file
         # lists only its NEW path, so `git mv tests/heldout/x y` would slip a
@@ -1798,6 +1817,7 @@ fun handle_review_done(db, running, retry, run_id, issue_id, approved, reason, c
         now = timestamp()
         company_id = map_get(info, "company_id")
         account_cost(db, company_id, cost)
+        _rc = Store.run_add_cost(db, run_id, cost)
         if (approved == 'true') {
             _a = Store.log_activity(db, company_id, "reviewer", "review.pass", issue_id)
             enqueue_merge(db, running, retry, info, run_id, issue_id, now)
@@ -2257,6 +2277,10 @@ fun do_gate(job) {
         added = lines_of(elem(shell(f"git -C {sq(rv)} diff --no-renames --name-only --diff-filter=AM o-base HEAD"), 1))
         numstat = elem(shell(f"git -C {sq(rv)} diff --no-renames --numstat o-base HEAD"), 1)
         lines = numstat_lines(lines_of(numstat), 0)
+        if (length(files) == 0) {
+            # An empty PR: nothing to review, so no model is paid for it.
+            gate_result(job, "REJECT: the PR makes no change against " ++ base ++ " (its commits net out to nothing).", "", "", "", map_get(job, "session"), 0)
+        } else {
         tier = pr_tier(cfg, files)
         new_files = lines_of(elem(shell(f"git -C {sq(rv)} diff --no-renames --name-only --diff-filter=A o-base HEAD"), 1))
         steps = mechanical_steps(cfg, rv, f"{dir}/pr-base", added, new_files, tier)
@@ -2267,7 +2291,8 @@ fun do_gate(job) {
             # O's own checks already found a blocking problem: no model needed.
             gate_result(job, "REJECT: " ++ failed, "", evidence, "", map_get(job, "session"), 0)
         } else {
-            gate_model_review(job, cfg, rv, files, lines, numstat, tier, evidence)
+            gate_model_review(map_put(job, "model", map_get(tier, "gate_model")), cfg, rv, files, lines, numstat, tier, evidence)
+        }
         }
     }
 }
@@ -2336,7 +2361,23 @@ fun pr_tier(cfg, files) {
     named = Std.filter(ts, fn(t) { t != nil })
     names = Std.join(Std.unique([str_or(map_get(t, "name"), "?") for t in named]), ", ")
     extra = Std.unique(flatten([list_or_empty(map_get(t, "extra")) for t in named]))
-    %{human: Std.any(merges, fn(m) { m == "human" }), names: names, extra: extra}
+    %{human: Std.any(merges, fn(m) { m == "human" }), names: names, extra: extra, gate_model: tier_gate_model(ts)}
+}
+
+# The merge gate's model for a PR: a tier may name a lighter `gate_model`
+# (e.g. "sonnet" for docs). Only when EVERY touched file's tier names one does
+# the PR get it, the strongest among them; otherwise O_MERGE_MODEL.
+fun tier_gate_model(ts) {
+    gms = [if (t == nil) { "" } else { str_or(map_get(t, "gate_model"), "") } for t in ts]
+    if (length(gms) == 0 || Std.any(gms, fn(g) { string_length(g) == 0 })) { merge_model() } else { strongest_model(gms, hd(gms)) }
+}
+
+fun model_rank(m) {
+    if (string_contains(m, "opus") == 'true') { 3 } else { if (string_contains(m, "sonnet") == 'true') { 2 } else { if (string_contains(m, "haiku") == 'true') { 1 } else { 4 } } }
+}
+
+fun strongest_model(ms, best) {
+    if (length(ms) == 0) { best } else { strongest_model(tl(ms), (if (model_rank(hd(ms)) > model_rank(best)) { hd(ms) } else { best })) }
 }
 
 fun flatten(ls) {
@@ -2448,7 +2489,7 @@ fun gate_model_review(job, cfg, rv, files, lines, numstat, tier, evidence) {
     np = str_or(map_get(job, "notes"), "")
     notes = if (string_length(np) > 0 && file_exists(np) == 'true') { file_read(np) } else { "" }
     _w = file_write(f"{dir}/GATE.txt", gate_primer(map_get(job, "gh_repo"), notes) ++ "\n\n" ++ pr_msg)
-    _r = gate_claude(dir, rv, "")
+    _r = gate_claude(dir, rv, "", str_or(map_get(job, "model"), merge_model()))
     res = parse_stream_result(f"{dir}/gate.jsonl")
     text = str_or(map_get(res, "result"), "")
     usd = map_get(res, "total_cost_usd")
@@ -2469,7 +2510,7 @@ fun gate_model_review(job, cfg, rv, files, lines, numstat, tier, evidence) {
 # Post the decision with its evidence on the PR, and hand it back.
 fun gate_result(job, verdict, text, evidence, cmd_md, session, cost) {
     dir = map_get(job, "dir")
-    body = "**O merge gate** (" ++ merge_model() ++ ")\n\n**Decision:** `" ++ verdict ++ "`\n\n<details><summary>O's own checks</summary>\n\n" ++ (if (string_length(evidence) > 0) { evidence } else { "_(none configured; add .o-review.json)_\n" }) ++ "\n</details>\n\n<details><summary>Commands the maintainer ran</summary>\n\n" ++ (if (string_length(cmd_md) > 0) { cmd_md } else { "_(model not consulted)_\n" }) ++ "\n</details>\n\n" ++ text
+    body = "**O merge gate** (" ++ str_or(map_get(job, "model"), merge_model()) ++ ")\n\n**Decision:** `" ++ verdict ++ "`\n\n<details><summary>O's own checks</summary>\n\n" ++ (if (string_length(evidence) > 0) { evidence } else { "_(none configured; add .o-review.json)_\n" }) ++ "\n</details>\n\n<details><summary>Commands the maintainer ran</summary>\n\n" ++ (if (string_length(cmd_md) > 0) { cmd_md } else { "_(model not consulted)_\n" }) ++ "\n</details>\n\n" ++ text
     _c = file_write(f"{dir}/COMMENT.md", body)
     _p = shell(f"{gh_bin()} api -X POST repos/{map_get(job, "gh_repo")}/issues/{map_get(job, "num")}/comments -F body=@{sq(dir)}/COMMENT.md")
     %{verdict: verdict, text: (if (string_length(evidence) > 0) { "O's checks:\n" ++ evidence ++ "\n" } else { "" }) ++ text, session: session, cost: cost}
@@ -2486,9 +2527,9 @@ fun bash_commands(path) {
     }
 }
 
-fun gate_claude(dir, rv, session) {
+fun gate_claude(dir, rv, session, model) {
     resume = if (string_length(session) > 0) { f" --resume {session}" } else { "" }
-    cmd = f"cd {sq(dir)} && cat GATE.txt | {agent_env()} env -u GH_TOKEN -u GITHUB_TOKEN {claude_bin()} -p{resume} --model {sq(merge_model())} --add-dir {sq(rv)} --max-turns {env_int("O_GATE_MAX_TURNS", 80)} --allowedTools Read,Grep,Glob,Edit,Write,Bash --verbose --output-format stream-json > gate.jsonl 2> gate.err"
+    cmd = f"cd {sq(dir)} && cat GATE.txt | {agent_env()} env -u GH_TOKEN -u GITHUB_TOKEN {claude_bin()} -p{resume} --model {sq(model)} --add-dir {sq(rv)} --max-turns {env_int("O_GATE_MAX_TURNS", 80)} --allowedTools Read,Grep,Glob,Edit,Write,Bash --verbose --output-format stream-json > gate.jsonl 2> gate.err"
     shell_managed(cmd, gate_timeout_ms())
 }
 
@@ -2582,6 +2623,7 @@ fun handle_gate_done(db, running, retry, run_id, issue_id, verdict, text, sessio
         company_id = map_get(info, "company_id")
         company = Store.company_row(db, company_id)
         account_cost(db, company_id, cost)
+        _rc = Store.run_add_cost(db, run_id, cost)
         home = getenv("HOME")
         _n = append_notes(f"{home}/.o/maintainer/{company_id}/NOTES.md", text)
         if (verdict == "APPROVE") {
@@ -2641,9 +2683,12 @@ fun review_poll_worker(orch, issue_id, gh_repo, adoptable) {
             send(orch, {'pr_state', issue_id, "closed", num})
         } else { if (adoptable == 'true') {
             send(orch, {'pr_state', issue_id, "adopt", num})
+        } else { if (str_or(map_get(pr, "mergeable_state"), "") == "dirty") {
+            head = map_get(pr, "head")
+            send(orch, {'pr_state', issue_id, "dirty:" ++ (if (head == nil) { "" } else { str_or(map_get(head, "sha"), "") }), num})
         } else {
             ""
-        }}}
+        }}}}
     }
 }
 
@@ -2673,6 +2718,25 @@ fun handle_pr_state(db, running, retry, issue_id, state, num) {
             _i = Store.issue_set_status(db, issue_id, "Canceled")
             _a = Store.log_activity(db, company_id, "github", "pr.closed", issue_id)
             %{running: running, retry: retry}
+        } else { if (string_starts_with(state, "dirty:") == 'true') {
+            # An approved PR waiting on a human now conflicts with base (other
+            # merges landed). Hand it back to its builder for a rebase, once
+            # per head commit, so a rebase that fails can't loop. Only PRs the
+            # gate passed: needs-human issues stay with the human.
+            sha = string_sub(state, 6, string_length(state) - 6)
+            lvs = if (last == nil) { "" } else { str_or(map_get(last, "verify_state"), "") }
+            marker = f"{home}/.o/rebase/{issue_id}-{sha}"
+            if (lvs != "in_review" || string_length(sha) == 0 || file_exists(marker) == 'true') {
+                %{running: running, retry: retry}
+            } else {
+                _m = shell(f"mkdir -p {sq(home)}/.o/rebase")
+                _w = file_write(marker, "")
+                base = company_base(company, repo)
+                _v = Store.run_set_verify(db, run_id, "conflict", f"This PR (#{num}) was approved but now conflicts with {base}: other changes merged after it. Rebase onto {base} and resolve the conflicts, keeping both sides' intent. Change nothing else.")
+                _i = Store.issue_set_status(db, issue_id, "Backlog")
+                _a = Store.log_activity(db, company_id, "orchestrator", "pr.rebase", issue_id)
+                %{running: running, retry: retry}
+            }
         } else {
             # adopt: back into the running map in the CI phase. The PR still has
             # to pass its required checks on current main (the same ci_poll a
@@ -2689,7 +2753,7 @@ fun handle_pr_state(db, running, retry, issue_id, state, num) {
             cpid = spawn(ci_poll(self(), run_id, issue_id, gh_repo, f"o/{issue_id}", num, detect_base(repo), required, now, now + ci_timeout_s() * 1000))
             info = %{run_id: run_id, worker_pid: cpid, started_at: now, attempt: attempt, company_id: company_id, agent_id: map_get(issue, "assignee_agent_id"), phase: 'ci', workspace: ws}
             %{running: map_put(running, issue_id, info), retry: retry}
-        }}
+        }}}
     }
 }
 
