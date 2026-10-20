@@ -137,7 +137,9 @@ O edits real repositories on its own. The guard rails are the point.
 - **Protected paths.** Each company declares `protected_paths`. An agent may not
   change them; a commit that does is rejected (`red_protected`) before it can
   merge. Renames count as touching both paths, and the agent's prompt lists the
-  fence. The test harness and this loop's own invariants live behind it, so an
+  fence. A builder whose task needs a protected file commits nothing and ends
+  with `NEEDS_HUMAN: <the change>`: the issue parks In Review with that ask
+  (`run.needs_human`) instead of burning its attempts. The test harness and this loop's own invariants live behind it, so an
   agent maintaining O cannot edit the checks that gate its merges.
 - **Guarded control plane.** Writes must be `Content-Type: application/json` and
   CORS preflights are answered only for loopback origins, so a web page can't
@@ -207,10 +209,14 @@ remotes, and `GH_TOKEN` is stripped, so nothing in it can push. In that clone
 O runs the commands from `.o-review.json`:
 - the build
 - every new or changed test, which must pass on the PR **and fail on base
-  without the change**, so a test that can't fail is a REJECT
+  without the change**, so a new test that can't fail is a REJECT. A
+  *modified* test that also passes on base (an un-skip, a refactor) proves
+  nothing either way: it is noted for the reviewer, not rejected
 - the suite, but only when the repo names no `required_checks`: otherwise CI
   already ran it on this same merge commit
-- the extra commands of the change's risk tier
+- the extra commands of the change's risk tier. One that fails is re-run on
+  base: failing there too is pre-existing and noted, not blamed on the PR;
+  passing there gets the PR one retry, and only a repeat failure blocks
 
 The first unexpected result is a REJECT, and the model is never asked.
 

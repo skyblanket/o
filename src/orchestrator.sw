@@ -269,7 +269,7 @@ fun escalate_hint() {
 
 fun build_prompt(title, body, repo, protected) {
     if (string_length(repo) > 0) {
-        fence = if (string_length(string_trim(protected)) > 0) { " You may NOT modify, rename or delete these protected paths (the verifier rejects any commit touching them): " ++ protected ++ "." } else { "" }
+        fence = if (string_length(string_trim(protected)) > 0) { " You may NOT modify, rename or delete these protected paths (the verifier rejects any commit touching them): " ++ protected ++ ". If the task can only be done by changing one of them, don't work around it: commit nothing and end your final message with one line `NEEDS_HUMAN: <the exact change the protected file needs>`; a human makes it." } else { "" }
         "You are an autonomous engineer working in a git checkout of a real project. Make the code changes this task needs, then run `git add -A` and `git commit -m` with a clear message. Do NOT commit PROMPT.txt, result.json or err.log." ++ fence ++ " Be focused and correct." ++ escalate_hint() ++ "\n\nTask: " ++ title ++ "\n\n" ++ body
     } else {
         "You are an autonomous agent in a fresh working directory. Complete the task below, creating whatever files are needed. Be concise.\n\nTask: " ++ title ++ "\n\n" ++ body
@@ -786,6 +786,13 @@ fun record_escalation(issue_id, line) {
     file_write(p, old ++ string_truncate(line, 400) ++ "\n")
 }
 
+# The builder's "NEEDS_HUMAN: <change>" line (the task needs a protected
+# path), or "".
+fun needs_human_in(text) {
+    ls = [string_trim(l) for l in string_split(text, "\n") when string_starts_with(string_trim(l), "NEEDS_HUMAN:") == 'true']
+    if (length(ls) == 0) { "" } else { Std.last(ls) }
+}
+
 # The last line of the agent's final message that starts with ESCALATE:, or "".
 fun escalation_in(text) {
     ls = [string_trim(l) for l in string_split(text, "\n") when string_starts_with(string_trim(l), "ESCALATE:") == 'true']
@@ -846,13 +853,18 @@ fun run_claude_code_in(orch, run_id, issue_id, prompt, workspace, repo, session_
     code = elem(result, 0)
     cost = run_cost(code, parse_stream_cost(f"{workspace}/stream.jsonl"))
     new_session = parse_stream_session(f"{workspace}/stream.jsonl")
-    esc = escalation_in(str_or(map_get(parse_stream_result(f"{workspace}/stream.jsonl"), "result"), ""))
+    final = str_or(map_get(parse_stream_result(f"{workspace}/stream.jsonl"), "result"), "")
+    esc = escalation_in(final)
     _e = if (string_length(esc) > 0) { record_escalation(issue_id, esc) } else { "" }
-    if (code == 0) {
+    nh = needs_human_in(final)
+    if (string_length(nh) > 0) {
+        _w = file_write(f"{workspace}/NEEDS_HUMAN.txt", nh)
+        send(orch, {'run_done', run_id, issue_id, 'needs_human', cost, new_session})
+    } else { if (code == 0) {
         send(orch, {'run_done', run_id, issue_id, 'succeeded', cost, new_session})
     } else {
         send(orch, {'run_done', run_id, issue_id, 'crashed', cost, new_session})
-    }
+    }}
 }
 
 # One headless claude run in the workspace, streaming events to stream.jsonl.
@@ -1269,8 +1281,10 @@ fun run_sim(orch, run_id, issue_id, outcome, workspace, repo, title, protected, 
             _p = file_write(f"{workspace}/PROMPT.txt", "sim")
             first_esc = string_contains(title, "[sim:escalate]") == 'true' && escalations(issue_id) == 0
             _e = if (first_esc) { record_escalation(issue_id, "ESCALATE: sim says this needs a stronger model") } else { "" }
-            _act = if (first_esc) { "" } else { sim_act(workspace, issue_id, sim_marker(title), protected) }
-            send(orch, {'run_done', run_id, issue_id, 'succeeded', sim_cost(), ""})
+            nh = string_contains(title, "[sim:needs-human]") == 'true'
+            _act = if (first_esc || nh) { "" } else { sim_act(workspace, issue_id, sim_marker(title), protected) }
+            _n = if (nh) { file_write(f"{workspace}/NEEDS_HUMAN.txt", f"NEEDS_HUMAN: sim says {first_prefix(protected)}keep.txt needs a line only a human may add") } else { "" }
+            send(orch, {'run_done', run_id, issue_id, (if (nh) { 'needs_human' } else { 'succeeded' }), sim_cost(), ""})
         }
     } else {
         send(orch, {'run_done', run_id, issue_id, outcome, sim_cost(), ""})
@@ -1288,7 +1302,10 @@ fun sim_marker(title) {
     else { if (string_contains(title, "[sim:vacuous-test]") == 'true') { "vacuous-test" }
     else { if (string_contains(title, "[sim:risky]") == 'true') { "risky" }
     else { if (string_contains(title, "[sim:docs]") == 'true') { "docs" }
-    else { "good" }}}}}}}}}
+    else { if (string_contains(title, "[sim:unskip-test]") == 'true') { "unskip-test" }
+    else { if (string_contains(title, "[sim:ext-ok]") == 'true') { "ext-ok" }
+    else { if (string_contains(title, "[sim:ext-broken]") == 'true') { "ext-broken" }
+    else { "good" }}}}}}}}}}}}
 }
 
 # Carry out the marker's action in the worktree. Every case except no-commit
@@ -1324,9 +1341,17 @@ fun sim_act(workspace, issue_id, marker, protected) {
                     shell(f"cd {workspace} && echo docs > docs/d_{issue_id}.md && git add docs/d_{issue_id}.md && git commit -q -m sim-docs")
                 } else { if (marker == "risky") {
                     sim_commit(workspace, f"risky/r_{issue_id}.txt", "runtime change")
+                } else { if (marker == "unskip-test") {
+                    # edit an EXISTING test (drop a skip guard): it passes on
+                    # base too, which proves nothing either way
+                    sim_commit(workspace, "tests/existing.sh", "# skip guard removed\nexit 0")
+                } else { if (marker == "ext-ok") {
+                    sim_commit(workspace, f"ext/ok_{issue_id}.txt", "fine")
+                } else { if (marker == "ext-broken") {
+                    sim_commit(workspace, "ext/broken", "breaks the ext tier check")
                 } else {
                     sim_commit(workspace, f"sim_{issue_id}.txt", "ok")
-                }}}}}
+                }}}}}}}}
                 }
             }
         }
@@ -1381,7 +1406,18 @@ fun handle_done(db, running, retry, run_id, issue_id, outcome, cost, session_id)
         now = timestamp()
         company_id = map_get(info, "company_id")
         _ps = persist_session(db, info, session_id)
-        if (outcome == 'succeeded') {
+        if (outcome == 'needs_human') {
+            # The task needs a protected path: park it for a human with the
+            # change the builder asked for. Not a failed attempt.
+            account_cost(db, company_id, cost)
+            ws = map_get(info, "workspace")
+            ask = if (file_exists(f"{ws}/NEEDS_HUMAN.txt") == 'true') { file_read(f"{ws}/NEEDS_HUMAN.txt") } else { "NEEDS_HUMAN" }
+            _m = Store.run_finish(db, run_id, "InReview", cost)
+            _v = Store.run_set_verify(db, run_id, "needs_human", "The builder says this task needs a protected path, which only a human may change:\n" ++ ask)
+            _s = Store.issue_set_status(db, issue_id, "In Review")
+            _a = Store.log_activity(db, company_id, "orchestrator", "run.needs_human", issue_id)
+            %{running: map_remove(running, issue_id), retry: map_remove(retry, issue_id)}
+        } else { if (outcome == 'succeeded') {
             # Spend is real whichever path we take, so account it immediately.
             account_cost(db, company_id, cost)
             company = Store.company_row(db, company_id)
@@ -1424,7 +1460,7 @@ fun handle_done(db, running, retry, run_id, issue_id, outcome, cost, session_id)
                 retry2 = schedule_retry(retry, issue_id, attempt, now)
                 %{running: map_remove(running, issue_id), retry: retry2}
             }
-        }
+        }}
     }
 }
 
@@ -2188,7 +2224,8 @@ fun do_gate(job) {
         numstat = elem(shell(f"git -C {sq(rv)} diff --no-renames --numstat o-base HEAD"), 1)
         lines = numstat_lines(lines_of(numstat), 0)
         tier = pr_tier(cfg, files)
-        steps = mechanical_steps(cfg, rv, f"{dir}/pr-base", added, tier)
+        new_files = lines_of(elem(shell(f"git -C {sq(rv)} diff --no-renames --name-only --diff-filter=A o-base HEAD"), 1))
+        steps = mechanical_steps(cfg, rv, f"{dir}/pr-base", added, new_files, tier)
         ev = run_steps(steps, dir, 1, "", "")
         evidence = map_get(ev, "md")
         failed = map_get(ev, "failed")
@@ -2274,22 +2311,55 @@ fun flatten(ls) {
 
 # O's own checks, run before any model is consulted. Each step is
 # %{label, dir, cmd, want: "pass"|"fail"}; the first unexpected result stops
-# the run and becomes a REJECT.
-fun mechanical_steps(cfg, rv, rvb, added, tier) {
+# the run and becomes a REJECT. Two kinds of step are softer:
+#   soft       a MODIFIED (not added) test that passes on base proves nothing
+#              either way (an un-skip, a refactor): noted for the reviewer
+#   base_retry a failing tier check is re-run on base: failing there too is
+#              pre-existing, not this PR's; passing there gets the PR one retry
+#              (a load flake), and only a repeat failure blocks
+fun mechanical_steps(cfg, rv, rvb, added, new_files, tier) {
     build = cfg_str(cfg, "build")
     b = if (string_length(build) > 0) { [%{label: "build (PR merged with base)", dir: rv, cmd: build, want: "pass"}] } else { [] }
     runners = cfg_list(cfg, "test_runners")
     tests = Std.filter([test_for(runners, f) for f in added], fn(t) { t != nil })
     on_pr = [%{label: "new/changed test passes on the PR: " ++ map_get(t, "file"), dir: rv, cmd: map_get(t, "cmd"), want: "pass"} for t in tests]
     prove = Std.filter(tests, fn(t) { map_get(t, "prove") == 'true' })
-    base_setup = if (length(prove) > 0) { [%{label: "base checkout (without the change)", dir: rv, cmd: "git worktree add -q --detach " ++ sq(rvb) ++ " o-base" ++ (if (string_length(build) > 0) { " && cd " ++ sq(rvb) ++ " && " ++ build } else { "" }), want: "pass"}] } else { [] }
-    on_base = [%{label: "test fails WITHOUT the change: " ++ map_get(t, "file"), dir: rvb, cmd: "mkdir -p \"$(dirname " ++ sq(map_get(t, "file")) ++ ")\" && cp " ++ sq(rv ++ "/" ++ map_get(t, "file")) ++ " " ++ sq(map_get(t, "file")) ++ " && " ++ map_get(t, "cmd"), want: "fail"} for t in prove]
+    setup = base_setup_cmd(rvb, build)
+    base_setup = if (length(prove) > 0) { [%{label: "base checkout (without the change)", dir: rv, cmd: setup, want: "pass"}] } else { [] }
+    on_base = [%{label: "test fails WITHOUT the change: " ++ map_get(t, "file"), dir: rvb, cmd: "mkdir -p \"$(dirname " ++ sq(map_get(t, "file")) ++ ")\" && cp " ++ sq(rv ++ "/" ++ map_get(t, "file")) ++ " " ++ sq(map_get(t, "file")) ++ " && " ++ map_get(t, "cmd"), want: "fail", soft: (if (Std.any(new_files, fn(f) { f == map_get(t, "file") })) { 'false' } else { 'true' })} for t in prove]
     # CI already ran the full suite on this same merge commit when the repo
     # names required checks; only re-run it here when nothing else will.
     suite = if (length(cfg_list(cfg, "required_checks")) > 0) { "" } else { cfg_str(cfg, "suite") }
     s = if (string_length(suite) > 0) { [%{label: "suite (PR merged with base)", dir: rv, cmd: suite, want: "pass"}] } else { [] }
-    x = [%{label: "tier check: " ++ c, dir: rv, cmd: c, want: "pass"} for c in map_get(tier, "extra")]
+    x = [%{label: "tier check: " ++ c, dir: rv, cmd: c, want: "pass", base_retry: 'true', base_dir: rvb, base_setup: setup} for c in map_get(tier, "extra")]
     b ++ on_pr ++ base_setup ++ on_base ++ s ++ x
+}
+
+fun base_setup_cmd(rvb, build) {
+    "git worktree add -q --detach " ++ sq(rvb) ++ " o-base" ++ (if (string_length(build) > 0) { " && cd " ++ sq(rvb) ++ " && " ++ build } else { "" })
+}
+
+fun run_step_cmd(dir, cmd, logp) {
+    elem(shell_managed("cd " ++ sq(dir) ++ " && sh -c " ++ sq(cmd) ++ " > " ++ sq(logp) ++ " 2>&1", gate_timeout_ms()), 0)
+}
+
+# A failed tier check, re-judged: "" when it doesn't block (with a note in
+# the evidence), else the blocking reason.
+fun base_rejudge(st, logdir, n, code) {
+    rv = map_get(st, "dir")
+    rvb = map_get(st, "base_dir")
+    _b = if (file_exists(rvb) == 'true') { 0 } else { run_step_cmd(rv, map_get(st, "base_setup"), f"{logdir}/check-{n}-base-setup.log") }
+    cb = run_step_cmd(rvb, map_get(st, "cmd"), f"{logdir}/check-{n}-base.log")
+    if (cb != 0) {
+        %{why: "", note: "⚠️ also fails on base without the change (exit " ++ to_string(cb) ++ "): pre-existing, not this PR's. Base output:\n\n```\n" ++ tail_n(f"{logdir}/check-{n}-base.log", 800) ++ "\n```\n"}
+    } else {
+        c2 = run_step_cmd(rv, map_get(st, "cmd"), f"{logdir}/check-{n}-retry.log")
+        if (c2 == 0) {
+            %{why: "", note: "⚠️ failed once (exit " ++ to_string(code) ++ "), passed on base and on a retry of the PR: flaky, not blocking.\n"}
+        } else {
+            %{why: map_get(st, "label") ++ " failed (exit " ++ to_string(c2) ++ ", twice) and passes on base without the change", note: "❌ retried: exit " ++ to_string(c2) ++ "; on base: exit 0\n"}
+        }
+    }
 }
 
 fun test_for(runners, f) {
@@ -2305,16 +2375,21 @@ fun run_steps(steps, logdir, n, md, failed) {
     } else {
         st = hd(steps)
         logp = f"{logdir}/check-{n}.log"
-        r = shell_managed("cd " ++ sq(map_get(st, "dir")) ++ " && sh -c " ++ sq(map_get(st, "cmd")) ++ " > " ++ sq(logp) ++ " 2>&1", gate_timeout_ms())
-        code = elem(r, 0)
+        code = run_step_cmd(map_get(st, "dir"), map_get(st, "cmd"), logp)
         ok = if (map_get(st, "want") == "pass") { code == 0 } else { code != 0 }
         tail = tail_n(logp, 1200)
-        line = "- " ++ (if (ok) { "✅" } else { "❌" }) ++ " **" ++ map_get(st, "label") ++ "**: `" ++ map_get(st, "cmd") ++ "` → exit " ++ to_string(code) ++ " (expected " ++ map_get(st, "want") ++ ")\n\n```\n" ++ tail ++ "\n```\n"
-        why = if (ok) { "" } else {
-            if (map_get(st, "want") == "fail") { map_get(st, "label") ++ " — it PASSES on the base without the change, so it proves nothing (a test that can't fail)" }
-            else { map_get(st, "label") ++ " failed (exit " ++ to_string(code) ++ ")" }
+        soft = map_get(st, "soft") == 'true'
+        bad = if (ok) { 'false' } else { 'true' }
+        rj = if (bad == 'true' && map_get(st, "base_retry") == 'true') { base_rejudge(st, logdir, n, code) } else { nil }
+        mark = if (ok) { "✅" } else { if (soft || (rj != nil && string_length(map_get(rj, "why")) == 0)) { "⚠️" } else { "❌" } }
+        line = "- " ++ mark ++ " **" ++ map_get(st, "label") ++ "**: `" ++ map_get(st, "cmd") ++ "` → exit " ++ to_string(code) ++ " (expected " ++ map_get(st, "want") ++ ")\n\n```\n" ++ tail ++ "\n```\n"
+        note = if (soft && bad == 'true') { "⚠️ this test was modified, not added, and passes on base too, so this proves nothing either way (an un-skip or a refactor): judge it from the diff.\n" } else { if (rj != nil) { map_get(rj, "note") } else { "" } }
+        why = if (ok || soft) { "" } else {
+            if (rj != nil) { map_get(rj, "why") }
+            else { if (map_get(st, "want") == "fail") { map_get(st, "label") ++ " — it PASSES on the base without the change, so it proves nothing (a test that can't fail)" }
+            else { map_get(st, "label") ++ " failed (exit " ++ to_string(code) ++ ")" } }
         }
-        run_steps(tl(steps), logdir, n + 1, md ++ line, why)
+        run_steps(tl(steps), logdir, n + 1, md ++ line ++ note, why)
     }
 }
 
