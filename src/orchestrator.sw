@@ -252,10 +252,14 @@ fun verify_timeout_ms() {
     n * 1000 + 60000
 }
 
+fun escalate_hint() {
+    " If, after a real attempt, the task is beyond what you can do reliably (you can't find the root cause, or it needs deeper expertise than you have), stop and end your final message with one line `ESCALATE: <why>`; the next attempt then goes to a stronger model. Don't escalate for a flaky test or a broken environment: say what you saw instead."
+}
+
 fun build_prompt(title, body, repo, protected) {
     if (string_length(repo) > 0) {
         fence = if (string_length(string_trim(protected)) > 0) { " You may NOT modify, rename or delete these protected paths (the verifier rejects any commit touching them): " ++ protected ++ "." } else { "" }
-        "You are an autonomous engineer working in a git checkout of a real project. Make the code changes this task needs, then run `git add -A` and `git commit -m` with a clear message. Do NOT commit PROMPT.txt, result.json or err.log." ++ fence ++ " Be focused and correct.\n\nTask: " ++ title ++ "\n\n" ++ body
+        "You are an autonomous engineer working in a git checkout of a real project. Make the code changes this task needs, then run `git add -A` and `git commit -m` with a clear message. Do NOT commit PROMPT.txt, result.json or err.log." ++ fence ++ " Be focused and correct." ++ escalate_hint() ++ "\n\nTask: " ++ title ++ "\n\n" ++ body
     } else {
         "You are an autonomous agent in a fresh working directory. Complete the task below, creating whatever files are needed. Be concise.\n\nTask: " ++ title ++ "\n\n" ++ body
     }
@@ -283,6 +287,12 @@ fun build_retry_prompt(title, body, repo, protected, rebase_onto, verdict, tail)
 # a verify-red attempt, in which case the previous verdict + output tail are
 # folded in. Reads the LAST run BEFORE the caller creates the new run row.
 fun dispatch_prompt(db, iid, title, body, repo, protected, rebase_onto, attempt) {
+    esc = escalation_lines(iid)
+    note = if (length(esc) == 0) { "" } else { "\n\nA previous agent on this task asked for a stronger model and said: " ++ Std.last(esc) ++ "\nIts work so far is on this branch." }
+    dispatch_prompt_base(db, iid, title, body, repo, protected, rebase_onto, attempt) ++ note
+}
+
+fun dispatch_prompt_base(db, iid, title, body, repo, protected, rebase_onto, attempt) {
     if (attempt > 1) {
         lastrun = Store.last_run_for_issue(db, iid)
         vstate = if (lastrun == nil) { "" } else { str_or(map_get(lastrun, "verify_state"), "") }
@@ -712,7 +722,7 @@ fun dispatch_one(db, issue, iid, attempt, running, now) {
         _a = Store.log_activity(db, company_id, "orchestrator", "run.dispatch", iid)
         ident = map_get(issue, "identifier")
         resumed = if (string_length(session_id) > 0) { "resume" } else { "fresh" }
-        model = builder_model(agent, attempt)
+        model = builder_model(agent, 1 + escalations(iid))
         print(f"[orch] dispatch {ident} via {runtime} ({resumed} session, attempt {attempt}, model {model})")
         sim_outcome = if (runtime == "sim") { decide_outcome(issue, attempt) } else { 'none' }
         start = worktree_start(company, repo)
@@ -723,18 +733,48 @@ fun dispatch_one(db, issue, iid, attempt, running, now) {
 
 # ---- workers: real agent runtimes ----------------------------
 
-# Builder model: the agent's own `model` if set, else a ladder by attempt.
-# O_MODEL_LADDER (default "haiku,sonnet,opus"): attempt 1 runs on the first,
-# each retry after a red verdict climbs one rung, the last rung repeats. Most
-# issues finish on the cheap model; the expensive one only sees the ones that
-# already failed twice. An empty ladder ("") leaves the CLI's default.
-fun builder_model(agent, attempt) {
+# Builder model: the agent's own `model` if set, else a ladder. O_MODEL_LADDER
+# (default "haiku,sonnet,opus"): rung = 1 + how many times an agent on this
+# issue ESCALATED (ended a run with "ESCALATE: <why>"). Only the agent climbs
+# the ladder: a failed test, a REJECT, a flake, a timeout or a restart retries
+# on the same model with the verdict in its prompt. The last rung repeats;
+# "" leaves the CLI's default.
+fun builder_model(agent, rung) {
     own = str_or(map_get(agent, "model"), "")
     if (string_length(own) > 0) { own } else {
         raw = getenv("O_MODEL_LADDER")
         ladder = if (raw == nil) { ["haiku", "sonnet", "opus"] } else { [string_trim(x) for x in string_split(raw, ",") when string_length(string_trim(x)) > 0] }
-        if (length(ladder) == 0) { "" } else { Std.nth(ladder, min2(attempt, length(ladder)) - 1) }
+        if (length(ladder) == 0) { "" } else { Std.nth(ladder, min2(rung, length(ladder)) - 1) }
     }
+}
+
+# Escalations live in ~/.o/escalations/<issue_id>, one "ESCALATE: why" line
+# per escalating run. Workers append (it's their own issue's file); dispatch
+# counts them to pick the rung and hands the last reason to the next model.
+fun escalation_path(issue_id) {
+    home = getenv("HOME")
+    f"{home}/.o/escalations/{issue_id}"
+}
+
+fun escalation_lines(issue_id) {
+    p = escalation_path(issue_id)
+    if (file_exists(p) == 'true') { [l for l in string_split(file_read(p), "\n") when string_starts_with(l, "ESCALATE:") == 'true'] } else { [] }
+}
+
+fun escalations(issue_id) { length(escalation_lines(issue_id)) }
+
+fun record_escalation(issue_id, line) {
+    home = getenv("HOME")
+    _m = shell(f"mkdir -p {sq(home)}/.o/escalations")
+    p = escalation_path(issue_id)
+    old = if (file_exists(p) == 'true') { file_read(p) } else { "" }
+    file_write(p, old ++ string_truncate(line, 400) ++ "\n")
+}
+
+# The last line of the agent's final message that starts with ESCALATE:, or "".
+fun escalation_in(text) {
+    ls = [string_trim(l) for l in string_split(text, "\n") when string_starts_with(string_trim(l), "ESCALATE:") == 'true']
+    if (length(ls) == 0) { "" } else { Std.last(ls) }
 }
 
 fun run_worker(orch, run_id, issue_id, runtime, prompt, workspace, repo, session_id, sim_outcome, title, protected, start, model) {
@@ -791,6 +831,8 @@ fun run_claude_code_in(orch, run_id, issue_id, prompt, workspace, repo, session_
     code = elem(result, 0)
     cost = run_cost(code, parse_stream_cost(f"{workspace}/stream.jsonl"))
     new_session = parse_stream_session(f"{workspace}/stream.jsonl")
+    esc = escalation_in(str_or(map_get(parse_stream_result(f"{workspace}/stream.jsonl"), "result"), ""))
+    _e = if (string_length(esc) > 0) { record_escalation(issue_id, esc) } else { "" }
     if (code == 0) {
         send(orch, {'run_done', run_id, issue_id, 'succeeded', cost, new_session})
     } else {
@@ -1210,7 +1252,9 @@ fun run_sim(orch, run_id, issue_id, outcome, workspace, repo, title, protected, 
             # relies on it existing in the worktree (green) yet absent on main
             # (red after merge), so the verify commit must never include it.
             _p = file_write(f"{workspace}/PROMPT.txt", "sim")
-            _act = sim_act(workspace, issue_id, sim_marker(title), protected)
+            first_esc = string_contains(title, "[sim:escalate]") == 'true' && escalations(issue_id) == 0
+            _e = if (first_esc) { record_escalation(issue_id, "ESCALATE: sim says this needs a stronger model") } else { "" }
+            _act = if (first_esc) { "" } else { sim_act(workspace, issue_id, sim_marker(title), protected) }
             send(orch, {'run_done', run_id, issue_id, 'succeeded', sim_cost(), ""})
         }
     } else {
@@ -1417,7 +1461,20 @@ fun run_verify(orch, run_id, issue_id, ws, repo, base, verify_cmd, protected) {
             verdict = if (code == 0) { "green" } else {
                 if (code == 142 || code == 124) { "red_timeout" } else { "red_tests" }
             }
-            send(orch, {'verify_done', run_id, issue_id, verdict, tail})
+            # A red verify is re-run once, identically, before it counts against
+            # the agent: a test that fails and then passes with no change is a
+            # flake (a port taken by a neighbour, a timing test on a loaded box),
+            # not the agent's fault, and must not cost a retry on a bigger model.
+            if (verdict == "red_tests" && getenv("O_VERIFY_RETRY") != "0") {
+                r2 = shell_managed(timeout_cmd(verify_timeout_s(), verify_cmd, ws, logpath), verify_timeout_ms())
+                if (elem(r2, 0) == 0) {
+                    send(orch, {'verify_done', run_id, issue_id, "green", "FLAKY: the first verify run failed and an identical rerun passed. First run:\n" ++ tail})
+                } else {
+                    send(orch, {'verify_done', run_id, issue_id, "red_tests", tail_log(logpath)})
+                }
+            } else {
+                send(orch, {'verify_done', run_id, issue_id, verdict, tail})
+            }
         }
     }
 }
@@ -1533,6 +1590,7 @@ fun handle_verify_done(db, running, retry, run_id, issue_id, verdict, tail) {
         company_id = map_get(info, "company_id")
         if (verdict == "green") {
             _a = Store.log_activity(db, company_id, "orchestrator", "verify.pass", issue_id)
+            _f = if (string_starts_with(tail, "FLAKY:") == 'true') { Store.log_activity(db, company_id, "orchestrator", "verify.flaky", issue_id) } else { "" }
             if (review_enabled() == 'true') {
                 start_review(db, running, retry, info, run_id, issue_id, now)
             } else {
