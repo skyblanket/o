@@ -85,6 +85,10 @@ fail() { echo "FAIL: $1"; exit 1; }
 # whole suite, plus ONE retry on exit 52 (swarmrt's http server occasionally
 # idle-closes a keep-alive socket mid-response — a single dropped connection
 # must not abort the run). All args pass straight through to curl.
+# The daemons write their DB while these checks read and poke it: wait out
+# the lock instead of dying on "database is locked" under load.
+sqlite3() { command sqlite3 -cmd ".timeout 5000" "$@"; }
+
 ocurl() {
   local out rc
   out="$(curl --max-time 10 "$@")"; rc=$?
