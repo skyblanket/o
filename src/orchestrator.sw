@@ -2043,7 +2043,7 @@ fun ci_poll(orch, run_id, issue_id, gh_repo, branch, num, base, required, pushed
         _s = sleep(env_int("O_CI_POLL_S", 30) * 1000)
         ci_poll(orch, run_id, issue_id, gh_repo, branch, num, base, required, timestamp(), deadline)
     } else { if (pr != nil && verdict == "success" && req_ok == 'true' && (length(checks) > 0 || settled)) {
-        if (getenv("O_PR_AUTOMERGE") == "0") {
+        if (getenv("O_PR_AUTOMERGE") == "0" || (automerge_allowed(gh_repo) == 'false' && merge_gate_enabled() == 'false')) {
             # PR-only mode: green PRs wait for a human to merge them.
             send(orch, {'ci_done', run_id, issue_id, "in_review", "", "CI green on PR #" ++ to_string(num) ++ "; O_PR_AUTOMERGE=0, so it waits for a human to merge."})
         } else { if (merge_gate_enabled() == 'true') {
@@ -2219,6 +2219,18 @@ fun handle_ci_done(db, running, retry, run_id, issue_id, outcome, sha, tail) {
 # Fail-closed: no parseable verdict is UNVERIFIED. A PR touching
 # O_ESCALATE_PATHS, or a human tier, goes to a human even on APPROVE. Every
 # verdict is posted on the PR as a comment.
+
+# O_AUTOMERGE_OWNERS (comma-separated GitHub owners, e.g. "skyblanket"):
+# only repos under these owners are ever merged by O. Anything else is
+# PR-only: O opens, verifies and gates the PR, and its maintainers merge.
+# Unset = no restriction (as before).
+fun automerge_allowed(gh_repo) {
+    raw = getenv("O_AUTOMERGE_OWNERS")
+    if (raw == nil || string_length(string_trim(raw)) == 0) { 'true' } else {
+        owner = hd(string_split(gh_repo, "/"))
+        if (Std.any(string_split(raw, ","), fn(o) { string_trim(o) == owner })) { 'true' } else { 'false' }
+    }
+}
 
 fun merge_gate_enabled() {
     if (getenv("O_MERGE_GATE") == "1") { 'true' } else { 'false' }
@@ -2629,9 +2641,16 @@ fun handle_gate_done(db, running, retry, run_id, issue_id, verdict, text, sessio
         if (verdict == "APPROVE") {
             _a = Store.log_activity(db, company_id, "maintainer", "gate.approve", issue_id)
             num = map_get(info, "pr")
-            mpid = spawn(merge_worker(self(), run_id, issue_id, str_or(map_get(company, "github_repo"), ""), f"o/{issue_id}", num))
-            info2 = map_put(map_put(map_put(info, "phase", 'ci'), "started_at", now), "worker_pid", mpid)
-            %{running: map_put(running, issue_id, info2), retry: map_remove(retry, issue_id)}
+            gh_repo = str_or(map_get(company, "github_repo"), "")
+            if (automerge_allowed(gh_repo) == 'false') {
+                # A repo O doesn't own: the gate's approval is advice; its
+                # maintainers merge.
+                handle_ci_done(db, running, retry, run_id, issue_id, "in_review", "", f"HUMAN: the merge gate approved, but {gh_repo} is PR-only (not in O_AUTOMERGE_OWNERS): its maintainers merge.\n\n" ++ text)
+            } else {
+                mpid = spawn(merge_worker(self(), run_id, issue_id, gh_repo, f"o/{issue_id}", num))
+                info2 = map_put(map_put(map_put(info, "phase", 'ci'), "started_at", now), "worker_pid", mpid)
+                %{running: map_put(running, issue_id, info2), retry: map_remove(retry, issue_id)}
+            }
         } else {
             if (string_starts_with(verdict, "REJECT") == 'true') {
                 _a = Store.log_activity(db, company_id, "maintainer", "gate.reject", issue_id)

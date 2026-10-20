@@ -1526,6 +1526,14 @@ sleep 2
 IDN_NF="$(sqlite3 "$TMP4/o.db" "SELECT identifier FROM issue WHERE id='$IID_NF'")"
 [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM issue WHERE fingerprint='verify-final:$IDN_NF'")" = "0" ] || fail "auto-file off: O_AUTO_FILE=0 still filed a follow-up"
 pass "auto-file off: O_AUTO_FILE=0 files no 'Fix failing verification' follow-up"
+# Outside repos are PR-only: with O_AUTOMERGE_OWNERS not naming acme, a gate
+# APPROVE parks the PR for its maintainers; nothing is merged.
+restart_d4 O_MERGE_GATE=1 O_AUTO_FILE=0 O_AUTOMERGE_OWNERS=skyblanket
+IID_EXT="$(gh_issue '[sim:good] change on a repo O does not own')"
+wait_status_at "$BASE4" "$IID_EXT" "In Review" 120 || { tail -30 "$TMP4/daemon.log"; fail "pr-only owners: approved PR on an outside repo was not parked for its maintainers"; }
+git -C "$GHS/remote.git" log --oneline main | grep "o/$IID_EXT" >/dev/null && fail "pr-only owners: O merged into a repo outside O_AUTOMERGE_OWNERS"
+sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_EXT' ORDER BY started_at DESC LIMIT 1" | grep "PR-only" >/dev/null || fail "pr-only owners: reason not recorded"
+pass "pr-only owners: a repo outside O_AUTOMERGE_OWNERS gets gated PRs, never merges"
 
 # ============================================================
 # Agent sandbox — 5th daemon, O_SANDBOX=bwrap + O_API_TOKEN

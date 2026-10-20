@@ -434,6 +434,7 @@ The daemon reads its configuration from the environment. All are optional.
 | `O_TIMEOUT_FLAT_CENTS` | `300` | cost charged for an agent run killed on its wall-clock cap. |
 | `O_REVIEW` | unset | set `1` to require a reviewer model's APPROVE before any green change merges. |
 | `O_MODEL_LADDER` | `haiku,sonnet,opus` | builder models. Every issue starts on the first, unless a `.o-review.json` tier names a stronger `builder` (e.g. `"builder": "sonnet"` on the runtime tier): an issue whose text names one of that tier's paths, or whose earlier attempt touched them, starts there. Retries stay on the same model, with the verdict in the prompt. A run moves up one rung only when the agent itself ends it with `ESCALATE: <why>`. An agent's own `model` overrides the ladder; `""` uses the CLI default. |
+| `O_AUTOMERGE_OWNERS` | unset (no limit) | comma-separated GitHub owners O may merge into. Any other repo is PR-only: O opens, verifies and gates the PR, and its maintainers merge (a gate APPROVE parks it In Review). Set it before pointing O at repos you don't own. |
 | `O_AUTO_FILE` | on | when an issue fails for good, O files a "Fix failing verification" follow-up (one level deep). `0` turns it off: the failed issue waits for a human. Revert follow-ups (main regressed) are always filed. |
 | `O_VERIFY_RETRY` | `1` | a failed verify is re-run once before it counts. Fail-then-pass is logged `verify.flaky` and ships with no retry. `0` turns it off. |
 | `O_REVIEW_MODEL` | `sonnet` | model for the pre-PR reviewer. |
