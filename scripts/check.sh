@@ -1500,6 +1500,7 @@ if echo x >> "$SBX_REPO/README.md" 2>/dev/null; then p="$p repo:WRITABLE"; else 
 if [ -e "$HOME/.o/o.db" ]; then p="$p db:VISIBLE"; else p="$p db:hidden"; fi
 if echo x >> "$SBX_REPO/.git/hooks/post-merge" 2>/dev/null; then p="$p hooks:WRITABLE"; else p="$p hooks:denied"; fi
 if git config core.fsmonitor "touch /tmp/pwned" 2>/dev/null; then p="$p config:WRITABLE"; else p="$p config:denied"; fi
+git worktree prune >/dev/null 2>&1 || true   # other runs' worktrees are hidden here; must not be pruned
 n="$(cat /proc/*/environ 2>/dev/null | tr '\0' '\n' | grep -c '^O_API_TOKEN=')"
 p="$p token_procs:$n"
 echo "$p" > probes.txt
@@ -1527,6 +1528,8 @@ sc="$(ocurl -s -o /dev/null -w '%{http_code}' -X POST "$BASE5/api/companies/$CID
 [ "$sc" = "401" ] || fail "token: verify_cmd rewrite without bearer expected 401, got $sc"
 ocurl -s -X POST "$BASE5/api/companies/$CIDS/agents" -H 'Content-Type: application/json' -H "Authorization: Bearer $TOK" \
   -d '{"name":"Boxed","runtime":"claude-code"}' >/dev/null
+# Another run's worktree, under the ~/.o the agent can't see.
+git -C "$SCRATCHS" worktree add -q "$TMP5/.o/workspaces/other" -b o/other main
 IID_SBX="$(jget "$(ocurl -s -X POST "$BASE5/api/companies/$CIDS/issues" -H 'Content-Type: application/json' -d '{"title":"probe the sandbox"}')" 'd["id"]')"
 [ -n "$IID_SBX" ] || fail "token: issue filing must stay open without a bearer"
 pass "token: 401 on company writes without bearer (incl. verify_cmd rewrite), issue filing stays open"
@@ -1535,7 +1538,8 @@ probes="$(git -C "$SCRATCHS" show main:probes.txt)"
 [ "$probes" = " repo:denied db:hidden hooks:denied config:denied token_procs:0" ] \
   || fail "sandbox: unexpected probe results: '$probes'"
 [ "$(cat "$SCRATCHS/README.md")" = "sandbox project" ] || fail "sandbox: main checkout was modified"
-pass "sandbox: repo/hooks/config not writable, ~/.o hidden, token not visible in /proc; worktree commit merged"
+[ -d "$SCRATCHS/.git/worktrees/other" ] || fail "sandbox: an agent's 'git worktree prune' deleted another run's worktree entry"
+pass "sandbox: repo/hooks/config not writable, ~/.o hidden, token not visible in /proc, other runs' worktrees survive a prune; worktree commit merged"
 grep -- "--model haiku " "$TMP5/agent-args" >/dev/null || { cat "$TMP5/agent-args"; fail "model ladder: attempt 1 should run on haiku"; }
 pass "model ladder: a builder's first attempt runs on haiku"
 else
