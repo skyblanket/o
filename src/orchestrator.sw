@@ -54,7 +54,7 @@ fun max_attempts()   { 3 }        # after this many failed runs, the issue is ma
 # `command -v` on PATH, then a conventional home-relative fallback.
 # Keeps the daemon portable across machines and CI.
 fun which_bin(cmd) {
-    r = shell(f"command -v {cmd}")
+    r = sh(f"command -v {cmd}")
     out = string_trim(elem(r, 1))
     if (elem(r, 0) == 0) {
         if (string_length(out) > 0) { out } else { "" }
@@ -253,6 +253,24 @@ fun str_or(v, d) {
 # Single-quote a value for splicing into a shell command: wraps it in '...'
 # and turns any embedded ' into '\'' — so a repo path with spaces, or a
 # verify_cmd like `grep 'ok' out.txt`, survives intact as one argument.
+# ---- shell with a trustworthy exit status --------------------------
+# swarmrt's shell() can report exit 0 for a failed command when several run
+# at once (~3% under load; swarmrt#137), so every status O acts on is read
+# back from the command's own output instead. No `exit` in `cmd`: it would
+# skip the marker (and shell() then waits ~2 min, swarmrt#134).
+fun sh(cmd) {
+    r = shell("{ " ++ cmd ++ "\n}; printf '\\n__o_rc=%s\\n' \"$?\"")
+    parts = string_split(elem(r, 1), "\n__o_rc=")
+    if (length(parts) < 2) { r } else {
+        code = to_int(string_trim(last_of(parts)))
+        {(if (code == nil) { elem(r, 0) } else { code }), Std.join(but_last(parts), "\n__o_rc=")}
+    }
+}
+
+fun last_of(xs) { if (length(tl(xs)) == 0) { hd(xs) } else { last_of(tl(xs)) } }
+
+fun but_last(xs) { if (length(tl(xs)) == 0) { [] } else { [hd(xs)] ++ but_last(tl(xs)) } }
+
 fun sq(v) {
     "'" ++ string_replace(v, "'", "'\\''") ++ "'"
 }
@@ -396,13 +414,13 @@ fun boot_recovery(db, dbpath) {
     _w = file_write(lst, Std.join(roots, "\n") ++ "\n")
     # a process whose cwd is one of those roots, or under one, is an orphan;
     # never this daemon (the shell's $PPID) or the shell itself
-    k = shell("n=0; me=$PPID; for d in /proc/[0-9]*; do p=${d#/proc/}; [ \"$p\" = \"$me\" ] && continue; [ \"$p\" = \"$$\" ] && continue; c=$(readlink $d/cwd 2>/dev/null) || continue; while IFS= read -r r; do [ -n \"$r\" ] || continue; case \"$c/\" in \"$r\"/*) kill -9 $p 2>/dev/null && n=$((n+1)); break ;; esac; done < " ++ sq(lst) ++ "; done; echo $n")
+    k = sh("n=0; me=$PPID; for d in /proc/[0-9]*; do p=${d#/proc/}; [ \"$p\" = \"$me\" ] && continue; [ \"$p\" = \"$$\" ] && continue; c=$(readlink $d/cwd 2>/dev/null) || continue; while IFS= read -r r; do [ -n \"$r\" ] || continue; case \"$c/\" in \"$r\"/*) kill -9 $p 2>/dev/null && n=$((n+1)); break ;; esac; done < " ++ sq(lst) ++ "; done; echo $n")
     killed = string_trim(elem(k, 1))
     _o = if (killed != "0" && killed != "") { Store.log_activity(db, "", "orchestrator", "recovery.orphans_killed", killed) } else { "" }
     _p1 = if (killed != "0" && killed != "") { print(f"[orch] recovery: killed {killed} orphaned processes from the previous daemon") } else { "" }
     parked = park_inflight_prs(db, db_query(db, "SELECT id, company_id FROM issue WHERE status IN ('In Progress', 'Verifying')", []), 0)
     _p2 = if (parked > 0) { print(f"[orch] recovery: parked {parked} PRs that were in CI or the gate, for re-adoption") } else { "" }
-    _d = shell(f"rm -f {sq(dbpath ++ ".drain")}")
+    _d = sh(f"rm -f {sq(dbpath ++ ".drain")}")
     ""
 }
 
@@ -665,7 +683,7 @@ fun sweep_stalls(db, ids, running, retry, now) {
             wpid = map_get(info, "worker_pid")
             _k = if (wpid == nil) { "" } else { exit_proc(wpid, 'stalled') }
             ws = map_get(info, "workspace")
-            _pk = if (ws == nil) { "" } else { elem(shell(f"pkill -f {ws}"), 1) }
+            _pk = if (ws == nil) { "" } else { elem(sh(f"pkill -f {ws}"), 1) }
             run_id = map_get(info, "run_id")
             company_id = map_get(info, "company_id")
             # A stalled AGENT run has no cost written yet, so run_finish (which
@@ -747,8 +765,8 @@ fun has_committed_work(db, issue, iid) {
     ws = getenv("HOME") ++ "/.o/workspaces/" ++ iid
     if (string_length(repo) == 0 || file_exists(ws) == 'false') { 'false' } else {
         base = company_base(company, repo)
-        n = string_trim(elem(shell(f"git -C {sq(ws)} rev-list --count {sq(base)}..HEAD"), 1))
-        if (n != "" && n != "0" && elem(shell(f"git -C {sq(ws)} diff --quiet {sq(base)}...HEAD"), 0) != 0) { 'true' } else { 'false' }
+        n = string_trim(elem(sh(f"git -C {sq(ws)} rev-list --count {sq(base)}..HEAD"), 1))
+        if (n != "" && n != "0" && elem(sh(f"git -C {sq(ws)} diff --quiet {sq(base)}...HEAD"), 0) != 0) { 'true' } else { 'false' }
     }
 }
 
@@ -880,8 +898,8 @@ fun tier_rung(repo, base, iid, text) {
         cfg = review_config(repo, base)
         tiers = [t for t in cfg_list(cfg, "tiers") when string_length(str_or(map_get(t, "builder"), "")) > 0]
         if (length(tiers) == 0) { 1 } else {
-            br = elem(shell(f"git -C {sq(repo)} rev-parse --verify --quiet refs/heads/o/{iid}"), 0) == 0
-            files = if (br) { lines_of(elem(shell(f"git -C {sq(repo)} diff --no-renames --name-only {sq(base)}...o/{iid}"), 1)) } else { [] }
+            br = elem(sh(f"git -C {sq(repo)} rev-parse --verify --quiet refs/heads/o/{iid}"), 0) == 0
+            files = if (br) { lines_of(elem(sh(f"git -C {sq(repo)} diff --no-renames --name-only {sq(base)}...o/{iid}"), 1)) } else { [] }
             hit = [t for t in tiers when Std.any(list_or_empty(map_get(t, "paths")), fn(p) { string_contains(text, p) == 'true' || Std.any(files, fn(f) { string_starts_with(f, p) == 'true' }) })]
             max_of([ladder_rung(str_or(map_get(t, "builder"), "")) for t in hit], 1)
         }
@@ -923,7 +941,7 @@ fun escalations(issue_id) { length(escalation_lines(issue_id)) }
 
 fun record_escalation(issue_id, line) {
     home = getenv("HOME")
-    _m = shell(f"mkdir -p {sq(home)}/.o/escalations")
+    _m = sh(f"mkdir -p {sq(home)}/.o/escalations")
     p = escalation_path(issue_id)
     old = if (file_exists(p) == 'true') { file_read(p) } else { "" }
     file_write(p, old ++ string_truncate(line, 400) ++ "\n")
@@ -967,7 +985,7 @@ fun run_claude_code(orch, run_id, issue_id, prompt, workspace, repo, session_id,
     if (string_length(repo) > 0) {
         prepare_worktree(repo, workspace, issue_id, start)
     } else {
-        _mk = shell(f"mkdir -p {workspace}")
+        _mk = sh(f"mkdir -p {workspace}")
     }
     if (ws_missing(repo, workspace)) {
         send(orch, {'run_done', run_id, issue_id, 'crashed', 0, ""})
@@ -1121,7 +1139,7 @@ fun run_swarm_code(orch, run_id, issue_id, prompt, workspace, repo, start) {
     if (string_length(repo) > 0) {
         prepare_worktree(repo, workspace, issue_id, start)
     } else {
-        _mk = shell(f"mkdir -p {workspace}")
+        _mk = sh(f"mkdir -p {workspace}")
     }
     if (ws_missing(repo, workspace)) {
         send(orch, {'run_done', run_id, issue_id, 'crashed', 0, ""})
@@ -1184,7 +1202,7 @@ fun chat_worker(dbpath, agent_id, message) {
         session_id = if (rawses == nil) { "" } else { rawses }
         home = getenv("HOME")
         workspace = f"{home}/.o/chat/{agent_id}"
-        _mk = shell(f"mkdir -p {workspace}")
+        _mk = sh(f"mkdir -p {workspace}")
         _w = file_write(f"{workspace}/CHAT.txt", message)
         outcome = chat_invoke(runtime, workspace, session_id)
         new_session = map_get(outcome, "session")
@@ -1292,7 +1310,7 @@ fun reflect_worker(dbpath, company_id, port) {
         prompt = build_reflect_prompt(name, repo, port, company_id, spent, greens, acts, fails, issues)
         home = getenv("HOME")
         dir = f"{home}/.o/reflect/{company_id}"
-        _mk = shell(f"mkdir -p {dir}")
+        _mk = sh(f"mkdir -p {dir}")
         _w = file_write(f"{dir}/PROMPT.txt", prompt)
         bin = claude_bin()
         cmd = f"cd {dir} && cat PROMPT.txt | {agent_env()} {bin} -p --dangerously-skip-permissions --max-turns 15 --verbose --output-format stream-json > stream.jsonl 2> err.log"
@@ -1362,7 +1380,7 @@ fun prepare_worktree(repo, workspace, issue_id, start) {
     if (file_exists(workspace) == 'true') {
         ""
     } else {
-        _f = if (string_starts_with(start, "origin/") == 'true') { shell(f"git -C {sq(repo)} fetch -q origin") } else { "" }
+        _f = if (string_starts_with(start, "origin/") == 'true') { sh(f"git -C {sq(repo)} fetch -q origin") } else { "" }
         wt_add(repo, workspace, f"o/{issue_id}", start, 5)
     }
 }
@@ -1377,8 +1395,8 @@ fun prepare_worktree(repo, workspace, issue_id, start) {
 # each retry prunes stale entries and, if the branch exists, checks it out
 # instead of re-creating it.
 fun wt_add(repo, workspace, branch, start, tries) {
-    have = elem(shell(f"git -C {sq(repo)} rev-parse --verify --quiet refs/heads/{branch}"), 0) == 0
-    r = if (have) { shell(f"git -C {sq(repo)} worktree add {workspace} {branch}") } else { shell(f"git -C {sq(repo)} worktree add {workspace} -b {branch} {start}") }
+    have = elem(sh(f"git -C {sq(repo)} rev-parse --verify --quiet refs/heads/{branch}"), 0) == 0
+    r = if (have) { sh(f"git -C {sq(repo)} worktree add {workspace} {branch}") } else { sh(f"git -C {sq(repo)} worktree add {workspace} -b {branch} {start}") }
     if (elem(r, 0) == 0) {
         ""
     } else {
@@ -1389,7 +1407,7 @@ fun wt_add(repo, workspace, branch, start, tries) {
                 ""
             } else {
                 _s = sleep(200)
-                _p = shell(f"git -C {sq(repo)} worktree prune")
+                _p = sh(f"git -C {sq(repo)} worktree prune")
                 wt_add(repo, workspace, branch, start, tries - 1)
             }
         }
@@ -1467,7 +1485,7 @@ fun sim_act(workspace, issue_id, marker, protected) {
             } else {
                 if (marker == "protected-rename") {
                     # move an EXISTING protected file out of the fence
-                    _mv = shell(f"cd {workspace} && git mv {first_prefix(protected)}keep.txt moved.txt && git commit -q -m sim-rename")
+                    _mv = sh(f"cd {workspace} && git mv {first_prefix(protected)}keep.txt moved.txt && git commit -q -m sim-rename")
                     ""
                 } else {
                 if (marker == "regress") {
@@ -1481,8 +1499,8 @@ fun sim_act(workspace, issue_id, marker, protected) {
                     _f = file_write(f"{workspace}/feat_{issue_id}", "on")
                     sim_commit(workspace, f"tests/t_{issue_id}.sh", "exit 0")
                 } else { if (marker == "docs") {
-                    _d = shell(f"mkdir -p {workspace}/docs")
-                    shell(f"cd {workspace} && echo docs > docs/d_{issue_id}.md && git add docs/d_{issue_id}.md && git commit -q -m sim-docs")
+                    _d = sh(f"mkdir -p {workspace}/docs")
+                    sh(f"cd {workspace} && echo docs > docs/d_{issue_id}.md && git add docs/d_{issue_id}.md && git commit -q -m sim-docs")
                 } else { if (marker == "risky") {
                     sim_commit(workspace, f"risky/r_{issue_id}.txt", "runtime change")
                 } else { if (marker == "unskip-test") {
@@ -1496,7 +1514,7 @@ fun sim_act(workspace, issue_id, marker, protected) {
                 } else { if (marker == "net-empty") {
                     # two commits that cancel out: commits exist, no net change
                     _c = sim_commit(workspace, f"sim_{issue_id}.txt", "ok")
-                    shell(f"cd {workspace} && git rm -q sim_{issue_id}.txt && git commit -q -m sim-undo")
+                    sh(f"cd {workspace} && git rm -q sim_{issue_id}.txt && git commit -q -m sim-undo")
                 } else {
                     sim_commit(workspace, f"sim_{issue_id}.txt", "ok")
                 }}}}}}}}}
@@ -1508,9 +1526,9 @@ fun sim_act(workspace, issue_id, marker, protected) {
 
 # Write one file and commit exactly it on the worktree's branch.
 fun sim_commit(workspace, relpath, content) {
-    _mk = shell(f"cd {workspace} && mkdir -p $(dirname {relpath})")
+    _mk = sh(f"cd {workspace} && mkdir -p $(dirname {relpath})")
     _w = file_write(f"{workspace}/{relpath}", content)
-    _c = shell(f"cd {workspace} && git add {relpath} $(ls feat_* 2>/dev/null) && git commit -q -m sim-change")
+    _c = sh(f"cd {workspace} && git add {relpath} $(ls feat_* 2>/dev/null) && git commit -q -m sim-change")
     ""
 }
 
@@ -1648,10 +1666,10 @@ fun account_cost(db, company_id, cost) {
 # 0 (same) or 1 (differs); anything else reads as "not empty" so it goes on to
 # the real checks instead of failing good work.
 fun branch_delta(ws, base) {
-    rc = shell(f"git -C {sq(ws)} rev-list --count {sq(base)}..HEAD")
+    rc = sh(f"git -C {sq(ws)} rev-list --count {sq(base)}..HEAD")
     count = string_trim(elem(rc, 1))
     n = if (elem(rc, 0) == 0) { to_int(count) } else { nil }
-    same = if (n == nil) { 'false' } else { if (n == 0) { 'true' } else { if (elem(shell(f"git -C {sq(ws)} diff --quiet {sq(base)}...HEAD"), 0) == 0) { 'true' } else { 'false' } } }
+    same = if (n == nil) { 'false' } else { if (n == 0) { 'true' } else { if (elem(sh(f"git -C {sq(ws)} diff --quiet {sq(base)}...HEAD"), 0) == 0) { 'true' } else { 'false' } } }
     {count, same}
 }
 
@@ -1668,7 +1686,7 @@ fun run_verify(orch, run_id, issue_id, ws, repo, base, verify_cmd, protected) {
         # --no-renames: with rename detection on (git's default), a moved file
         # lists only its NEW path, so `git mv tests/heldout/x y` would slip a
         # protected file out of the fence. Report both sides as delete + add.
-        rd = shell(f"git -C {ws} diff --no-renames --name-only {base}...HEAD")
+        rd = sh(f"git -C {ws} diff --no-renames --name-only {base}...HEAD")
         files = string_split(string_trim(elem(rd, 1)), "\n")
         if (any_protected(files, protected) == 'true') {
             # The changed-file list is the tail, so the retry prompt shows the
@@ -1723,7 +1741,7 @@ fun is_pr_mode(company) {
 }
 
 fun detect_base(repo) {
-    b = string_trim(elem(shell(f"git -C {sq(repo)} symbolic-ref --short HEAD"), 1))
+    b = string_trim(elem(sh(f"git -C {sq(repo)} symbolic-ref --short HEAD"), 1))
     if (string_length(b) == 0) { "main" } else { b }
 }
 
@@ -1950,7 +1968,7 @@ fun handle_review_done(db, running, retry, run_id, issue_id, approved, reason, c
 # runs in the worktree with only read tools allowed, and must answer with a
 # first line of APPROVE or REJECT: <reason>.
 fun review_worker(orch, run_id, issue_id, ws, repo, base, title, body, vcmd) {
-    rd = shell(f"git -C {ws} diff --no-renames {base}...HEAD")
+    rd = sh(f"git -C {ws} diff --no-renames {base}...HEAD")
     raw = elem(rd, 1)
     diff = if (string_length(raw) > 60000) { string_sub(raw, 0, 60000) ++ "\n[diff truncated]" } else { raw }
     evidence = "O ran the project's verify command on this branch and it PASSED:\n$ " ++ vcmd ++ "\n" ++ tail_n(f"{ws}/verify.log", 1500)
@@ -2046,7 +2064,7 @@ fun gh_poll_each(rows) {
 # (`issue list`, `pr view --json`, `pr create`, `pr merge`) use GraphQL, which
 # some environments block; REST works wherever the token does.
 fun gh_api(args) {
-    shell(f"{gh_bin()} api {args}")
+    sh(f"{gh_bin()} api {args}")
 }
 
 fun gh_json(args) {
@@ -2089,7 +2107,7 @@ fun start_ci(db, running, retry, info, company, run_id, issue_id, now) {
     _w = file_write(f"{ws}/PR.md", pr_body)
     _a = Store.log_activity(db, company_id, "orchestrator", "ci.start", issue_id)
     base = company_base(company, repo)
-    files = lines_of(elem(shell(f"git -C {sq(ws)} diff --no-renames --name-only {base}...HEAD"), 1))
+    files = lines_of(elem(sh(f"git -C {sq(ws)} diff --no-renames --name-only {base}...HEAD"), 1))
     required = required_for(review_config(repo, base), files)
     cpid = spawn(ci_worker(self(), run_id, issue_id, ws, f"o/{issue_id}", detect_base(repo), gh_repo, title, required))
     info2 = %{run_id: run_id, worker_pid: cpid, started_at: now, attempt: map_get(info, "attempt"), company_id: company_id, agent_id: map_get(info, "agent_id"), phase: 'ci', workspace: ws}
@@ -2099,7 +2117,7 @@ fun start_ci(db, running, retry, info, company, run_id, issue_id, now) {
 fun ci_worker(orch, run_id, issue_id, ws, branch, base, gh_repo, title, required) {
     # --force: the branch is O's own, and GitHub may have added an
     # update-branch merge commit to it that the agent's retry doesn't have.
-    push = shell(f"git -C {ws} push -q --force origin HEAD:refs/heads/{branch}")
+    push = sh(f"git -C {ws} push -q --force origin HEAD:refs/heads/{branch}")
     if (elem(push, 0) != 0) {
         send(orch, {'ci_done', run_id, issue_id, "red_ci", "", "git push failed:\n" ++ elem(push, 1)})
     } else {
@@ -2200,7 +2218,7 @@ fun ci_rerun(gh_repo, num, base, issue_id, sha, checks) {
         if (length(ok) == 0) {
             'false'
         } else {
-            _m = shell(f"mkdir -p {sq(getenv("HOME"))}/.o/ci-rerun")
+            _m = sh(f"mkdir -p {sq(getenv("HOME"))}/.o/ci-rerun")
             _w = file_write(marker, Std.join(ok, " ") ++ "\n")
             'true'
         }
@@ -2292,8 +2310,8 @@ fun handle_ci_done(db, running, retry, run_id, issue_id, outcome, sha, tail) {
         repo = str_or(map_get(company, "repo"), "")
         if (outcome == "merged") {
             _arch = archive_run(db, run_id, ws)
-            _wr = shell(f"git -C {sq(repo)} worktree remove {ws} --force")
-            _bd = shell(f"git -C {sq(repo)} branch -D o/{issue_id}")
+            _wr = sh(f"git -C {sq(repo)} worktree remove {ws} --force")
+            _bd = sh(f"git -C {sq(repo)} branch -D o/{issue_id}")
             _st = Store.run_set_state(db, run_id, "Succeeded")
             _ms = Store.run_set_merge(db, run_id, sha)
             _is = Store.issue_set_status(db, issue_id, "Done")
@@ -2396,24 +2414,24 @@ fun do_gate(job) {
     gh_repo = map_get(job, "gh_repo")
     num = map_get(job, "num")
     iid = map_get(job, "issue_id")
-    _mk = shell(f"mkdir -p {sq(dir)}")
+    _mk = sh(f"mkdir -p {sq(dir)}")
     rv = f"{dir}/pr"
     prep = prepare_review_checkout(repo, base, iid, rv)
     if (prep != "ok") {
         gate_result(job, "REJECT: the PR does not merge cleanly with current " ++ base ++ " (" ++ prep ++ "). Rebase it onto " ++ base ++ ".", "", "", "", map_get(job, "session"), 0)
     } else {
         cfg = review_config(repo, base)
-        files = lines_of(elem(shell(f"git -C {sq(rv)} diff --no-renames --name-only o-base HEAD"), 1))
-        added = lines_of(elem(shell(f"git -C {sq(rv)} diff --no-renames --name-only --diff-filter=AM o-base HEAD"), 1))
-        numstat = elem(shell(f"git -C {sq(rv)} diff --no-renames --numstat o-base HEAD"), 1)
+        files = lines_of(elem(sh(f"git -C {sq(rv)} diff --no-renames --name-only o-base HEAD"), 1))
+        added = lines_of(elem(sh(f"git -C {sq(rv)} diff --no-renames --name-only --diff-filter=AM o-base HEAD"), 1))
+        numstat = elem(sh(f"git -C {sq(rv)} diff --no-renames --numstat o-base HEAD"), 1)
         lines = numstat_lines(lines_of(numstat), 0)
         if (length(files) == 0) {
             # An empty PR: nothing to review, so no model is paid for it.
             gate_result(job, "REJECT: the PR makes no change against " ++ base ++ " (its commits net out to nothing).", "", "", "", map_get(job, "session"), 0)
         } else {
         tier = pr_tier(cfg, files)
-        new_files = lines_of(elem(shell(f"git -C {sq(rv)} diff --no-renames --name-only --diff-filter=A o-base HEAD"), 1))
-        steps = mechanical_steps(cfg, rv, f"{dir}/pr-base", added, new_files, tier)
+        new_files = lines_of(elem(sh(f"git -C {sq(rv)} diff --no-renames --name-only --diff-filter=A o-base HEAD"), 1))
+        steps = mechanical_steps(cfg, rv, f"{dir}/pr-base", added, new_files, tier, tree_of(rv, "HEAD"), tree_of(rv, "o-base"))
         ev = run_steps(steps, dir, 1, "", "")
         evidence = map_get(ev, "md")
         failed = map_get(ev, "failed")
@@ -2432,7 +2450,7 @@ fun do_gate(job) {
 # it couldn't be made.
 fun prepare_review_checkout(repo, base, iid, rv) {
     baseref = if (string_starts_with(base, "origin/") == 'true') { "refs/remotes/" ++ base } else { "refs/heads/" ++ base }
-    r = shell(f"rm -rf {sq(rv)} {sq(rv)}-base && git clone -q --no-hardlinks {sq(repo)} {sq(rv)} && cd {sq(rv)} && git fetch -q {sq(repo)} {baseref}:refs/heads/o-base && git checkout -q -B o-review origin/o/{iid} && git remote remove origin && git -c user.email=o@localhost -c user.name=O merge -q --no-edit o-base")
+    r = sh(f"rm -rf {sq(rv)} {sq(rv)}-base && git clone -q --no-hardlinks {sq(repo)} {sq(rv)} && cd {sq(rv)} && git fetch -q {sq(repo)} {baseref}:refs/heads/o-base && git checkout -q -B o-review origin/o/{iid} && git remote remove origin && git -c user.email=o@localhost -c user.name=O merge -q --no-edit o-base")
     if (elem(r, 0) == 0) { "ok" } else { string_trim(elem(r, 1)) }
 }
 
@@ -2449,7 +2467,7 @@ fun lines_of(s) {
 #   tiers            [{name, paths, merge: "auto"|"human", extra: [cmd]}]
 #   default_merge    tier for files no tier matches ("auto" unless set)
 fun review_config(repo, base) {
-    r = shell(f"git -C {sq(repo)} show {sq(base ++ ":.o-review.json")}")
+    r = sh(f"git -C {sq(repo)} show {sq(base ++ ":.o-review.json")}")
     d = if (elem(r, 0) == 0) { json_decode(elem(r, 1)) } else { nil }
     if (d == nil) { %{} } else { d }
 }
@@ -2522,23 +2540,30 @@ fun flatten(ls) {
 #   base_retry a failing tier check is re-run on base: failing there too is
 #              pre-existing, not this PR's; passing there gets the PR one retry
 #              (a load flake), and only a repeat failure blocks
-fun mechanical_steps(cfg, rv, rvb, added, new_files, tier) {
+fun mechanical_steps(cfg, rv, rvb, added, new_files, tier, tpr, tbase) {
+    # cache keys (see run_step_cached); builds and checkouts are never cached,
+    # later steps need what they produce
+    kpr = if (string_length(tpr) > 0) { "pr|" ++ tpr ++ "|" } else { "" }
+    kpb = if (string_length(tpr) > 0 && string_length(tbase) > 0) { "prbase|" ++ tpr ++ "|" ++ tbase ++ "|" } else { "" }
+    kb = if (string_length(tbase) > 0) { "base|" ++ tbase ++ "|" } else { "" }
     build = cfg_str(cfg, "build")
-    b = if (string_length(build) > 0) { [%{label: "build (PR merged with base)", dir: rv, cmd: build, want: "pass"}] } else { [] }
+    b = if (string_length(build) > 0) { [%{label: "build (PR merged with base)", dir: rv, cmd: build, want: "pass", key: ""}] } else { [] }
     runners = cfg_list(cfg, "test_runners")
     tests = Std.filter([test_for(runners, f) for f in added], fn(t) { t != nil })
-    on_pr = [%{label: "new/changed test passes on the PR: " ++ map_get(t, "file"), dir: rv, cmd: map_get(t, "cmd"), want: "pass"} for t in tests]
+    on_pr = [%{label: "new/changed test passes on the PR: " ++ map_get(t, "file"), dir: rv, cmd: map_get(t, "cmd"), want: "pass", key: ckey(kpr, map_get(t, "cmd"))} for t in tests]
     prove = Std.filter(tests, fn(t) { map_get(t, "prove") == 'true' })
     setup = base_setup_cmd(rvb, build)
-    base_setup = if (length(prove) > 0) { [%{label: "base checkout (without the change)", dir: rv, cmd: setup, want: "pass"}] } else { [] }
-    on_base = [%{label: "test fails WITHOUT the change: " ++ map_get(t, "file"), dir: rvb, cmd: "mkdir -p \"$(dirname " ++ sq(map_get(t, "file")) ++ ")\" && cp " ++ sq(rv ++ "/" ++ map_get(t, "file")) ++ " " ++ sq(map_get(t, "file")) ++ " && " ++ map_get(t, "cmd"), want: "fail", soft: (if (Std.any(new_files, fn(f) { f == map_get(t, "file") })) { 'false' } else { 'true' })} for t in prove]
+    base_setup = if (length(prove) > 0) { [%{label: "base checkout (without the change)", dir: rv, cmd: setup, want: "pass", key: ""}] } else { [] }
+    on_base = [%{label: "test fails WITHOUT the change: " ++ map_get(t, "file"), dir: rvb, cmd: "mkdir -p \"$(dirname " ++ sq(map_get(t, "file")) ++ ")\" && cp " ++ sq(rv ++ "/" ++ map_get(t, "file")) ++ " " ++ sq(map_get(t, "file")) ++ " && " ++ map_get(t, "cmd"), want: "fail", key: ckey(kpb, map_get(t, "file") ++ "|" ++ map_get(t, "cmd")), soft: (if (Std.any(new_files, fn(f) { f == map_get(t, "file") })) { 'false' } else { 'true' })} for t in prove]
     # CI already ran the full suite on this same merge commit when the repo
     # names required checks; only re-run it here when nothing else will.
     suite = if (length(cfg_list(cfg, "required_checks")) > 0) { "" } else { cfg_str(cfg, "suite") }
-    s = if (string_length(suite) > 0) { [%{label: "suite (PR merged with base)", dir: rv, cmd: suite, want: "pass"}] } else { [] }
-    x = [%{label: "tier check: " ++ c, dir: rv, cmd: c, want: "pass", base_retry: 'true', base_dir: rvb, base_setup: setup} for c in map_get(tier, "extra")]
+    s = if (string_length(suite) > 0) { [%{label: "suite (PR merged with base)", dir: rv, cmd: suite, want: "pass", key: ckey(kpr, suite)}] } else { [] }
+    x = [%{label: "tier check: " ++ c, dir: rv, cmd: c, want: "pass", key: ckey(kpr, c), base_retry: 'true', base_dir: rvb, base_setup: setup, base_key: ckey(kb, c)} for c in map_get(tier, "extra")]
     b ++ on_pr ++ base_setup ++ on_base ++ s ++ x
 }
+
+fun ckey(prefix, cmd) { if (string_length(prefix) > 0) { prefix ++ cmd } else { "" } }
 
 fun base_setup_cmd(rvb, build) {
     "git worktree add -q --detach " ++ sq(rvb) ++ " o-base" ++ (if (string_length(build) > 0) { " && cd " ++ sq(rvb) ++ " && " ++ build } else { "" })
@@ -2548,19 +2573,61 @@ fun run_step_cmd(dir, cmd, logp) {
     elem(shell_managed("cd " ++ sq(dir) ++ " && sh -c " ++ sq(cmd) ++ " > " ++ sq(logp) ++ " 2>&1", gate_timeout_ms()), 0)
 }
 
+# ---- gate check cache --------------------------------------------
+# A check's result is a function of the code it ran on, so it is kept by
+# content: key = git tree(s) + command. A PR re-adopted at the same commit
+# (after a restart, or behind a slow CI) skips the checks it already passed,
+# and the base half of a re-judge runs once per base tree for every PR on it.
+# O_GATE_CACHE=0 turns it off.
+fun gate_cache_on() { getenv("O_GATE_CACHE") != "0" }
+
+fun gate_cache_path(key) {
+    dir = getenv("HOME") ++ "/.o/gate-cache"
+    h = string_trim(elem(sh("mkdir -p " ++ sq(dir) ++ " && printf %s " ++ sq(key) ++ " | sha1sum | cut -c1-40"), 1))
+    dir ++ "/" ++ h
+}
+
+# %{code, cached}. `keep(code)` says which results may be stored.
+fun run_step_cached(dir, cmd, logp, key, keep) {
+    p = if (gate_cache_on() && string_length(key) > 0) { gate_cache_path(key) } else { "" }
+    hit = string_length(p) > 0 && file_exists(p ++ ".code") == 'true'
+    if (hit) {
+        _c = sh("cp " ++ sq(p ++ ".log") ++ " " ++ sq(logp) ++ " 2>/dev/null")
+        %{code: to_int(string_trim(file_read(p ++ ".code"))), cached: 'true'}
+    } else {
+        code = run_step_cmd(dir, cmd, logp)
+        _s = if (string_length(p) > 0 && keep(code)) {
+            _l = sh("cp " ++ sq(logp) ++ " " ++ sq(p ++ ".log"))
+            file_write(p ++ ".code", to_string(code) ++ "\n")
+        } else { "" }
+        %{code: code, cached: 'false'}
+    }
+}
+
+fun tree_of(rv, rev) {
+    r = sh("git -C " ++ sq(rv) ++ " rev-parse " ++ sq(rev ++ "^" ++ "{tree}"))
+    if (elem(r, 0) == 0) { string_trim(elem(r, 1)) } else { "" }
+}
+
 # A failed tier check, re-judged: "" when it doesn't block (with a note in
 # the evidence), else the blocking reason.
 fun base_rejudge(st, logdir, n, code) {
     rv = map_get(st, "dir")
     rvb = map_get(st, "base_dir")
-    _b = if (file_exists(rvb) == 'true') { 0 } else { run_step_cmd(rv, map_get(st, "base_setup"), f"{logdir}/check-{n}-base-setup.log") }
-    cb = run_step_cmd(rvb, map_get(st, "cmd"), f"{logdir}/check-{n}-base.log")
+    bk = str_or(map_get(st, "base_key"), "")
+    known = gate_cache_on() && string_length(bk) > 0 && file_exists(gate_cache_path(bk) ++ ".code") == 'true'
+    _b = if (known || file_exists(rvb) == 'true') { 0 } else { run_step_cmd(rv, map_get(st, "base_setup"), f"{logdir}/check-{n}-base-setup.log") }
+    # the base half is the same for every PR on this base: run once, kept
+    # whichever way it went (but never when the base checkout itself failed)
+    bres = run_step_cached(rvb, map_get(st, "cmd"), f"{logdir}/check-{n}-base.log", bk, fn(c) { file_exists(rvb) == 'true' })
+    cb = map_get(bres, "code")
+    from = if (map_get(bres, "cached") == 'true') { " (base result cached: this base was already checked)" } else { "" }
     if (cb != 0) {
-        %{why: "", note: "⚠️ also fails on base without the change (exit " ++ to_string(cb) ++ "): pre-existing, not this PR's. Base output:\n\n```\n" ++ tail_n(f"{logdir}/check-{n}-base.log", 800) ++ "\n```\n"}
+        %{why: "", note: "⚠️ also fails on base without the change (exit " ++ to_string(cb) ++ "): pre-existing, not this PR's" ++ from ++ ". Base output:\n\n```\n" ++ tail_n(f"{logdir}/check-{n}-base.log", 800) ++ "\n```\n"}
     } else {
         c2 = run_step_cmd(rv, map_get(st, "cmd"), f"{logdir}/check-{n}-retry.log")
         if (c2 == 0) {
-            %{why: "", note: "⚠️ failed once (exit " ++ to_string(code) ++ "), passed on base and on a retry of the PR: flaky, not blocking.\n"}
+            %{why: "", note: "⚠️ failed once (exit " ++ to_string(code) ++ "), passed on base" ++ from ++ " and on a retry of the PR: flaky, not blocking.\n"}
         } else {
             %{why: map_get(st, "label") ++ " failed (exit " ++ to_string(c2) ++ ", twice) and passes on base without the change", note: "❌ retried: exit " ++ to_string(c2) ++ "; on base: exit 0\n"}
         }
@@ -2580,14 +2647,18 @@ fun run_steps(steps, logdir, n, md, failed) {
     } else {
         st = hd(steps)
         logp = f"{logdir}/check-{n}.log"
-        code = run_step_cmd(map_get(st, "dir"), map_get(st, "cmd"), logp)
-        ok = if (map_get(st, "want") == "pass") { code == 0 } else { code != 0 }
+        want_pass = map_get(st, "want") == "pass"
+        # only an expected result is kept: a failure always runs again
+        res = run_step_cached(map_get(st, "dir"), map_get(st, "cmd"), logp, str_or(map_get(st, "key"), ""), fn(c) { if (want_pass) { c == 0 } else { c != 0 } })
+        code = map_get(res, "code")
+        cached = map_get(res, "cached") == 'true'
+        ok = if (want_pass) { code == 0 } else { code != 0 }
         tail = tail_n(logp, 1200)
         soft = map_get(st, "soft") == 'true'
         bad = if (ok) { 'false' } else { 'true' }
         rj = if (bad == 'true' && map_get(st, "base_retry") == 'true') { base_rejudge(st, logdir, n, code) } else { nil }
         mark = if (ok) { "✅" } else { if (soft || (rj != nil && string_length(map_get(rj, "why")) == 0)) { "⚠️" } else { "❌" } }
-        line = "- " ++ mark ++ " **" ++ map_get(st, "label") ++ "**: `" ++ map_get(st, "cmd") ++ "` → exit " ++ to_string(code) ++ " (expected " ++ map_get(st, "want") ++ ")\n\n```\n" ++ tail ++ "\n```\n"
+        line = "- " ++ mark ++ " **" ++ map_get(st, "label") ++ "**: `" ++ map_get(st, "cmd") ++ "` → exit " ++ to_string(code) ++ " (expected " ++ map_get(st, "want") ++ ")" ++ (if (cached) { ", cached: same code already checked" } else { "" }) ++ "\n\n```\n" ++ tail ++ "\n```\n"
         note = if (soft && bad == 'true') { "⚠️ this test was modified, not added, and passes on base too, so this proves nothing either way (an un-skip or a refactor): judge it from the diff.\n" } else { if (rj != nil) { map_get(rj, "note") } else { "" } }
         why = if (ok || soft) { "" } else {
             if (rj != nil) { map_get(rj, "why") }
@@ -2612,9 +2683,9 @@ fun gate_model_review(job, cfg, rv, files, lines, numstat, tier, evidence) {
     dir = map_get(job, "dir")
     session = map_get(job, "session")
     base = map_get(job, "base")
-    raw = elem(shell(f"git -C {sq(rv)} diff --no-renames o-base HEAD"), 1)
+    raw = elem(sh(f"git -C {sq(rv)} diff --no-renames o-base HEAD"), 1)
     diff = if (string_length(raw) > 60000) { string_sub(raw, 0, 60000) ++ "\n[diff truncated; read the files in the checkout]" } else { raw }
-    hist = elem(shell(f"git -C {sq(rv)} log --oneline -15 o-base -- " ++ Std.join(Std.map(files, fn(f) { sq(f) }), " ")), 1)
+    hist = elem(sh(f"git -C {sq(rv)} log --oneline -15 o-base -- " ++ Std.join(Std.map(files, fn(f) { sq(f) }), " ")), 1)
     pr_msg = gate_pr_message(job, cfg, rv, numstat, hist, diff, tier, evidence)
     np = str_or(map_get(job, "notes"), "")
     notes = if (string_length(np) > 0 && file_exists(np) == 'true') { file_read(np) } else { "" }
@@ -2642,7 +2713,7 @@ fun gate_result(job, verdict, text, evidence, cmd_md, session, cost) {
     dir = map_get(job, "dir")
     body = "**O merge gate** (" ++ str_or(map_get(job, "model"), merge_model()) ++ ")\n\n**Decision:** `" ++ verdict ++ "`\n\n<details><summary>O's own checks</summary>\n\n" ++ (if (string_length(evidence) > 0) { evidence } else { "_(none configured; add .o-review.json)_\n" }) ++ "\n</details>\n\n<details><summary>Commands the maintainer ran</summary>\n\n" ++ (if (string_length(cmd_md) > 0) { cmd_md } else { "_(model not consulted)_\n" }) ++ "\n</details>\n\n" ++ text
     _c = file_write(f"{dir}/COMMENT.md", body)
-    _p = shell(f"{gh_bin()} api -X POST repos/{map_get(job, "gh_repo")}/issues/{map_get(job, "num")}/comments -F body=@{sq(dir)}/COMMENT.md")
+    _p = sh(f"{gh_bin()} api -X POST repos/{map_get(job, "gh_repo")}/issues/{map_get(job, "num")}/comments -F body=@{sq(dir)}/COMMENT.md")
     %{verdict: verdict, text: (if (string_length(evidence) > 0) { "O's checks:\n" ++ evidence ++ "\n" } else { "" }) ++ text, session: session, cost: cost}
 }
 
@@ -2886,9 +2957,9 @@ fun worktree_check_each(db, rows, running) {
         r = hd(rows)
         iid = map_get(r, "id")
         ws = getenv("HOME") ++ "/.o/workspaces/" ++ iid
-        broken = map_has_key(running, iid) == 'false' && file_exists(ws) == 'true' && elem(shell(f"git -C {sq(ws)} rev-parse --git-dir >/dev/null 2>&1"), 0) != 0
+        broken = map_has_key(running, iid) == 'false' && file_exists(ws) == 'true' && elem(sh(f"git -C {sq(ws)} rev-parse --git-dir >/dev/null 2>&1"), 0) != 0
         _f = if (broken) {
-            _x = shell(f"rm -rf {sq(ws)}; git -C {sq(map_get(r, "repo"))} worktree prune")
+            _x = sh(f"rm -rf {sq(ws)}; git -C {sq(map_get(r, "repo"))} worktree prune")
             Store.log_activity(db, map_get(r, "company_id"), "orchestrator", "selfcheck.worktree_repaired", iid)
         } else { "" }
         worktree_check_each(db, tl(rows), running)
@@ -2912,15 +2983,15 @@ fun handle_pr_state(db, running, retry, issue_id, state, num) {
         home = getenv("HOME")
         ws = f"{home}/.o/workspaces/{issue_id}"
         if (state == "merged") {
-            _w = shell(f"git -C {sq(repo)} worktree remove {ws} --force")
-            _b = shell(f"git -C {sq(repo)} branch -D o/{issue_id}")
+            _w = sh(f"git -C {sq(repo)} worktree remove {ws} --force")
+            _b = sh(f"git -C {sq(repo)} branch -D o/{issue_id}")
             _r = if (string_length(run_id) > 0) { Store.run_set_state(db, run_id, "Succeeded") } else { "" }
             _i = Store.issue_set_status(db, issue_id, "Done")
             _g = Store.company_mark_green(db, company_id)
             _a = Store.log_activity(db, company_id, "github", "pr.merged", issue_id)
             %{running: running, retry: map_remove(retry, issue_id)}
         } else { if (state == "closed") {
-            _w = shell(f"git -C {sq(repo)} worktree remove {ws} --force")
+            _w = sh(f"git -C {sq(repo)} worktree remove {ws} --force")
             _i = Store.issue_set_status(db, issue_id, "Canceled")
             _a = Store.log_activity(db, company_id, "github", "pr.closed", issue_id)
             %{running: running, retry: retry}
@@ -2935,7 +3006,7 @@ fun handle_pr_state(db, running, retry, issue_id, state, num) {
             if (lvs != "in_review" || string_length(sha) == 0 || file_exists(marker) == 'true') {
                 %{running: running, retry: retry}
             } else {
-                _m = shell(f"mkdir -p {sq(home)}/.o/rebase")
+                _m = sh(f"mkdir -p {sq(home)}/.o/rebase")
                 _w = file_write(marker, "")
                 base = company_base(company, repo)
                 _v = Store.run_set_verify(db, run_id, "conflict", f"This PR (#{num}) was approved but now conflicts with {base}: other changes merged after it. Rebase onto {base} and resolve the conflicts, keeping both sides' intent. Change nothing else.")
@@ -3034,7 +3105,7 @@ fun do_merge(job) {
     ws = map_get(job, "ws")
     verify_cmd = map_get(job, "verify_cmd")
     timeout_s = map_get(job, "timeout_s")
-    st = shell(f"git -C {sq(repo)} status --porcelain --untracked-files=no")
+    st = sh(f"git -C {sq(repo)} status --porcelain --untracked-files=no")
     dirty = string_trim(elem(st, 1))
     if (string_length(dirty) > 0) {
         # Repo mid-operation / dirty tracked tree — leave it entirely untouched
@@ -3045,19 +3116,19 @@ fun do_merge(job) {
         _s = sleep(1500)
         %{outcome: "dirty", sha: "", tail: ""}
     } else {
-        co = shell(f"git -C {sq(repo)} checkout {base}")
+        co = sh(f"git -C {sq(repo)} checkout {base}")
         if (elem(co, 0) != 0) {
             _s = sleep(1500)
             %{outcome: "dirty", sha: "", tail: string_trim(elem(co, 1))}
         } else {
-            mg = shell(f"git -C {sq(repo)} merge --no-ff --no-edit {branch}")
+            mg = sh(f"git -C {sq(repo)} merge --no-ff --no-edit {branch}")
             if (elem(mg, 0) != 0) {
-                uf = shell(f"git -C {sq(repo)} diff --name-only --diff-filter=U")
+                uf = sh(f"git -C {sq(repo)} diff --name-only --diff-filter=U")
                 files = string_trim(elem(uf, 1))
-                _ab = shell(f"git -C {sq(repo)} merge --abort")
+                _ab = sh(f"git -C {sq(repo)} merge --abort")
                 %{outcome: "conflict", sha: "", tail: files}
             } else {
-                sha = string_trim(elem(shell(f"git -C {sq(repo)} rev-parse HEAD"), 1))
+                sha = string_trim(elem(sh(f"git -C {sq(repo)} rev-parse HEAD"), 1))
                 logpath = f"{ws}/merge-verify.log"
                 # shell_managed: see run_verify — plain shell() caps at 120s.
                 # timeout_s is the STRING seconds for the perl splice; the C-level
@@ -3074,7 +3145,7 @@ fun do_merge(job) {
                 } else {
                     # green in the worktree but RED on main — regression. Undo the
                     # merge commit (-m 1 keeps main's first parent) and report it.
-                    _rv = shell(f"git -C {sq(repo)} revert -m 1 --no-edit {sha}")
+                    _rv = sh(f"git -C {sq(repo)} revert -m 1 --no-edit {sha}")
                     %{outcome: "reverted", sha: sha, tail: tail_log(logpath)}
                 }}
             }
@@ -3112,8 +3183,8 @@ fun handle_merge_done(db, running, retry, run_id, issue_id, outcome, merge_sha, 
         branch = f"o/{issue_id}"
         if (outcome == "merged") {
             _arch = archive_run(db, run_id, ws)
-            _wr = shell(f"git -C {sq(repo)} worktree remove {ws} --force")
-            _bd = shell(f"git -C {sq(repo)} branch -d {branch}")
+            _wr = sh(f"git -C {sq(repo)} worktree remove {ws} --force")
+            _bd = sh(f"git -C {sq(repo)} branch -d {branch}")
             _st = Store.run_set_state(db, run_id, "Succeeded")
             _ms = Store.run_set_merge(db, run_id, merge_sha)
             _is = Store.issue_set_status(db, issue_id, "Done")
@@ -3150,7 +3221,7 @@ fun handle_merge_done(db, running, retry, run_id, issue_id, outcome, merge_sha, 
                     _st = Store.run_set_state(db, run_id, "Reverted")
                     _is = Store.issue_set_status(db, issue_id, "Reverted")
                     _arch = archive_run(db, run_id, ws)
-                    _wr = shell(f"git -C {sq(repo)} worktree remove {ws} --force")
+                    _wr = sh(f"git -C {sq(repo)} worktree remove {ws} --force")
                     _a = Store.log_activity(db, company_id, "orchestrator", "merge.revert", issue_id)
                     # Auto-file the regression fix, pointing at the kept branch.
                     _sf = file_revert(db, company_id, issue_id, merge_sha, branch, tail)
@@ -3199,8 +3270,8 @@ fun handle_merge_done(db, running, retry, run_id, issue_id, outcome, merge_sha, 
 fun archive_run(db, run_id, ws) {
     home = getenv("HOME")
     arc = f"{home}/.o/archive/{run_id}"
-    _mk = shell(f"mkdir -p {arc}")
-    _cp = shell(f"for f in stream.jsonl err.log verify.log merge-verify.log PROMPT.txt result.json REVIEW.txt review.json PR.md; do cp {ws}/$f {arc}/ 2>/dev/null || true; done")
+    _mk = sh(f"mkdir -p {arc}")
+    _cp = sh(f"for f in stream.jsonl err.log verify.log merge-verify.log PROMPT.txt result.json REVIEW.txt review.json PR.md; do cp {ws}/$f {arc}/ 2>/dev/null || true; done")
     ""
 }
 
@@ -3212,9 +3283,9 @@ fun final_fail_cleanup(db, company_id, ws, run_id) {
     company = Store.company_row(db, company_id)
     repo = str_or(map_get(company, "repo"), "")
     _wr = if (string_length(repo) > 0) {
-        shell(f"git -C {sq(repo)} worktree remove {ws} --force")
+        sh(f"git -C {sq(repo)} worktree remove {ws} --force")
     } else {
-        shell(f"rm -rf {ws}")
+        sh(f"rm -rf {ws}")
     }
     ""
 }
@@ -3373,10 +3444,10 @@ fun persona_worker(job) {
     repo = map_get(job, "repo")
     dir = f"{home}/.o/personas/{run_id}"
     work = f"{dir}/work"
-    _f = if (map_get(job, "fetch") == 'true') { shell(f"git -C {sq(repo)} fetch -q origin") } else { {0, ""} }
+    _f = if (map_get(job, "fetch") == 'true') { sh(f"git -C {sq(repo)} fetch -q origin") } else { {0, ""} }
     # git archive: the files a user would get, with no .git and no worktree
     # registered on the source repo.
-    x = shell(f"mkdir -p {sq(work)} && git -C {sq(repo)} archive --format=tar {sq(map_get(job, "base"))} | tar -x -C {sq(work)}")
+    x = sh(f"mkdir -p {sq(work)} && git -C {sq(repo)} archive --format=tar {sq(map_get(job, "base"))} | tar -x -C {sq(work)}")
     if (elem(x, 0) != 0) {
         send(whereis('orchestrator'), {'persona_done', run_id, 0, 1, "export failed: " ++ elem(x, 1), []})
     } else {
@@ -3390,7 +3461,7 @@ fun persona_worker(job) {
         cost = parse_stream_cost(f"{dir}/stream.jsonl")
         text = str_or(map_get(res, "result"), "")
         judged = if (getenv("O_PERSONA_JUDGE") == "1" && map_get(job, "kind") == "scenario") { judge_reports(job, dir) } else { %{verdicts: [], cost: 0} }
-        _rm = shell(f"rm -rf {sq(work)}")
+        _rm = sh(f"rm -rf {sq(work)}")
         send(whereis('orchestrator'), {'persona_done', run_id, cost + map_get(judged, "cost"), elem(r, 0), text, map_get(judged, "verdicts")})
     }
 }
