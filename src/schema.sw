@@ -98,5 +98,16 @@ fun migrate(db) {
     _i_pid    = db_exec(db, "ALTER TABLE issue ADD COLUMN persona_id TEXT DEFAULT ''")
     _i_vsaf   = db_exec(db, "ALTER TABLE issue ADD COLUMN verify_scenario_after_fix INTEGER DEFAULT 0")
 
+    # ---- planning + structure (GitHub) --------------------------
+    # labels: the GitHub label names, lowercased, as ",o,epic," so a label is
+    # matched with a comma-delimited string_contains. blocked_by (above) holds
+    # the GitHub issue numbers this issue waits on, comma-separated.
+    # tracking: 1 for a parent (an epic, a tracking issue, or anything with
+    # sub-issues) that is a plan, never built itself. plan_state: '' until the
+    # planner has seen the issue, then 'small', 'split' or 'tracked'.
+    _i_labels = db_exec(db, "ALTER TABLE issue ADD COLUMN labels TEXT DEFAULT ''")
+    _i_track  = db_exec(db, "ALTER TABLE issue ADD COLUMN tracking INTEGER DEFAULT 0")
+    _i_plan   = db_exec(db, "ALTER TABLE issue ADD COLUMN plan_state TEXT DEFAULT ''")
+
     print("  schema     migrated (11 tables)")
 }

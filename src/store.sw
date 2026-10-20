@@ -9,6 +9,8 @@
 
 module Store
 
+import Std
+
 export [next_id, companies, company_row, company_create, company_update,
         company_add_spend, enforce_budget, rollover_day, company_mark_green, global_spent_today,
         company_touch_reflect, companies_to_reflect, company_set_github, companies_with_github, company_set_maintainer, issues_in_review,
@@ -26,7 +28,8 @@ export [next_id, companies, company_row, company_create, company_update,
         persona_run_create, persona_run_row, persona_runs_for, persona_run_report, persona_run_finish, persona_run_add_report,
         issue_link_persona, issue_open_by_fp, issue_append_body,
         persona_confirm_due, issue_set_scenario_state, company_set_persona,
-        persona_run_set_issue, persona_runs_reap, persona_confirms_running]
+        persona_run_set_issue, persona_runs_reap, persona_confirms_running,
+        issue_sync_github, issue_set_plan, issue_set_plan_state, plan_reset_planning, blockers_done]
 
 # Ask the registered `idgen` process for a fresh unique id.
 fun next_id(prefix) {
@@ -212,7 +215,7 @@ fun issues_for(db, company_id) {
 }
 
 fun issue_row(db, id) {
-    rows = db_query(db, "SELECT id, company_id, identifier, title, body, status, priority, assignee_agent_id, goal_id, sort_order, created_at, updated_at, origin, fingerprint, persona_id, verify_scenario_after_fix FROM issue WHERE id = ?", [id])
+    rows = db_query(db, "SELECT id, company_id, identifier, title, body, status, priority, assignee_agent_id, goal_id, sort_order, created_at, updated_at, origin, fingerprint, persona_id, verify_scenario_after_fix, labels, tracking, plan_state, blocked_by FROM issue WHERE id = ?", [id])
     if (length(rows) == 0) { nil } else { hd(rows) }
 }
 
@@ -317,7 +320,12 @@ fun issue_create_with_origin(db, company_id, title, body, priority, origin) {
 # Import GitHub issue #number exactly once per company, ever: the fingerprint
 # gh:<number> is checked across ALL statuses, so a closed-out O issue is never
 # re-imported while its GitHub issue stays open. Returns the new id or nil.
-fun issue_import_github(db, company_id, number, title, body) {
+# `meta` carries what the planner and dispatcher read off GitHub:
+#   labels      ",o,epic," style, lowercased
+#   tracking    1 for a parent that is a plan, never built itself
+#   blocked_by  comma-separated GitHub issue numbers this issue waits on
+#   plan_state  the planner's starting state ('' asks the planner to look)
+fun issue_import_github(db, company_id, number, title, body, meta) {
     fp = f"gh:{number}"
     rows = db_query(db, "SELECT COUNT(*) AS n FROM issue WHERE company_id = ? AND fingerprint = ?", [company_id, fp])
     seen = if (length(rows) == 0) { 0 } else { map_get(hd(rows), "n") }
@@ -331,9 +339,42 @@ fun issue_import_github(db, company_id, number, title, body) {
         id = next_id("iss")
         now = timestamp()
         _upd = db_query(db, "UPDATE company SET issue_counter = ?, updated_at = ? WHERE id = ?", [n, now, company_id])
-        _ins = db_query(db, "INSERT INTO issue (id, company_id, identifier, title, body, status, priority, sort_order, created_at, updated_at, origin, fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [id, company_id, identifier, title, body, "Backlog", "medium", now, now, now, "github", fp])
+        _ins = db_query(db, "INSERT INTO issue (id, company_id, identifier, title, body, status, priority, sort_order, created_at, updated_at, origin, fingerprint, labels, tracking, plan_state, blocked_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [id, company_id, identifier, title, body, "Backlog", "medium", now, now, now, "github", fp, map_get(meta, "labels"), map_get(meta, "tracking"), map_get(meta, "plan_state"), map_get(meta, "blocked_by")])
         id
     }
+}
+
+# Refresh the GitHub-derived structure of an already-imported issue: its
+# labels, whether it is now a parent, and its blockers. Title and body are
+# left alone; the operator may have edited them in O. Terminal issues are
+# left alone too, since nothing will dispatch them again.
+fun issue_sync_github(db, company_id, number, meta) {
+    _u = db_query(db, "UPDATE issue SET labels = ?, tracking = ?, blocked_by = ? WHERE company_id = ? AND fingerprint = ? AND status NOT IN ('Done', 'Canceled', 'Failed', 'Reverted')", [map_get(meta, "labels"), map_get(meta, "tracking"), map_get(meta, "blocked_by"), company_id, f"gh:{number}"])
+    ""
+}
+
+# The planner's verdict on an issue: its plan_state, and whether it is a
+# parent now (tracking 1 keeps it out of dispatch for good).
+fun issue_set_plan(db, id, state, tracking) {
+    _u = db_query(db, "UPDATE issue SET plan_state = ?, tracking = ?, updated_at = ? WHERE id = ?", [state, tracking, timestamp(), id])
+    id
+}
+
+# Marks an issue as being planned, so the dispatcher leaves it alone while
+# the planner runs.
+fun issue_set_plan_state(db, id, state) {
+    _u = db_query(db, "UPDATE issue SET plan_state = ?, updated_at = ? WHERE id = ?", [state, timestamp(), id])
+    id
+}
+
+# A planner is a child process that reports back by message, so one that dies
+# (or a restarted daemon, which has none) would leave its issue 'planning' for
+# good. Any issue marked 'planning' since before `cutoff` goes back to '' and is
+# planned again. Called with now at boot, and with now minus the planner's
+# timeout on every tick.
+fun plan_reset_planning(db, cutoff) {
+    _u = db_query(db, "UPDATE issue SET plan_state = '' WHERE plan_state = 'planning' AND updated_at < ?", [cutoff])
+    ""
 }
 
 fun issue_set_status(db, id, status) {
@@ -355,8 +396,24 @@ fun issue_assign(db, id, agent_id) {
 # daemon is alive the running map holds that issue, and dispatch_batch skips any
 # id already in running, so no double-dispatch occurs. Only "Reverted" (a phase-3
 # terminal state) joins Done/Canceled/Failed in the exclusion list.
+# An issue whose blocked_by is not all Done is left out here: the blocker
+# is a build-order dependency (a planned step waiting on the step before it),
+# so the child is not even offered to dispatch until the blocker has merged.
 fun candidate_issues(db) {
-    db_query(db, "SELECT id, company_id, identifier, title, body, status, priority, assignee_agent_id, sort_order, origin, fingerprint FROM issue WHERE status NOT IN ('Done', 'Canceled', 'Failed', 'Reverted', 'In Review') AND company_id IN (SELECT id FROM company WHERE status = 'active') ORDER BY CASE WHEN origin = 'auto' THEN 0 ELSE 1 END, CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, created_at ASC", [])
+    rows = db_query(db, "SELECT id, company_id, identifier, title, body, status, priority, assignee_agent_id, sort_order, origin, fingerprint, labels, tracking, plan_state, blocked_by FROM issue WHERE status NOT IN ('Done', 'Canceled', 'Failed', 'Reverted', 'In Review') AND company_id IN (SELECT id FROM company WHERE status = 'active') ORDER BY CASE WHEN origin = 'auto' THEN 0 ELSE 1 END, CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, created_at ASC", [])
+    Std.filter(rows, fn(r) { blockers_done(db, map_get(r, "company_id"), map_get(r, "blocked_by")) == 'true' })
+}
+
+# True when every GitHub issue number in the comma-separated list is an
+# imported issue whose status is Done. A blocker with no imported row (not
+# labelled O, or not yet polled) counts as not done: it waits, never races.
+fun blockers_done(db, company_id, blocked_by) {
+    raw = if (blocked_by == nil) { "" } else { blocked_by }
+    nums = [string_trim(n) for n in string_split(raw, ",") when string_length(string_trim(n)) > 0]
+    Std.all(nums, fn(n) {
+        rows = db_query(db, "SELECT status FROM issue WHERE company_id = ? AND fingerprint = ?", [company_id, f"gh:{n}"])
+        length(rows) > 0 && map_get(hd(rows), "status") == "Done"
+    })
 }
 
 # Partial update of the operator-editable issue fields.

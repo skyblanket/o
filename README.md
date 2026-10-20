@@ -194,6 +194,31 @@ curl -s -X POST localhost:4100/api/companies -H 'Content-Type: application/json'
 - `ship: "merge"` (the default) keeps the local serialized merge, with
   post-merge verify and auto-revert.
 
+### Planning, structure and labels
+
+Before its first build, an imported GitHub issue gets one read-only planning
+pass (Claude with `Read,Grep,Glob`, run in the repo). It answers `small` or
+`large`. A small issue is built exactly as before. A large one (more than
+`O_ESCALATE_LINES` changed lines, more than one subsystem, a human-tier path
+in `.o-review.json` beyond a contained fix, the `epic` label, or a body that
+says `[split]`) is split into 2 to 6 steps. O files each step as a GitHub
+sub-issue of the original, labelled `O_GH_LABEL` so it is imported, with a
+"Depends on #n" line for each step it waits for. The original becomes a
+tracking parent: O comments the plan on it, never builds it, and closes it
+once every sub-issue is closed. A planner whose answer does not parse is
+treated as small, so a planning failure never drops work.
+
+O reads these labels and links on a GitHub issue:
+
+- **`o`** (`O_GH_LABEL`): the import filter. Only open issues with it are imported.
+- **`epic`**: the planner is asked to split it. An `epic` that stays small is still a parent, never built.
+- **`tracking`**, or any issue that already has sub-issues: a parent. O never builds it.
+- **`needs-human-review`**: on the issue or on its PR, it forces a model-gate APPROVE to HUMAN. The PR parks in **In Review** for a person. It is read at gate time, so a label added to a PR in flight still counts.
+- **"Depends on #n"** in a body: O builds the issue only after issue `#n` is Done. A "Part k of N of #p" child waits for its open sibling "Part k-1 of N of #p".
+
+With `O_GH_IMPORT_CHILDREN=1`, the open sub-issues of a labelled parent are
+imported too, even when they carry no `O_GH_LABEL` label of their own.
+
 ### Merge gate: a persistent maintainer that runs the code
 
 With `O_MERGE_GATE=1`, a PR whose CI is green isn't merged automatically. It
@@ -406,6 +431,10 @@ The daemon reads its configuration from the environment. All are optional.
 | `O_GH_BIN` | `gh` on `PATH` | GitHub CLI used for issue import and PRs. |
 | `O_GH_LABEL` | `o` | only open GitHub issues with this label are imported. |
 | `O_GH_POLL_S` | `60` | GitHub issue poll interval. |
+| `O_GH_IMPORT_CHILDREN` | unset | `1` also imports the open sub-issues of a labelled parent, even unlabelled ones. |
+| `O_PLAN` | unset | `0` turns off the planning pass, so every issue is built whole. |
+| `O_PLAN_MODEL` | `sonnet` | model for the planner. |
+| `O_PLAN_TIMEOUT_S` | `300` | wall-clock cap for one planning run. |
 | `O_CI_POLL_S` / `O_CI_TIMEOUT_S` | `30` / `3600` | PR check poll interval / give-up deadline (`red_timeout`). |
 | `O_PR_AUTOMERGE` | `1` | set `0` for PR-only mode: a green PR parks in **In Review** for a human to merge. |
 | `O_CI_SETTLE_S` | `30` | how long a PR with no checks reported waits before counting as "no CI, green". |
