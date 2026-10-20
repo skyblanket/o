@@ -430,6 +430,7 @@ IID_PROT="$(mk_issue '[sim:protected] sneaky')"
 IID_BAD="$(mk_issue '[sim:bad-verify] break')"
 IID_REN="$(mk_issue '[sim:protected-rename] move it out')"
 IID_NH="$(mk_issue '[sim:needs-human] needs a protected file')"
+IID_NE="$(mk_issue '[sim:net-empty] commits that cancel out')"
 for x in "$IID_GOOD" "$IID_NC" "$IID_PROT" "$IID_BAD" "$IID_REN"; do
   [ -n "$x" ] || fail "verify-gate issue id missing"
 done
@@ -511,6 +512,11 @@ wait_status "$IID_NH" "In Review" 120 || { cat "$TMP/daemon.log" || true; fail "
 [ "$(sqlite3 "$TMP/o.db" "SELECT COUNT(*) FROM run WHERE issue_id='$IID_NH'")" = "1" ] || fail "[sim:needs-human] was retried"
 sqlite3 "$TMP/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_NH'" | grep "keep.txt needs a line" >/dev/null || fail "[sim:needs-human] the builder's ask was not recorded"
 pass "verify-gate: [sim:needs-human] parks In Review with the protected change it needs, one run, no retries"
+
+# [sim:net-empty] — commits exist but net to no change -> red_no_commit
+wait_status "$IID_NE" "Failed" 120 || { cat "$TMP/daemon.log" || true; fail "[sim:net-empty] never Failed"; }
+[ "$(last_verify_state "$IID_NE")" = "red_no_commit" ] || fail "[sim:net-empty] expected red_no_commit, got '$(last_verify_state "$IID_NE")'"
+pass "verify-gate: [sim:net-empty] commits that net to nothing -> red_no_commit (no review, CI or gate)"
 
 # [sim:protected] — commit under protected/ -> red_protected, Failed
 if wait_status "$IID_PROT" "Failed" 120; then
@@ -1154,7 +1160,8 @@ case "$method $path" in
     n="${path#repos/acme/widgets/pulls/}"; b="$(cat "$GHS/pr_$n")"
     sha="$(git -C "$GHS/remote.git" rev-parse "refs/heads/$b" 2>/dev/null)"; echo "$b" > "$GHS/sha_$sha"
     m=false; st=open; [ -f "$GHS/merged_$n" ] && { m=true; st=closed; }; [ -f "$GHS/closed_$n" ] && st=closed
-    echo "{\"number\":$n,\"state\":\"$st\",\"merged\":$m,\"mergeable_state\":\"clean\",\"head\":{\"sha\":\"$sha\"}}" ;;
+    ms=clean; listed dirty_pr "$b" && ms=dirty
+    echo "{\"number\":$n,\"state\":\"$st\",\"merged\":$m,\"mergeable_state\":\"$ms\",\"head\":{\"sha\":\"$sha\"}}" ;;
   "GET repos/acme/widgets/commits/"*/check-runs*)
     sha="${path#repos/acme/widgets/commits/}"; sha="${sha%%/*}"; b="$(cat "$GHS/sha_$sha" 2>/dev/null)"
     n="$(num_for "$b")"; c=success
@@ -1239,7 +1246,7 @@ cat > "$SEEDGH/.o-review.json" <<'JSON'
   "suite": "true",
   "test_runners": [ { "paths": ["tests/"], "cmd": "sh {file}", "prove_fails": true } ],
   "required_checks": ["build"],
-  "tiers": [ { "name": "docs", "paths": ["docs/", "README.md"], "merge": "auto", "required_checks": ["lint"] },
+  "tiers": [ { "name": "docs", "paths": ["docs/", "README.md"], "merge": "auto", "required_checks": ["lint"], "gate_model": "sonnet" },
              { "name": "runtime", "paths": ["risky/"], "merge": "human", "extra": ["true"] },
              { "name": "ext", "paths": ["ext/"], "merge": "auto", "extra": ["test ! -f ext/broken", "test -f broken-on-base-too"] } ] }
 JSON
@@ -1416,6 +1423,18 @@ for _i in $(seq 1 20); do [ -f "$GHS/closed_$(pr_of "$IID_VT")" ] && break; slee
 git -C "$GHS/remote.git" log --oneline main | grep "o/$IID_VT" >/dev/null && fail "gate2: vacuous-test PR merged"
 wait_status_at "$BASE4" "$IID_RK" "In Review" 120 || fail "gate2: runtime-tier change did not wait for a human"
 sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_RK' ORDER BY started_at DESC LIMIT 1" | grep "human sign-off" >/dev/null || fail "gate2: runtime-tier reason not recorded"
+# The parked, approved PR starts conflicting with main (other merges landed):
+# O hands it back to its builder for a rebase, once, and it comes back for
+# sign-off.
+ndisp="$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='run.dispatch' AND target='$IID_RK'")"
+echo "o/$IID_RK" >> "$GHS/dirty_pr"
+for _i in $(seq 1 60); do [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='pr.rebase' AND target='$IID_RK'")" -ge 1 ] && break; sleep 1; done
+sed -i "\|o/$IID_RK|d" "$GHS/dirty_pr"
+[ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='pr.rebase' AND target='$IID_RK'")" = "1" ] || fail "rebase: a parked PR that went dirty was not sent back exactly once"
+sleep 3
+wait_status_at "$BASE4" "$IID_RK" "In Review" 120 || { tail -30 "$TMP4/daemon.log"; fail "rebase: the rebased PR never came back for sign-off"; }
+[ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='run.dispatch' AND target='$IID_RK'")" -gt "$ndisp" ] || fail "rebase: the builder was not re-dispatched"
+pass "rebase: an approved PR waiting on a human that goes dirty is rebased by its builder once, then parked for sign-off again"
 wait_status_at "$BASE4" "$IID_NB" "In Review" 120 || fail "gate2: APPROVE without running anything was not downgraded"
 sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_NB' ORDER BY started_at DESC LIMIT 1" | grep "without running" >/dev/null || fail "gate2: UNVERIFIED reason not recorded"
 IID_GH9="$(sqlite3 "$TMP4/o.db" "SELECT identifier FROM issue WHERE fingerprint='gh:9'")"
@@ -1460,7 +1479,10 @@ IID_DOC="$(gh_issue '[sim:docs] docs-only change')"
 echo "o/$IID_DOC" >> "$GHS/only_lint"
 echo "o/$IID_DOC" >> "$GHS/extra_fail"
 wait_status_at "$BASE4" "$IID_DOC" "Done" 120 || { tail -30 "$TMP4/daemon.log"; fail "tiered CI: a docs-only PR should merge on its tier's own required check (lint)"; }
+grep -F "O merge gate** (sonnet)" "$GHS/comments_$(pr_of "$IID_DOC")" >/dev/null || fail "gate model: a docs-only PR should be gated by its tier's gate_model (sonnet)"
+grep -F "O merge gate** (sonnet)" "$GHS/comments_$(pr_of "$IID_GM")" >/dev/null && fail "gate model: a PR outside the docs tier used the docs tier's lighter gate"
 pass "tiered CI: a docs-only PR needs only its tier's required checks (lint, not build; a failing macos it doesn't need is ignored)"
+pass "gate model: a docs-only PR is gated by its tier's gate_model; other PRs keep O_MERGE_MODEL"
 IID_FLK="$(gh_issue '[sim:good] ci flakes once')"
 echo "o/$IID_FLK" >> "$GHS/flaky_ci"
 wait_status_at "$BASE4" "$IID_FLK" "Done" 120 || { tail -30 "$TMP4/daemon.log"; fail "ci rerun: a check that passes on re-run should merge"; }
@@ -1492,13 +1514,20 @@ wait_status_at "$BASE4" "$IID_SL2" "Done" 120 || { tail -30 "$TMP4/daemon.log"; 
 sed -i "\|o/$IID_SL1|d" "$GHS/hold_ci"
 wait_status_at "$BASE4" "$IID_SL1" "Done" 120 || { tail -30 "$TMP4/daemon.log"; fail "slots: the held PR never merged after its CI finished"; }
 pass "slots: a PR waiting on CI holds no agent slot (O_MAX_CONCURRENT=1, a second issue ships meanwhile)"
-restart_d4 O_MERGE_GATE=1 O_AUTO_FILE=0
+restart_d4 O_MERGE_GATE=1 O_AUTO_FILE=0 O_ISSUE_CAP_CENTS=500
 IID_NF="$(gh_issue '[sim:no-commit] fails with no follow-up')"
+IID_CAP="$(gh_issue '[sim:bad-verify] keeps failing past its cost cap')"
 wait_status_at "$BASE4" "$IID_NF" "Failed" 120 || { tail -30 "$TMP4/daemon.log"; fail "auto-file off: no-commit issue never Failed"; }
 sleep 2
 IDN_NF="$(sqlite3 "$TMP4/o.db" "SELECT identifier FROM issue WHERE id='$IID_NF'")"
 [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM issue WHERE fingerprint='verify-final:$IDN_NF'")" = "0" ] || fail "auto-file off: O_AUTO_FILE=0 still filed a follow-up"
 pass "auto-file off: O_AUTO_FILE=0 files no 'Fix failing verification' follow-up"
+# sim runs cost 300c each: after 2 runs (600c >= 500c) the 3rd attempt is
+# never dispatched; the issue parks In Review as capped.
+wait_status_at "$BASE4" "$IID_CAP" "In Review" 120 || { tail -30 "$TMP4/daemon.log"; fail "cost cap: issue over O_ISSUE_CAP_CENTS was not parked"; }
+[ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM run WHERE issue_id='$IID_CAP'")" = "2" ] || fail "cost cap: expected 2 runs before the cap, got $(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM run WHERE issue_id='$IID_CAP'")"
+sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_CAP' ORDER BY started_at DESC LIMIT 1" | grep "per-issue cost cap" >/dev/null || fail "cost cap: reason not recorded"
+pass "cost cap: O_ISSUE_CAP_CENTS parks an issue In Review once its runs cost that much (no 3rd attempt)"
 
 # ============================================================
 # Agent sandbox — 5th daemon, O_SANDBOX=bwrap + O_API_TOKEN
@@ -1530,6 +1559,8 @@ if [ -e "$HOME/.o/o.db" ]; then p="$p db:VISIBLE"; else p="$p db:hidden"; fi
 if echo x >> "$SBX_REPO/.git/hooks/post-merge" 2>/dev/null; then p="$p hooks:WRITABLE"; else p="$p hooks:denied"; fi
 if git config core.fsmonitor "touch /tmp/pwned" 2>/dev/null; then p="$p config:WRITABLE"; else p="$p config:denied"; fi
 git worktree prune >/dev/null 2>&1 || true   # other runs' worktrees are hidden here; must not be pruned
+if [ -n "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ]; then p="$p gh_token:VISIBLE"; else p="$p gh_token:hidden"; fi
+if git push https://example.invalid/x.git HEAD 2>&1 | grep -q o-no-push; then p="$p push:blocked"; else p="$p push:OPEN"; fi
 n="$(cat /proc/*/environ 2>/dev/null | tr '\0' '\n' | grep -c '^O_API_TOKEN=')"
 p="$p token_procs:$n"
 echo "$p" > probes.txt
@@ -1539,7 +1570,7 @@ git add probes.txt run-stamp.txt && git commit -q -m "sandbox probes"
 printf '%s\n' '{"type":"result","total_cost_usd":0.01,"session_id":"sbx-1"}'
 STUB
 chmod +x "$TMP5/agent-stub"
-HOME="$TMP5" O_DB="$TMP5/.o/o.db" O_PORT="$PORT5" O_NO_OPEN=1 O_SANDBOX=bwrap O_API_TOKEN="$TOK" \
+HOME="$TMP5" O_DB="$TMP5/.o/o.db" O_PORT="$PORT5" O_NO_OPEN=1 O_SANDBOX=bwrap O_API_TOKEN="$TOK" GH_TOKEN=fake-gh-token \
   O_CLAUDE_BIN="$TMP5/agent-stub" SBX_REPO="$SCRATCHS" SBX_ARGS="$TMP5/agent-args" ./bin/swarmd >"$TMP5/daemon.log" 2>&1 &
 DAEMON5_PID=$!
 up5=""
@@ -1565,11 +1596,11 @@ IID_SBX="$(jget "$(ocurl -s -X POST "$BASE5/api/companies/$CIDS/issues" -H 'Cont
 pass "token: 401 on company writes without bearer (incl. verify_cmd rewrite), issue filing stays open"
 wait_status_at "$BASE5" "$IID_SBX" "Done" 90 || { tail -30 "$TMP5/daemon.log"; fail "sandbox: boxed agent's issue never Done"; }
 probes="$(git -C "$SCRATCHS" show main:probes.txt)"
-[ "$probes" = " repo:denied db:hidden hooks:denied config:denied token_procs:0" ] \
+[ "$probes" = " repo:denied db:hidden hooks:denied config:denied gh_token:hidden push:blocked token_procs:0" ] \
   || fail "sandbox: unexpected probe results: '$probes'"
 [ "$(cat "$SCRATCHS/README.md")" = "sandbox project" ] || fail "sandbox: main checkout was modified"
 [ -d "$SCRATCHS/.git/worktrees/other" ] || fail "sandbox: an agent's 'git worktree prune' deleted another run's worktree entry"
-pass "sandbox: repo/hooks/config not writable, ~/.o hidden, token not visible in /proc, other runs' worktrees survive a prune; worktree commit merged"
+pass "sandbox: repo/hooks/config not writable, ~/.o hidden, no API/GitHub token, git push blocked, other runs' worktrees survive a prune; worktree commit merged"
 grep -- "--model haiku " "$TMP5/agent-args" >/dev/null || { cat "$TMP5/agent-args"; fail "model ladder: attempt 1 should run on haiku"; }
 pass "model ladder: a builder's first attempt runs on haiku"
 IID_SBX2="$(jget "$(ocurl -s -X POST "$BASE5/api/companies/$CIDS/issues" -H 'Content-Type: application/json' -d '{"title":"fix the scheduler","body":"The race is in core/sched.c."}')" 'd["id"]')"

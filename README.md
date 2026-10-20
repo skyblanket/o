@@ -137,7 +137,8 @@ O edits real repositories on its own. The guard rails are the point.
 - **Protected paths.** Each company declares `protected_paths`. An agent may not
   change them; a commit that does is rejected (`red_protected`) before it can
   merge. Renames count as touching both paths, and the agent's prompt lists the
-  fence. A builder whose task needs a protected file commits nothing and ends
+  fence. Agents get no GitHub token, and every `git push` from inside a run is
+  rewritten to an unusable URL: only O pushes, after verify and review. A builder whose task needs a protected file commits nothing and ends
   with `NEEDS_HUMAN: <the change>`: the issue parks In Review with that ask
   (`run.needs_human`) instead of burning its attempts. The test harness and this loop's own invariants live behind it, so an
   agent maintaining O cannot edit the checks that gate its merges.
@@ -272,6 +273,14 @@ that judge it. Protect `.o-review.json` with `protected_paths`. (It is a root fi
   key, needs the top-level list.
   Only the required checks decide: other jobs on the PR are neither waited
   for nor blamed.
+- **Gate model by tier:** a tier may name a lighter `gate_model` (e.g.
+  `"sonnet"` for docs). A PR gets it only when every file it touches is in a
+  tier that names one (the strongest of them); otherwise `O_MERGE_MODEL`.
+- **Parked PRs stay mergeable:** when an approved PR waiting on a human starts
+  conflicting with base, O hands it back to its builder for a rebase (once per
+  head commit), and it comes back for sign-off.
+- **No empty changes:** a branch whose commits net out to nothing is
+  `red_no_commit` at verify, and an empty PR is rejected without a model.
 - **A failed CI job is re-run once** (per head commit) before the change is
   blamed. Runner and mirror hiccups pass on the re-run; a failure that repeats
   goes back to the builder as `red_ci`. `O_CI_RERUN=0` turns it off.
@@ -425,6 +434,7 @@ The daemon reads its configuration from the environment. All are optional.
 | `O_TIMEOUT_FLAT_CENTS` | `300` | cost charged for an agent run killed on its wall-clock cap. |
 | `O_REVIEW` | unset | set `1` to require a reviewer model's APPROVE before any green change merges. |
 | `O_MODEL_LADDER` | `haiku,sonnet,opus` | builder models. Every issue starts on the first, unless a `.o-review.json` tier names a stronger `builder` (e.g. `"builder": "sonnet"` on the runtime tier): an issue whose text names one of that tier's paths, or whose earlier attempt touched them, starts there. Retries stay on the same model, with the verdict in the prompt. A run moves up one rung only when the agent itself ends it with `ESCALATE: <why>`. An agent's own `model` overrides the ladder; `""` uses the CLI default. |
+| `O_ISSUE_CAP_CENTS` | `0` (off) | per-issue spend cap across all its runs (builder, review, gate). An issue at the cap gets no more retries: it parks In Review (`capped`, `run.capped`) with its last verdict. |
 | `O_AUTO_FILE` | on | when an issue fails for good, O files a "Fix failing verification" follow-up (one level deep). `0` turns it off: the failed issue waits for a human. Revert follow-ups (main regressed) are always filed. |
 | `O_VERIFY_RETRY` | `1` | a failed verify is re-run once before it counts. Fail-then-pass is logged `verify.flaky` and ships with no retry. `0` turns it off. |
 | `O_REVIEW_MODEL` | `sonnet` | model for the pre-PR reviewer. |
