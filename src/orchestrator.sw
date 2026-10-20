@@ -139,6 +139,14 @@ fun rw_each(paths) {
     }
 }
 
+# The workspace's own entry under .git/worktrees, from its .git file
+# ("gitdir: <path>"); git names it after the directory unless that collides.
+fun own_worktree_dir(ws, git) {
+    f = f"{ws}/.git"
+    line = if (file_exists(f) == 'true') { string_trim(file_read(f)) } else { "" }
+    if (string_starts_with(line, "gitdir: ") == 'true') { string_trim(string_sub(line, 8, string_length(line) - 8)) } else { git ++ "/worktrees/" ++ Std.last(string_split(ws, "/")) }
+}
+
 fun sandbox_prefix(ws, repo) {
     if (getenv("O_SANDBOX") == "bwrap" && string_length(repo) > 0) {
         home = getenv("HOME")
@@ -146,6 +154,9 @@ fun sandbox_prefix(ws, repo) {
         "bwrap --die-with-parent --unshare-pid --ro-bind / / --dev /dev --proc /proc --bind /tmp /tmp" ++ extra_rw_binds(getenv("O_SANDBOX_RW")) ++
             f" --ro-bind {sq(repo)} {sq(repo)} --tmpfs {sq(home)}/.o --bind {sq(ws)} {sq(ws)}" ++
             f" --bind {sq(git)} {sq(git)} --ro-bind-try {sq(git)}/config {sq(git)}/config --ro-bind-try {sq(git)}/hooks {sq(git)}/hooks" ++
+            # Other runs' worktree entries are read-only: their directories are
+            # hidden in here, so a `git worktree prune` would delete them.
+            f" --ro-bind-try {sq(git)}/worktrees {sq(git)}/worktrees --bind-try {sq(own_worktree_dir(ws, git))} {sq(own_worktree_dir(ws, git))}" ++
             f" --bind-try {sq(home)}/.claude {sq(home)}/.claude --bind-try {sq(home)}/.claude.json {sq(home)}/.claude.json -- "
     } else {
         ""
