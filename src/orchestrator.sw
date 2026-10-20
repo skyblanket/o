@@ -422,7 +422,7 @@ fun do_tick(db, dbpath, port, tick_n, running, retry) {
     sr = map_get(swept, "running")
     sq = map_get(swept, "retry")
     cands = Store.candidate_issues(db)
-    slots = dispatch_slots(db, map_size(sr))
+    slots = dispatch_slots(db, busy_slots(sr))
     dispatch_batch(db, cands, slots, sr, sq, now)
 }
 
@@ -534,6 +534,13 @@ fun phase_timeout(phase) {
     else { if (phase == 'merge') { 1200000 }
     else { if (phase == 'ci') { ci_timeout_s() * 1000 + 120000 }
     else { if (phase == 'gate') { gate_timeout_ms() * 2 + 120000 } else { stall_timeout() + 60000 } }}}
+}
+
+# Slots are for agent work (build, verify, review). An issue waiting on
+# GitHub CI, the merge gate or a merge holds no slot, so a few slow CI runs
+# can't stall the backlog.
+fun busy_slots(running) {
+    length([k for k in map_keys(running) when Std.any(['agent', 'verify', 'review'], fn(p) { default_phase(map_get(map_get(running, k), "phase")) == p })])
 }
 
 fun default_phase(p) {
@@ -1738,13 +1745,21 @@ fun review_worker(orch, run_id, issue_id, ws, repo, base, title, body, vcmd) {
     cost = run_cost(elem(r, 0), parse_cost(f"{ws}/review.json"))
     text = chat_reply_claude(f"{ws}/review.json")
     # One protocol with the merge gate: the LAST "VERDICT:" line decides.
-    v = parse_verdict(string_split(text, "\n"), "")
+    # A screen that drops the prefix and answers a bare "APPROVE" / "REJECT: .."
+    # line still counts; the merge gate stays strict (no VERDICT -> fail-closed).
+    v0 = parse_verdict(string_split(text, "\n"), "")
+    v = if (string_length(v0) > 0) { v0 } else { parse_verdict([f"VERDICT: {l}" for l in string_split(text, "\n") when bare_verdict(l) == 'true'], "") }
     if (v == "APPROVE") {
         send(orch, {'review_done', run_id, issue_id, 'true', "", cost})
     } else {
         why = if (string_length(v) == 0) { "the reviewer gave no VERDICT line (fail-closed)" } else { v }
         send(orch, {'review_done', run_id, issue_id, 'false', "Code review rejected this change:\n" ++ why ++ "\n\nFull review:\n" ++ text, cost})
     }
+}
+
+fun bare_verdict(line) {
+    l = string_trim(string_replace(string_replace(line, "`", ""), "*", ""))
+    if (l == "APPROVE" || string_starts_with(l, "REJECT:") == 'true') { 'true' } else { 'false' }
 }
 
 fun build_review_prompt(title, body, diff, evidence) {
@@ -1896,7 +1911,9 @@ fun ci_poll(orch, run_id, issue_id, gh_repo, branch, num, base, required, pushed
     head = if (pr == nil) { nil } else { map_get(pr, "head") }
     sha = if (head == nil) { "" } else { str_or(map_get(head, "sha"), "") }
     checks = pr_checks(gh_repo, sha)
-    verdict = classify_checks(checks, "success", "")
+    # With required checks (by tier), only those decide: a docs PR doesn't wait
+    # on, or fail by, the slow macOS/hardening jobs it doesn't need.
+    verdict = classify_checks(required_only(checks, required), "success", "")
     settled = timestamp() - pushed_at >= env_int("O_CI_SETTLE_S", 30) * 1000
     # Every check .o-review.json requires must have run AND passed, not just
     # whatever has reported so far.
@@ -1909,8 +1926,15 @@ fun ci_poll(orch, run_id, issue_id, gh_repo, branch, num, base, required, pushed
         send(orch, {'ci_done', run_id, issue_id, "merged", "", ""})
     } else { if (mstate == "dirty") {
         send(orch, {'ci_done', run_id, issue_id, "conflict", "", "The PR for " ++ branch ++ " conflicts with its base branch."})
+    } else { if (string_starts_with(verdict, "failed") == 'true' && ci_rerun(gh_repo, issue_id, sha, required_only(checks, required)) == 'true') {
+        # First failure on this head: re-run the failed jobs once and keep
+        # polling. Runner/mirror hiccups pass on the rerun; a real failure
+        # fails again and goes to the builder below.
+        _s = sleep(env_int("O_CI_POLL_S", 30) * 1000)
+        ci_poll(orch, run_id, issue_id, gh_repo, branch, num, base, required, timestamp(), deadline)
     } else { if (string_starts_with(verdict, "failed") == 'true') {
-        send(orch, {'ci_done', run_id, issue_id, "red_ci", "", "CI checks failed on PR #" ++ to_string(num) ++ ": " ++ string_sub(verdict, 7, string_length(verdict) - 7) ++ "\nSee `gh pr checks " ++ to_string(num) ++ " -R " ++ gh_repo ++ "` and `gh run view --log-failed` for the logs."})
+        again = if (file_exists(ci_rerun_marker(issue_id, sha)) == 'true') { " (failed again after a re-run)" } else { "" }
+        send(orch, {'ci_done', run_id, issue_id, "red_ci", "", "CI checks failed on PR #" ++ to_string(num) ++ again ++ ": " ++ string_sub(verdict, 7, string_length(verdict) - 7) ++ "\nSee `gh pr checks " ++ to_string(num) ++ " -R " ++ gh_repo ++ "` and `gh run view --log-failed` for the logs."})
     } else { if (timestamp() > deadline) {
         send(orch, {'ci_done', run_id, issue_id, "red_timeout", "", "CI did not finish within O_CI_TIMEOUT_S."})
     } else { if (pr != nil && verdict == "success" && behind > 0) {
@@ -1930,7 +1954,50 @@ fun ci_poll(orch, run_id, issue_id, gh_repo, branch, num, base, required, pushed
     } else {
         _s = sleep(env_int("O_CI_POLL_S", 30) * 1000)
         ci_poll(orch, run_id, issue_id, gh_repo, branch, num, base, required, pushed_at, deadline)
-    }}}}}}
+    }}}}}}}
+}
+
+fun required_only(checks, required) {
+    if (length(required) == 0) { checks } else { [c for c in checks when Std.any(required, fn(n) { str_or(map_get(c, "name"), str_or(map_get(c, "context"), "")) == n })] }
+}
+
+fun ci_rerun_marker(issue_id, sha) {
+    getenv("HOME") ++ "/.o/ci-rerun/" ++ issue_id ++ "-" ++ sha
+}
+
+# Re-run the failed GitHub Actions jobs on this head, once per sha
+# (O_CI_RERUN=0 turns it off). 'true' when a rerun was requested. Checks that
+# aren't Actions runs (no /actions/runs/<id> in details_url) can't be re-run.
+fun ci_rerun(gh_repo, issue_id, sha, checks) {
+    marker = ci_rerun_marker(issue_id, sha)
+    if (getenv("O_CI_RERUN") == "0" || string_length(sha) == 0 || file_exists(marker) == 'true') {
+        'false'
+    } else {
+        rids = Std.unique([actions_run_id(str_or(map_get(c, "details_url"), "")) for c in checks when check_failed(c) == 'true'])
+        ok = [r for r in rids when string_length(r) > 0 && elem(gh_api(f"-X POST repos/{gh_repo}/actions/runs/{r}/rerun-failed-jobs"), 0) == 0]
+        if (length(ok) == 0) {
+            'false'
+        } else {
+            _m = shell(f"mkdir -p {sq(getenv("HOME"))}/.o/ci-rerun")
+            _w = file_write(marker, Std.join(ok, " ") ++ "\n")
+            'true'
+        }
+    }
+}
+
+# ".../actions/runs/<id>/job/<j>" -> "<id>", else "".
+fun actions_run_id(url) {
+    if (string_contains(url, "/actions/runs/") == 'true') {
+        hd(string_split(Std.last(string_split(url, "/actions/runs/")), "/"))
+    } else {
+        ""
+    }
+}
+
+fun check_failed(c) {
+    concl = string_lower(str_or(map_get(c, "conclusion"), ""))
+    state = string_lower(str_or(map_get(c, "state"), ""))
+    if (concl == "failure" || concl == "cancelled" || concl == "timed_out" || concl == "action_required" || concl == "startup_failure" || state == "failure" || state == "error") { 'true' } else { 'false' }
 }
 
 # Every check on the head commit: check runs (Actions and apps) plus legacy
@@ -1973,9 +2040,8 @@ fun classify_checks(checks, acc, failed) {
         c = hd(checks)
         name = str_or(map_get(c, "name"), str_or(map_get(c, "context"), "check"))
         st = string_lower(str_or(map_get(c, "status"), ""))
-        concl = string_lower(str_or(map_get(c, "conclusion"), ""))
         state = string_lower(str_or(map_get(c, "state"), ""))
-        bad = concl == "failure" || concl == "cancelled" || concl == "timed_out" || concl == "action_required" || concl == "startup_failure" || state == "failure" || state == "error"
+        bad = check_failed(c) == 'true'
         waiting = (string_length(st) > 0 && st != "completed") || state == "pending" || state == "expected"
         if (bad) {
             sep = if (string_length(failed) > 0) { ", " } else { "" }
@@ -2330,7 +2396,7 @@ fun parse_verdict(lines, acc) {
     if (length(lines) == 0) {
         acc
     } else {
-        l = string_trim(string_replace(hd(lines), "`", ""))
+        l = string_trim(string_replace(string_replace(hd(lines), "`", ""), "*", ""))
         if (string_starts_with(l, "VERDICT:") == 'true') {
             v = string_trim(string_sub(l, 8, string_length(l) - 8))
             next = if (string_starts_with(v, "APPROVE") == 'true') { "APPROVE" }

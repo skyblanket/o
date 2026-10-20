@@ -264,6 +264,11 @@ that judge it. Protect `.o-review.json` with `protected_paths`. (It is a root fi
   waits for the quick check, not a 14-minute sanitizer job. A PR needs the
   union over the files it touches. A file in no tier, or in a tier without the
   key, needs the top-level list.
+  Only the required checks decide: other jobs on the PR are neither waited
+  for nor blamed.
+- **A failed CI job is re-run once** (per head commit) before the change is
+  blamed. Runner and mirror hiccups pass on the re-run; a failure that repeats
+  goes back to the builder as `red_ci`. `O_CI_RERUN=0` turns it off.
 - **Adopted PRs wait for CI too:** a PR picked back up from In Review (for
   example after a restart) goes through the same CI wait before the gate.
 - **One PR per issue:** when O gives up on an issue, it closes that issue's PR
@@ -396,7 +401,7 @@ The daemon reads its configuration from the environment. All are optional.
 |---|---|---|
 | `SW_SCHEDULERS` | CPU count | scheduler threads (a swarmrt setting). Each running agent, verify, gate review or persona holds one while its subprocess runs, and when all are held the API and orchestrator stall; set it well above how many can run at once (`deploy/o.env.example` uses 32). |
 | `O_TICK_MS` / `O_BACKOFF_MS` | `5000` / `2000` | orchestrator tick and base retry backoff in ms (the test suite runs at 500 / 300). |
-| `O_MAX_CONCURRENT` | `3` | agent runs in flight across all companies. Keep `SW_SCHEDULERS` above twice this. |
+| `O_MAX_CONCURRENT` | `3` | agent runs (build, verify, review) in flight across all companies. PRs waiting on CI, the gate or a merge hold no slot. Keep `SW_SCHEDULERS` above twice this. |
 | `O_DB` | `~/.o/o.db` | control-plane SQLite path. |
 | `O_PORT` | `4100` | HTTP port. |
 | `O_CLAUDE_BIN` | `claude` on `PATH` | claude-code binary for the `claude-code` runtime. |
