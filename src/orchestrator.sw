@@ -664,38 +664,15 @@ fun dispatch_batch(db, cands, slots, running, retry, now) {
                         _is = Store.issue_set_status(db, iid, "Failed")
                         _a = Store.log_activity(db, cid, "orchestrator", "run.failed_final", iid)
                         dispatch_batch(db, tl(cands), slots, running, map_remove(retry, iid), now)
-                    } else { if (attempt > 1 && over_issue_cap(db, iid) == 'true') {
-                        _p = park_capped(db, issue, iid)
-                        dispatch_batch(db, tl(cands), slots, running, map_remove(retry, iid), now)
                     } else {
                         running2 = dispatch_one(db, issue, iid, attempt, running, now)
                         retry2 = map_remove(retry, iid)
                         dispatch_batch(db, tl(cands), slots - 1, running2, retry2, now)
-                    }}
+                    }
                 }
             }
         }
     }
-}
-
-# O_ISSUE_CAP_CENTS (0 = off): an issue whose runs (builder, review and gate)
-# have cost this much gets no more retries; it parks In Review for a human
-# with its last verdict, instead of burning more attempts.
-fun over_issue_cap(db, iid) {
-    cap = env_int("O_ISSUE_CAP_CENTS", 0)
-    if (cap > 0 && Store.issue_cost(db, iid) >= cap) { 'true' } else { 'false' }
-}
-
-fun park_capped(db, issue, iid) {
-    cid = map_get(issue, "company_id")
-    last = Store.last_run_for_issue(db, iid)
-    spent = Store.issue_cost(db, iid)
-    cap = env_int("O_ISSUE_CAP_CENTS", 0)
-    prev = if (last == nil) { "" } else { str_or(map_get(last, "verify_state"), "") ++ ": " ++ str_or(map_get(last, "verify_output"), "") }
-    _v = if (last == nil) { "" } else { Store.run_set_verify(db, map_get(last, "id"), "capped", f"Over the per-issue cost cap ({spent}c spent, O_ISSUE_CAP_CENTS={cap}), so no more retries. Last verdict, {prev}") }
-    _s = Store.issue_set_status(db, iid, "In Review")
-    _a = Store.log_activity(db, cid, "orchestrator", "run.capped", iid)
-    print(f"[orch] CAPPED {str_or(map_get(issue, "identifier"), iid)}: {spent}c >= {cap}c, parked for a human")
 }
 
 # The attempt number for an issue that is NOT in the in-memory retry map.
@@ -2745,7 +2722,7 @@ fun handle_pr_state(db, running, retry, issue_id, state, num) {
             # An approved PR waiting on a human now conflicts with base (other
             # merges landed). Hand it back to its builder for a rebase, once
             # per head commit, so a rebase that fails can't loop. Only PRs the
-            # gate passed: capped or needs-human issues stay with the human.
+            # gate passed: needs-human issues stay with the human.
             sha = string_sub(state, 6, string_length(state) - 6)
             lvs = if (last == nil) { "" } else { str_or(map_get(last, "verify_state"), "") }
             marker = f"{home}/.o/rebase/{issue_id}-{sha}"

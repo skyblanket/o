@@ -1472,7 +1472,8 @@ restart_d4 O_MERGE_GATE=1 O_CI_TIMEOUT_S=6
 IID_RC="$(gh_issue '[sim:good] required check never reports')"
 echo "o/$IID_RC" >> "$GHS/only_lint"
 wait_status_at "$BASE4" "$IID_RC" "Failed" 200 || { tail -30 "$TMP4/daemon.log"; fail "required: PR without the required 'build' check did not time out"; }
-[ "$(sqlite3 "$TMP4/o.db" "SELECT verify_state FROM run WHERE issue_id='$IID_RC' ORDER BY started_at DESC LIMIT 1")" = "red_timeout" ] || fail "required: expected red_timeout"
+vs_rc="$(sqlite3 "$TMP4/o.db" "SELECT verify_state FROM run WHERE issue_id='$IID_RC' ORDER BY started_at DESC LIMIT 1")"
+[ "$vs_rc" = "red_timeout" ] || { sqlite3 "$TMP4/o.db" "SELECT attempt, verify_state, substr(verify_output,1,200) FROM run WHERE issue_id='$IID_RC'"; fail "required: expected red_timeout, got '$vs_rc'"; }
 git -C "$GHS/remote.git" log --oneline main | grep "o/$IID_RC" >/dev/null && fail "required: merged without the required check"
 pass "required: a PR whose required check never passes is never merged (red_timeout)"
 IID_DOC="$(gh_issue '[sim:docs] docs-only change')"
@@ -1514,20 +1515,13 @@ wait_status_at "$BASE4" "$IID_SL2" "Done" 120 || { tail -30 "$TMP4/daemon.log"; 
 sed -i "\|o/$IID_SL1|d" "$GHS/hold_ci"
 wait_status_at "$BASE4" "$IID_SL1" "Done" 120 || { tail -30 "$TMP4/daemon.log"; fail "slots: the held PR never merged after its CI finished"; }
 pass "slots: a PR waiting on CI holds no agent slot (O_MAX_CONCURRENT=1, a second issue ships meanwhile)"
-restart_d4 O_MERGE_GATE=1 O_AUTO_FILE=0 O_ISSUE_CAP_CENTS=500
+restart_d4 O_MERGE_GATE=1 O_AUTO_FILE=0
 IID_NF="$(gh_issue '[sim:no-commit] fails with no follow-up')"
-IID_CAP="$(gh_issue '[sim:bad-verify] keeps failing past its cost cap')"
 wait_status_at "$BASE4" "$IID_NF" "Failed" 120 || { tail -30 "$TMP4/daemon.log"; fail "auto-file off: no-commit issue never Failed"; }
 sleep 2
 IDN_NF="$(sqlite3 "$TMP4/o.db" "SELECT identifier FROM issue WHERE id='$IID_NF'")"
 [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM issue WHERE fingerprint='verify-final:$IDN_NF'")" = "0" ] || fail "auto-file off: O_AUTO_FILE=0 still filed a follow-up"
 pass "auto-file off: O_AUTO_FILE=0 files no 'Fix failing verification' follow-up"
-# sim runs cost 300c each: after 2 runs (600c >= 500c) the 3rd attempt is
-# never dispatched; the issue parks In Review as capped.
-wait_status_at "$BASE4" "$IID_CAP" "In Review" 120 || { tail -30 "$TMP4/daemon.log"; fail "cost cap: issue over O_ISSUE_CAP_CENTS was not parked"; }
-[ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM run WHERE issue_id='$IID_CAP'")" = "2" ] || fail "cost cap: expected 2 runs before the cap, got $(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM run WHERE issue_id='$IID_CAP'")"
-sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_CAP' ORDER BY started_at DESC LIMIT 1" | grep "per-issue cost cap" >/dev/null || fail "cost cap: reason not recorded"
-pass "cost cap: O_ISSUE_CAP_CENTS parks an issue In Review once its runs cost that much (no 3rd attempt)"
 
 # ============================================================
 # Agent sandbox — 5th daemon, O_SANDBOX=bwrap + O_API_TOKEN
