@@ -1272,7 +1272,8 @@ fun sim_marker(title) {
     else { if (string_contains(title, "[sim:real-test]") == 'true') { "real-test" }
     else { if (string_contains(title, "[sim:vacuous-test]") == 'true') { "vacuous-test" }
     else { if (string_contains(title, "[sim:risky]") == 'true') { "risky" }
-    else { "good" }}}}}}}}
+    else { if (string_contains(title, "[sim:docs]") == 'true') { "docs" }
+    else { "good" }}}}}}}}}
 }
 
 # Carry out the marker's action in the worktree. Every case except no-commit
@@ -1303,11 +1304,14 @@ fun sim_act(workspace, issue_id, marker, protected) {
                     # a "test" that passes whether or not the change exists
                     _f = file_write(f"{workspace}/feat_{issue_id}", "on")
                     sim_commit(workspace, f"tests/t_{issue_id}.sh", "exit 0")
+                } else { if (marker == "docs") {
+                    _d = shell(f"mkdir -p {workspace}/docs")
+                    shell(f"cd {workspace} && echo docs > docs/d_{issue_id}.md && git add docs/d_{issue_id}.md && git commit -q -m sim-docs")
                 } else { if (marker == "risky") {
                     sim_commit(workspace, f"risky/r_{issue_id}.txt", "runtime change")
                 } else {
                     sim_commit(workspace, f"sim_{issue_id}.txt", "ok")
-                }}}}
+                }}}}}
                 }
             }
         }
@@ -1852,7 +1856,9 @@ fun start_ci(db, running, retry, info, company, run_id, issue_id, now) {
     pr_body = "Automated change by O for " ++ ident ++ ". It passed the company verify command" ++ (if (review_enabled() == 'true') { " and the review gate" } else { "" }) ++ " before this PR was opened.\n\n" ++ body ++ closes
     _w = file_write(f"{ws}/PR.md", pr_body)
     _a = Store.log_activity(db, company_id, "orchestrator", "ci.start", issue_id)
-    required = cfg_list(review_config(repo, company_base(company, repo)), "required_checks")
+    base = company_base(company, repo)
+    files = lines_of(elem(shell(f"git -C {sq(ws)} diff --no-renames --name-only {base}...HEAD"), 1))
+    required = required_for(review_config(repo, base), files)
     cpid = spawn(ci_worker(self(), run_id, issue_id, ws, f"o/{issue_id}", detect_base(repo), gh_repo, title, required))
     info2 = %{run_id: run_id, worker_pid: cpid, started_at: now, attempt: map_get(info, "attempt"), company_id: company_id, agent_id: map_get(info, "agent_id"), phase: 'ci', workspace: ws}
     %{running: map_put(running, issue_id, info2), retry: map_remove(retry, issue_id)}
@@ -2154,6 +2160,21 @@ fun cfg_list(cfg, k) { list_or_empty(map_get(cfg, k)) }
 
 fun starts_any_of(f, prefixes) {
     Std.any(prefixes, fn(p) { string_starts_with(f, p) == 'true' })
+}
+
+# CI checks this PR must pass: each touched file's tier may name its own
+# `required_checks` (a docs change needn't wait for a 14-minute sanitizer
+# job); a file in no tier, or in a tier without the key, needs the top-level
+# list. The union over all files is required.
+fun required_for(cfg, files) {
+    top = cfg_list(cfg, "required_checks")
+    tiers = cfg_list(cfg, "tiers")
+    per = [tier_required(tier_of(tiers, f), top) for f in files]
+    if (length(files) == 0) { top } else { Std.unique(flatten(per)) }
+}
+
+fun tier_required(t, top) {
+    if (t == nil) { top } else { if (map_get(t, "required_checks") == nil) { top } else { list_or_empty(map_get(t, "required_checks")) } }
 }
 
 fun tier_of(tiers, f) {
@@ -2461,15 +2482,21 @@ fun handle_pr_state(db, running, retry, issue_id, state, num) {
             _a = Store.log_activity(db, company_id, "github", "pr.closed", issue_id)
             %{running: running, retry: retry}
         } else {
-            # adopt: back into the running map in the gate phase, then to the
-            # maintainer exactly as if CI had just gone green.
+            # adopt: back into the running map in the CI phase. The PR still has
+            # to pass its required checks on current main (the same ci_poll a
+            # fresh PR gets, without re-pushing) before the maintainer sees it.
             now = timestamp()
             _i = Store.issue_set_status(db, issue_id, "Verifying")
             _r = Store.run_set_state(db, run_id, "Verifying")
             _a = Store.log_activity(db, company_id, "orchestrator", "pr.adopted", issue_id)
             attempt = if (last == nil) { 1 } else { map_get(last, "attempt") }
-            info = %{run_id: run_id, worker_pid: nil, started_at: now, attempt: attempt, company_id: company_id, agent_id: map_get(issue, "assignee_agent_id"), phase: 'ci', workspace: ws}
-            handle_ci_green(db, map_put(running, issue_id, info), retry, run_id, issue_id, num)
+            gh_repo = str_or(map_get(company, "github_repo"), "")
+            pf = gh_json(f"repos/{gh_repo}/pulls/{num}/files?per_page=100")
+            files = if (pf == nil) { [] } else { [str_or(map_get(f, "filename"), "") for f in pf] }
+            required = required_for(review_config(repo, company_base(company, repo)), files)
+            cpid = spawn(ci_poll(self(), run_id, issue_id, gh_repo, f"o/{issue_id}", num, detect_base(repo), required, now, now + ci_timeout_s() * 1000))
+            info = %{run_id: run_id, worker_pid: cpid, started_at: now, attempt: attempt, company_id: company_id, agent_id: map_get(issue, "assignee_agent_id"), phase: 'ci', workspace: ws}
+            %{running: map_put(running, issue_id, info), retry: retry}
         }}
     }
 }

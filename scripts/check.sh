@@ -1215,7 +1215,7 @@ cat > "$SEEDGH/.o-review.json" <<'JSON'
   "suite": "true",
   "test_runners": [ { "paths": ["tests/"], "cmd": "sh {file}", "prove_fails": true } ],
   "required_checks": ["build"],
-  "tiers": [ { "name": "docs", "paths": ["docs/", "README.md"], "merge": "auto" },
+  "tiers": [ { "name": "docs", "paths": ["docs/", "README.md"], "merge": "auto", "required_checks": ["lint"] },
              { "name": "runtime", "paths": ["risky/"], "merge": "human", "extra": ["true"] } ] }
 JSON
 git -C "$SEEDGH" add -A; git -C "$SEEDGH" commit -q -m "seed gh project"; git -C "$SEEDGH" push -q origin main
@@ -1305,6 +1305,9 @@ restart_d4() {  # extra env assignments as args
 }
 gh_issue() { jget "$(ocurl -s -X POST "$BASE4/api/companies/$CIDG/issues" -H 'Content-Type: application/json' -d "{\"title\":\"$1\"}")" 'd["id"]'; }
 pr_of() { grep -lx "o/$1" "$GHS"/pr_* | head -1 | sed 's|.*/pr_||'; }
+# The PR-only PR parked above is adopted by the gate next; hold its CI so the
+# poller test below can prove an adopted PR still waits for its checks.
+echo "o/$IID_PRO" >> "$GHS/hold_ci"
 restart_d4 O_MERGE_GATE=1 O_MAINTAINER_ROTATE=3
 IID_GM="$(gh_issue '[sim:good] gate merges')"
 IID_GX="$(gh_issue '[sim:good] [gate:changes] needs work')"
@@ -1337,6 +1340,11 @@ pass "gate: APPROVE merged, REJECT -> red_merge_gate -> Failed, UNVERIFIED/no-ve
 # merged by the maintainer. A merge GitHub refused is never re-adopted, but
 # when a human merges it O marks it Done. An escalated PR a human closes
 # becomes Canceled.
+for _i in $(seq 1 60); do [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='pr.adopted' AND target='$IID_PRO'")" = "1" ] && break; sleep 1; done
+sleep 4
+git -C "$GHS/remote.git" log --oneline main | grep "o/$IID_PRO" >/dev/null && fail "poller: an adopted PR merged while its CI was still running"
+[ "$(sqlite3 "$TMP4/o.db" "SELECT status FROM issue WHERE id='$IID_PRO'")" != "Done" ] || fail "poller: adopted PR marked Done before CI finished"
+sed -i "\|o/$IID_PRO|d" "$GHS/hold_ci"
 wait_status_at "$BASE4" "$IID_PRO" "Done" 90 || { tail -30 "$TMP4/daemon.log"; fail "poller: PR-only parked PR was not adopted by the gate"; }
 git -C "$GHS/remote.git" log --oneline main | grep "o/$IID_PRO" >/dev/null || fail "poller: adopted PR not merged"
 [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='pr.adopted' AND target='$IID_PRO'")" = "1" ] || fail "poller: pr.adopted not logged once"
@@ -1350,6 +1358,7 @@ wait_status_at "$BASE4" "$IID_BLK" "Done" 30 || fail "poller: a human merge was 
 [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='pr.merged' AND target='$IID_BLK'")" = "1" ] || fail "poller: pr.merged not logged"
 touch "$GHS/closed_$(pr_of "$IID_GE")"
 wait_status_at "$BASE4" "$IID_GE" "Canceled" 30 || fail "poller: a closed PR was not Canceled"
+pass "poller: an adopted PR waits for its CI before the gate"
 pass "poller: PR-only PR adopted + merged by the gate; refused/escalated never re-adopted; human merge -> Done; closed -> Canceled"
 
 # ---- gate v2: the reviewer brief ----------------------------------------
@@ -1403,6 +1412,10 @@ wait_status_at "$BASE4" "$IID_RC" "Failed" 200 || { tail -30 "$TMP4/daemon.log";
 [ "$(sqlite3 "$TMP4/o.db" "SELECT verify_state FROM run WHERE issue_id='$IID_RC' ORDER BY started_at DESC LIMIT 1")" = "red_timeout" ] || fail "required: expected red_timeout"
 git -C "$GHS/remote.git" log --oneline main | grep "o/$IID_RC" >/dev/null && fail "required: merged without the required check"
 pass "required: a PR whose required check never passes is never merged (red_timeout)"
+IID_DOC="$(gh_issue '[sim:docs] docs-only change')"
+echo "o/$IID_DOC" >> "$GHS/only_lint"
+wait_status_at "$BASE4" "$IID_DOC" "Done" 120 || { tail -30 "$TMP4/daemon.log"; fail "tiered CI: a docs-only PR should merge on its tier's own required check (lint)"; }
+pass "tiered CI: a docs-only PR needs only its tier's required checks (lint, not build)"
 
 # ============================================================
 # Agent sandbox — 5th daemon, O_SANDBOX=bwrap + O_API_TOKEN
