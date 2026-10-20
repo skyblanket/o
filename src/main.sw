@@ -47,7 +47,8 @@ fun main() {
     if (string_length(holder) > 0) {
         # One daemon per DB: two orchestrators on one DB re-dispatch the same
         # issues and fight over its rows.
-        print(f"FATAL: another O daemon (pid {holder}) is already running on {dbpath}; stop it first.")
+        what = string_trim(elem(shell("tr '\\0' ' ' < /proc/" ++ holder ++ "/cmdline 2>/dev/null"), 1))
+        print(f"FATAL: another O daemon (pid {holder}: {what}) is already running on {dbpath}; stop it first.")
     } else { if (port_in_use(port0) == 'true') {
         print(f"FATAL: port {port0} already answers /api/health; another daemon is on it. Set O_PORT or stop it.")
     } else {
@@ -86,9 +87,11 @@ fun instance_holder(dbpath) {
     me = string_trim(elem(shell("echo $PPID"), 1))
     lock = dbpath ++ ".pid"
     held = if (file_exists(lock) == 'true') { string_trim(file_read(lock)) } else { "" }
-    # live = that pid still has this DB open (a pid reused by another process,
-    # even another swarmd on another DB, does not count)
-    probe = "h=" ++ Orchestrator.sq(held) ++ "; case \"$h\" in ''|*[!0-9]*) exit 1 ;; esac; p=$(realpath -m " ++ Orchestrator.sq(dbpath) ++ ") && ls -l /proc/$h/fd 2>/dev/null | grep -qF -- \" $p\""
+    # live = that pid is a swarmd that still has this DB open. A reused pid
+    # (an sqlite3 on this DB, another swarmd on another DB) does not count,
+    # nor does an orphaned child of the old daemon that inherited its handle.
+    # (no `exit` in a shell() command: the runtime then waits ~2 min for it)
+    probe = "h=" ++ Orchestrator.sq(held) ++ "; case \"$h\" in ''|*[!0-9]*) false ;; *) tr '\\0' ' ' < /proc/$h/cmdline 2>/dev/null | grep -q swarmd && p=$(realpath -m " ++ Orchestrator.sq(dbpath) ++ ") && ls -l /proc/$h/fd 2>/dev/null | grep -qF -- \" $p\" ;; esac"
     live = string_length(held) > 0 && held != me && elem(shell(probe), 0) == 0
     if (live) { held } else {
         _w = file_write(lock, me ++ "\n")
@@ -97,7 +100,7 @@ fun instance_holder(dbpath) {
 }
 
 fun port_in_use(port) {
-    if (elem(shell(f"curl -s -f -m 2 -o /dev/null http://127.0.0.1:{port}/api/health"), 0) == 0) { 'true' } else { 'false' }
+    if (elem(shell(f"curl --noproxy '*' -s -f -m 2 -o /dev/null http://127.0.0.1:{port}/api/health"), 0) == 0) { 'true' } else { 'false' }
 }
 
 # HTTP port — O_PORT env override, default 4100. Lets a second

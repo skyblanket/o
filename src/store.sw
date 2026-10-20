@@ -73,6 +73,27 @@ fun issues_in_review(db) {
     db_query(db, "SELECT i.id, i.company_id, c.github_repo FROM issue i JOIN company c ON c.id = i.company_id WHERE i.status = 'In Review' AND c.status = 'active' AND c.ship = 'pr' AND c.github_repo != ''", [])
 }
 
+# Issues on a PR-mode company that ran at least once but are not parked In
+# Review: a human may have merged their PR anyway (the self-check looks).
+fun issues_maybe_merged(db) {
+    db_query(db, "SELECT i.id, i.company_id, c.github_repo FROM issue i JOIN company c ON c.id = i.company_id WHERE i.status IN ('Failed', 'Backlog', 'Todo', 'In Progress', 'Verifying') AND c.status = 'active' AND c.ship = 'pr' AND c.github_repo != '' AND EXISTS (SELECT 1 FROM run r WHERE r.issue_id = i.id)", [])
+}
+
+# In Review issues whose latest run ended red: nothing will ever pick them up.
+fun issues_stranded_in_review(db) {
+    db_query(db, "SELECT i.id, i.company_id FROM issue i WHERE i.status = 'In Review' AND (SELECT r.verify_state FROM run r WHERE r.issue_id = i.id ORDER BY r.started_at DESC LIMIT 1) LIKE 'red_%'", [])
+}
+
+# Open issues whose worktree may need a health check.
+fun issues_with_workspace(db) {
+    db_query(db, "SELECT i.id, i.company_id, c.repo FROM issue i JOIN company c ON c.id = i.company_id WHERE i.status NOT IN ('Done', 'Canceled', 'Reverted') AND c.repo != ''", [])
+}
+
+fun activity_count_since(db, verb, since) {
+    r = db_query(db, "SELECT COUNT(*) AS n FROM activity WHERE verb = ? AND ts >= ?", [verb, since])
+    if (length(r) == 0) { 0 } else { map_get(hd(r), "n") }
+}
+
 fun company_set_maintainer(db, id, session, reviews) {
     _u = db_query(db, "UPDATE company SET maintainer_session = ?, maintainer_reviews = ?, updated_at = ? WHERE id = ?", [session, reviews, timestamp(), id])
     id

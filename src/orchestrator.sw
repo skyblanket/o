@@ -496,6 +496,7 @@ fun do_tick(db, dbpath, port, tick_n, running, retry) {
     _pp = maybe_persona_pass(db, dbpath, port, now)
     _pc = maybe_persona_confirm(db, dbpath, port, now)
     _gh = maybe_gh_poll(db, tick_n)
+    _sc = maybe_self_check(db, tick_n, running)
     swept = sweep_stalls(db, map_keys(running), running, retry, now)
     sr = map_get(swept, "running")
     sq = map_get(swept, "retry")
@@ -595,7 +596,13 @@ fun dispatch_slots(db, running_size) {
             base
         } else {
             if (Store.global_spent_today(db) >= limit) {
-                _p = print(f"[orch] GLOBAL daily cap {limit}c reached — dispatching 0 slots this tick")
+                # in-flight work (verifies, CI, gates) carries on; only new
+                # dispatch stops. Said once a day, not every tick.
+                day0 = (timestamp() / 86400000) * 86400000
+                _l = if (Store.activity_count_since(db, "budget.capped", day0) == 0) {
+                    _p = print(f"[orch] GLOBAL daily cap {limit}c reached: no new dispatch until the daily reset")
+                    Store.log_activity(db, "", "orchestrator", "budget.capped", f"{limit}")
+                } else { "" }
                 0
             } else {
                 base
@@ -1557,6 +1564,13 @@ fun handle_done(db, running, retry, run_id, issue_id, outcome, cost, session_id)
             _v = Store.run_set_verify(db, run_id, "needs_human", "The builder says this task needs a protected path, which only a human may change:\n" ++ ask)
             _s = Store.issue_set_status(db, issue_id, "In Review")
             _a = Store.log_activity(db, company_id, "orchestrator", "run.needs_human", issue_id)
+            # an issue imported from GitHub gets the ask where its humans look
+            company = Store.company_row(db, company_id)
+            gh = str_or(map_get(company, "github_repo"), "")
+            fp = str_or(map_get(Store.issue_row(db, issue_id), "fingerprint"), "")
+            _g = if (string_length(gh) > 0 && string_starts_with(fp, "gh:") == 'true') {
+                spawn(needs_human_comment_worker(gh, string_sub(fp, 3, string_length(fp) - 3), issue_id, ask))
+            } else { "" }
             %{running: map_remove(running, issue_id), retry: map_remove(retry, issue_id)}
         } else { if (outcome == 'succeeded') {
             # Spend is real whichever path we take, so account it immediately.
@@ -1629,14 +1643,27 @@ fun account_cost(db, company_id, cost) {
 #   (a) a commit must exist on the branch    -> red_no_commit
 #   (b) no changed file may touch protected/ -> red_protected
 #   (c) the verify command must exit 0       -> red_tests / red_timeout
-fun run_verify(orch, run_id, issue_id, ws, repo, base, verify_cmd, protected) {
-    rc = shell(f"git -C {ws} rev-list --count {base}..HEAD")
+# {count, empty?}: the branch's commits over base, and whether they net out to
+# nothing. Only a clean answer counts: rev-list printing a number, diff exiting
+# 0 (same) or 1 (differs); anything else reads as "not empty" so it goes on to
+# the real checks instead of failing good work.
+fun branch_delta(ws, base) {
+    rc = shell(f"git -C {sq(ws)} rev-list --count {sq(base)}..HEAD")
     count = string_trim(elem(rc, 1))
+    n = if (elem(rc, 0) == 0) { to_int(count) } else { nil }
+    same = if (n == nil) { 'false' } else { if (n == 0) { 'true' } else { if (elem(shell(f"git -C {sq(ws)} diff --quiet {sq(base)}...HEAD"), 0) == 0) { 'true' } else { 'false' } } }
+    {count, same}
+}
+
+fun run_verify(orch, run_id, issue_id, ws, repo, base, verify_cmd, protected) {
     # Commits that net out to nothing (reverted, or the branch reset to base)
-    # are no change either: never pay review, CI and the gate for them.
-    empty = count == "0" || elem(shell(f"git -C {ws} diff --quiet {base}...HEAD"), 0) == 0
-    if (empty) {
-        send(orch, {'verify_done', run_id, issue_id, "red_no_commit", (if (count == "0") { "" } else { "The branch's commits make no net change against " ++ base ++ "." })})
+    # are no change either: never pay review, CI and the gate for them. Asked
+    # twice before saying so: one bad read must not cost an attempt.
+    d1 = branch_delta(ws, base)
+    d = if (elem(d1, 1) == 'true') { branch_delta(ws, base) } else { d1 }
+    count = elem(d, 0)
+    if (elem(d, 1) == 'true') {
+        send(orch, {'verify_done', run_id, issue_id, "red_no_commit", (if (count == "0") { "" } else { "The branch's commits (" ++ count ++ ") make no net change against " ++ base ++ "." })})
     } else {
         # --no-renames: with rename detection on (git's default), a moved file
         # lists only its NEW path, so `git mv tests/heldout/x y` would slip a
@@ -2802,9 +2829,78 @@ fun review_poll_worker(orch, issue_id, gh_repo, adoptable) {
     }
 }
 
+# ---- self-checks (o#42) ------------------------------------------
+# What the operator used to fix by hand, every O_SELF_CHECK_S (300) and on the
+# first tick after a boot. Only issues with no live run are touched.
+#   a PR a human merged while the issue sat Failed/Backlog/... -> Done
+#   In Review with a red latest run (nothing will pick it up) -> Backlog
+#   a worktree whose git link is gone -> removed, so dispatch makes a new one
+fun maybe_self_check(db, tick_n, running) {
+    every = env_int("O_SELF_CHECK_S", 300) * 1000
+    if (tick_n == 1 || (tick_n * tick_interval()) % every < tick_interval()) {
+        _m = merged_check_each(Store.issues_maybe_merged(db), running)
+        _s = unstrand_each(db, Store.issues_stranded_in_review(db), running)
+        _w = worktree_check_each(db, Store.issues_with_workspace(db), running)
+        ""
+    } else { "" }
+}
+
+fun merged_check_each(rows, running) {
+    if (length(rows) == 0) { "" } else {
+        r = hd(rows)
+        iid = map_get(r, "id")
+        _s = if (map_has_key(running, iid) == 'true') { "" } else { spawn(merged_check_worker(self(), iid, map_get(r, "github_repo"))) }
+        merged_check_each(tl(rows), running)
+    }
+}
+
+# Only "merged" is news here: O closes PRs itself when the gate rejects one.
+fun merged_check_worker(orch, issue_id, gh_repo) {
+    owner = hd(string_split(gh_repo, "/"))
+    prs = gh_json(sq(f"repos/{gh_repo}/pulls?head={owner}:o/{issue_id}&state=all"))
+    num = if (prs == nil) { nil } else { merged_pr(prs) }
+    if (num == nil) { "" } else { send(orch, {'pr_state', issue_id, "merged", num}) }
+}
+
+fun merged_pr(prs) {
+    if (length(prs) == 0) { nil } else {
+        p = hd(prs)
+        if (map_get(p, "merged_at") == nil) { merged_pr(tl(prs)) } else { map_get(p, "number") }
+    }
+}
+
+fun unstrand_each(db, rows, running) {
+    if (length(rows) == 0) { "" } else {
+        r = hd(rows)
+        iid = map_get(r, "id")
+        _u = if (map_has_key(running, iid) == 'true') { "" } else {
+            _s = Store.issue_set_status(db, iid, "Backlog")
+            Store.log_activity(db, map_get(r, "company_id"), "orchestrator", "selfcheck.unstranded", iid)
+        }
+        unstrand_each(db, tl(rows), running)
+    }
+}
+
+fun worktree_check_each(db, rows, running) {
+    if (length(rows) == 0) { "" } else {
+        r = hd(rows)
+        iid = map_get(r, "id")
+        ws = getenv("HOME") ++ "/.o/workspaces/" ++ iid
+        broken = map_has_key(running, iid) == 'false' && file_exists(ws) == 'true' && elem(shell(f"git -C {sq(ws)} rev-parse --git-dir >/dev/null 2>&1"), 0) != 0
+        _f = if (broken) {
+            _x = shell(f"rm -rf {sq(ws)}; git -C {sq(map_get(r, "repo"))} worktree prune")
+            Store.log_activity(db, map_get(r, "company_id"), "orchestrator", "selfcheck.worktree_repaired", iid)
+        } else { "" }
+        worktree_check_each(db, tl(rows), running)
+    }
+}
+
 fun handle_pr_state(db, running, retry, issue_id, state, num) {
     issue = Store.issue_row(db, issue_id)
-    still = if (issue == nil) { 'false' } else { if (str_or(map_get(issue, "status"), "") == "In Review") { 'true' } else { 'false' } }
+    st0 = if (issue == nil) { "" } else { str_or(map_get(issue, "status"), "") }
+    # a merge is final from any open status (merged_check_worker); the rest
+    # only means something for an issue parked In Review
+    still = if (st0 == "In Review" || (state == "merged" && st0 != "" && st0 != "Done" && st0 != "Canceled" && st0 != "Reverted")) { 'true' } else { 'false' }
     if (still == 'false' || map_has_key(running, issue_id) == 'true') {
         %{running: running, retry: retry}
     } else {
@@ -2822,7 +2918,7 @@ fun handle_pr_state(db, running, retry, issue_id, state, num) {
             _i = Store.issue_set_status(db, issue_id, "Done")
             _g = Store.company_mark_green(db, company_id)
             _a = Store.log_activity(db, company_id, "github", "pr.merged", issue_id)
-            %{running: running, retry: retry}
+            %{running: running, retry: map_remove(retry, issue_id)}
         } else { if (state == "closed") {
             _w = shell(f"git -C {sq(repo)} worktree remove {ws} --force")
             _i = Store.issue_set_status(db, issue_id, "Canceled")
@@ -3547,6 +3643,12 @@ fun persona_confirm_result(db, run, persona, reps, code, text) {
 }
 
 fun str_or_map(m) { if (m == nil) { %{} } else { m } }
+
+fun needs_human_comment_worker(gh_repo, num, issue_id, ask) {
+    path = getenv("HOME") ++ "/.o/needs-human-" ++ issue_id ++ ".md"
+    _x = file_write(path, "**O needs a human here.** The fix touches a protected path, which only a maintainer may change. The builder asks:\n\n" ++ string_truncate(ask, 6000) ++ "\n\nMake that change (or say how), then move the issue back to Backlog in O.")
+    gh_api(f"-X POST repos/{gh_repo}/issues/{num}/comments -F body=@{sq(path)}")
+}
 
 fun confirm_comment_worker(gh_repo, num, name) {
     home = getenv("HOME")
