@@ -1300,6 +1300,8 @@ for _i in $(seq 1 30); do
 done
 IID_PRO="$(jget "$(ocurl -s -X POST "$BASE4/api/companies/$CIDG/issues" -H 'Content-Type: application/json' -d '{"title":"[sim:good] pr-only"}')" 'd["id"]')"
 wait_status_at "$BASE4" "$IID_PRO" "In Review" 90 || { tail -30 "$TMP4/daemon.log"; fail "pr-only: green PR never parked In Review"; }
+IID_PRF="$(jget "$(ocurl -s -X POST "$BASE4/api/companies/$CIDG/issues" -H 'Content-Type: application/json' -d '{"title":"[sim:good] pr-only, CI fails once adopted"}')" 'd["id"]')"
+wait_status_at "$BASE4" "$IID_PRF" "In Review" 90 || { tail -30 "$TMP4/daemon.log"; fail "pr-only: second green PR never parked In Review"; }
 git -C "$GHS/remote.git" log --oneline main | grep "o/$IID_PRO" >/dev/null && fail "pr-only: PR was merged with O_PR_AUTOMERGE=0"
 pass "pr-only: O_PR_AUTOMERGE=0 leaves a green PR open, issue In Review, nothing merged"
 
@@ -1324,6 +1326,7 @@ pr_of() { grep -lx "o/$1" "$GHS"/pr_* | head -1 | sed 's|.*/pr_||'; }
 # The PR-only PR parked above is adopted by the gate next; hold its CI so the
 # poller test below can prove an adopted PR still waits for its checks.
 echo "o/$IID_PRO" >> "$GHS/hold_ci"
+echo "o/$IID_PRF" >> "$GHS/fail_ci"
 restart_d4 O_MERGE_GATE=1
 IID_GM="$(gh_issue '[sim:good] gate merges')"
 IID_GX="$(gh_issue '[sim:good] [gate:changes] needs work')"
@@ -1362,6 +1365,9 @@ git -C "$GHS/remote.git" log --oneline main | grep "o/$IID_PRO" >/dev/null && fa
 [ "$(sqlite3 "$TMP4/o.db" "SELECT status FROM issue WHERE id='$IID_PRO'")" != "Done" ] || fail "poller: adopted PR marked Done before CI finished"
 sed -i "\|o/$IID_PRO|d" "$GHS/hold_ci"
 wait_status_at "$BASE4" "$IID_PRO" "Done" 90 || { tail -30 "$TMP4/daemon.log"; fail "poller: PR-only parked PR was not adopted by the gate"; }
+wait_status_at "$BASE4" "$IID_PRF" "Failed" 200 || { tail -30 "$TMP4/daemon.log"; fail "poller: an adopted PR whose CI fails stayed In Review instead of going back to its builder"; }
+[ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='run.dispatch' AND target='$IID_PRF'")" -ge 2 ] || fail "poller: no builder retry after the adopted PR's CI failed"
+pass "poller: an adopted PR whose CI fails goes back to its builder (not stuck In Review)"
 git -C "$GHS/remote.git" log --oneline main | grep "o/$IID_PRO" >/dev/null || fail "poller: adopted PR not merged"
 [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='pr.adopted' AND target='$IID_PRO'")" = "1" ] || fail "poller: pr.adopted not logged once"
 [ "$(sqlite3 "$TMP4/o.db" "SELECT status FROM issue WHERE id='$IID_BLK'")" = "In Review" ] || fail "poller: a refused merge left In Review"

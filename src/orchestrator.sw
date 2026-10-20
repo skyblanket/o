@@ -1926,7 +1926,7 @@ fun ci_poll(orch, run_id, issue_id, gh_repo, branch, num, base, required, pushed
         send(orch, {'ci_done', run_id, issue_id, "merged", "", ""})
     } else { if (mstate == "dirty") {
         send(orch, {'ci_done', run_id, issue_id, "conflict", "", "The PR for " ++ branch ++ " conflicts with its base branch."})
-    } else { if (string_starts_with(verdict, "failed") == 'true' && ci_rerun(gh_repo, issue_id, sha, required_only(checks, required)) == 'true') {
+    } else { if (string_starts_with(verdict, "failed") == 'true' && ci_rerun(gh_repo, num, base, issue_id, sha, required_only(checks, required)) == 'true') {
         # First failure on this head: re-run the failed jobs once and keep
         # polling. Runner/mirror hiccups pass on the rerun; a real failure
         # fails again and goes to the builder below.
@@ -1968,13 +1968,16 @@ fun ci_rerun_marker(issue_id, sha) {
 # Re-run the failed GitHub Actions jobs on this head, once per sha
 # (O_CI_RERUN=0 turns it off). 'true' when a rerun was requested. Checks that
 # aren't Actions runs (no /actions/runs/<id> in details_url) can't be re-run.
-fun ci_rerun(gh_repo, issue_id, sha, checks) {
+fun ci_rerun(gh_repo, num, base, issue_id, sha, checks) {
     marker = ci_rerun_marker(issue_id, sha)
     if (getenv("O_CI_RERUN") == "0" || string_length(sha) == 0 || file_exists(marker) == 'true') {
         'false'
     } else {
         rids = Std.unique([actions_run_id(str_or(map_get(c, "details_url"), "")) for c in checks when check_failed(c) == 'true'])
-        ok = [r for r in rids when string_length(r) > 0 && elem(gh_api(f"-X POST repos/{gh_repo}/actions/runs/{r}/rerun-failed-jobs"), 0) == 0]
+        ok0 = [r for r in rids when string_length(r) > 0 && elem(gh_api(f"-X POST repos/{gh_repo}/actions/runs/{r}/rerun-failed-jobs"), 0) == 0]
+        # No rerun (a token without Actions write gets 403): if the PR is
+        # behind base, updating the branch runs CI again with base's fixes.
+        ok = if (length(ok0) > 0) { ok0 } else { ci_update_if_behind(gh_repo, num, base, sha) }
         if (length(ok) == 0) {
             'false'
         } else {
@@ -1983,6 +1986,12 @@ fun ci_rerun(gh_repo, issue_id, sha, checks) {
             'true'
         }
     }
+}
+
+fun ci_update_if_behind(gh_repo, num, base, sha) {
+    cmpd = gh_json(f"repos/{gh_repo}/compare/{base}...{sha}")
+    behind = if (cmpd == nil) { 0 } else { str_or(map_get(cmpd, "behind_by"), 0) }
+    if (behind > 0 && elem(gh_api(f"-X PUT repos/{gh_repo}/pulls/{num}/update-branch"), 0) == 0) { ["update-branch"] } else { [] }
 }
 
 # ".../actions/runs/<id>/job/<j>" -> "<id>", else "".
