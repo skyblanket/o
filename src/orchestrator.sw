@@ -1904,7 +1904,9 @@ fun ci_poll(orch, run_id, issue_id, gh_repo, branch, num, base, required, pushed
     head = if (pr == nil) { nil } else { map_get(pr, "head") }
     sha = if (head == nil) { "" } else { str_or(map_get(head, "sha"), "") }
     checks = pr_checks(gh_repo, sha)
-    verdict = classify_checks(checks, "success", "")
+    # With required checks (by tier), only those decide: a docs PR doesn't wait
+    # on, or fail by, the slow macOS/hardening jobs it doesn't need.
+    verdict = classify_checks(required_only(checks, required), "success", "")
     settled = timestamp() - pushed_at >= env_int("O_CI_SETTLE_S", 30) * 1000
     # Every check .o-review.json requires must have run AND passed, not just
     # whatever has reported so far.
@@ -1917,7 +1919,7 @@ fun ci_poll(orch, run_id, issue_id, gh_repo, branch, num, base, required, pushed
         send(orch, {'ci_done', run_id, issue_id, "merged", "", ""})
     } else { if (mstate == "dirty") {
         send(orch, {'ci_done', run_id, issue_id, "conflict", "", "The PR for " ++ branch ++ " conflicts with its base branch."})
-    } else { if (string_starts_with(verdict, "failed") == 'true' && ci_rerun(gh_repo, issue_id, sha, checks) == 'true') {
+    } else { if (string_starts_with(verdict, "failed") == 'true' && ci_rerun(gh_repo, issue_id, sha, required_only(checks, required)) == 'true') {
         # First failure on this head: re-run the failed jobs once and keep
         # polling. Runner/mirror hiccups pass on the rerun; a real failure
         # fails again and goes to the builder below.
@@ -1946,6 +1948,10 @@ fun ci_poll(orch, run_id, issue_id, gh_repo, branch, num, base, required, pushed
         _s = sleep(env_int("O_CI_POLL_S", 30) * 1000)
         ci_poll(orch, run_id, issue_id, gh_repo, branch, num, base, required, pushed_at, deadline)
     }}}}}}}
+}
+
+fun required_only(checks, required) {
+    if (length(required) == 0) { checks } else { [c for c in checks when Std.any(required, fn(n) { str_or(map_get(c, "name"), str_or(map_get(c, "context"), "")) == n })] }
 }
 
 fun ci_rerun_marker(issue_id, sha) {
