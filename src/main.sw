@@ -86,7 +86,10 @@ fun instance_holder(dbpath) {
     me = string_trim(elem(shell("echo $PPID"), 1))
     lock = dbpath ++ ".pid"
     held = if (file_exists(lock) == 'true') { string_trim(file_read(lock)) } else { "" }
-    live = string_length(held) > 0 && held != me && elem(shell(f"kill -0 {held} 2>/dev/null && grep -q swarmd /proc/{held}/cmdline"), 0) == 0
+    # live = that pid still has this DB open (a pid reused by another process,
+    # even another swarmd on another DB, does not count)
+    probe = "h=" ++ Orchestrator.sq(held) ++ "; case \"$h\" in ''|*[!0-9]*) exit 1 ;; esac; p=$(realpath -m " ++ Orchestrator.sq(dbpath) ++ ") && ls -l /proc/$h/fd 2>/dev/null | grep -qF -- \" $p\""
+    live = string_length(held) > 0 && held != me && elem(shell(probe), 0) == 0
     if (live) { held } else {
         _w = file_write(lock, me ++ "\n")
         ""

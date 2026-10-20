@@ -1225,7 +1225,7 @@ wait_status_at "$BASE4" "$IID_BARE" "Done" 90 || { tail -30 "$TMP4/daemon.log"; 
 git -C "$SCRATCHV" log --oneline main | grep "o/$IID_APP" >/dev/null || fail "review: approved change not merged"
 wait_status_at "$BASE4" "$IID_REJ" "Failed" 150 || { cat "$TMP4/daemon.log"; fail "review: rejected change never Failed"; }
 vs="$(sqlite3 "$TMP4/o.db" "SELECT verify_state FROM run WHERE issue_id='$IID_REJ' ORDER BY started_at DESC LIMIT 1")"
-[ "$vs" = "red_review" ] || fail "review: expected red_review, got '$vs'"
+[ "$vs" = "red_review" ] || { sqlite3 "$TMP4/o.db" "SELECT attempt,state,verify_state,started_at,substr(verify_output,1,120) FROM run WHERE issue_id='$IID_REJ' ORDER BY started_at" || true; sqlite3 "$TMP4/o.db" "SELECT ts,verb FROM activity WHERE target='$IID_REJ' ORDER BY ts" || true; fail "review: expected red_review, got '$vs'"; }
 sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_REJ' ORDER BY started_at DESC LIMIT 1" | grep "stub reviewer says" >/dev/null \
   || fail "review: rejection reason not recorded for the retry prompt"
 git -C "$SCRATCHV" log --oneline main | grep "o/$IID_REJ" >/dev/null && fail "review: rejected change was merged"
@@ -1370,7 +1370,7 @@ grep "Decision:" "$GHS/comments_$(pr_of "$IID_GM")" >/dev/null || fail "gate: no
 wait_status_at "$BASE4" "$IID_GE" "In Review" 120 || { tail -40 "$TMP4/daemon.log"; fail "gate: ESCALATE never parked In Review"; }
 wait_status_at "$BASE4" "$IID_GS" "In Review" 120 || fail "gate: missing VERDICT did not fail closed to In Review"
 wait_status_at "$BASE4" "$IID_GX" "Failed" 180 || { tail -40 "$TMP4/daemon.log"; fail "gate: CHANGES x3 never Failed"; }
-[ "$(sqlite3 "$TMP4/o.db" "SELECT verify_state FROM run WHERE issue_id='$IID_GX' ORDER BY started_at DESC LIMIT 1")" = "red_merge_gate" ] || fail "gate: CHANGES not recorded as red_merge_gate"
+[ "$(sqlite3 "$TMP4/o.db" "SELECT verify_state FROM run WHERE issue_id='$IID_GX' ORDER BY started_at DESC LIMIT 1")" = "red_merge_gate" ] || { sqlite3 "$TMP4/o.db" "SELECT attempt,state,verify_state,started_at,substr(verify_output,1,150) FROM run WHERE issue_id='$IID_GX' ORDER BY started_at" || true; sqlite3 "$TMP4/o.db" "SELECT ts,verb,payload FROM activity WHERE target='$IID_GX' ORDER BY ts" || true; grep -v '^\[orch\] tick' "$TMP4/daemon.log" | grep -i "$IID_GX\|resume\|recover" | tail -20; fail "gate: CHANGES not recorded as red_merge_gate"; }
 sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_GX' ORDER BY started_at DESC LIMIT 1" | grep "regression test" >/dev/null || fail "gate: maintainer findings not passed to the retry"
 for i in "$IID_GE" "$IID_GX"; do git -C "$GHS/remote.git" log --oneline main | grep "o/$i" >/dev/null && fail "gate: $i was merged without a MERGE verdict"; done
 nres="$(grep -c '^resume' "$GHS/gate_calls" || true)"
@@ -1558,8 +1558,10 @@ mkdir -p "$SCRATCHS" "$TMP5/.o"
 git -C "$SCRATCHS" init -q -b main
 git -C "$SCRATCHS" config user.email "o@example.com"; git -C "$SCRATCHS" config user.name "O Test"
 cp "$SCRATCH/verify.sh" "$SCRATCHS/verify.sh"; echo "sandbox project" > "$SCRATCHS/README.md"
-# a change carrying slow.txt makes its FIRST verify hang (the restart test below)
-sed -i '/^exit 0$/i if [ -f slow.txt ] \&\& [ ! -f .slept ]; then : > .slept; sleep 120; fi' "$SCRATCHS/verify.sh"
+# a change carrying slow.txt makes the FIRST verify of it hang, once per suite
+# (the restart test below); later verifies, and changes cut from a main that
+# carries slow.txt, never sleep
+sed -i "/^exit 0\$/i if [ -f slow.txt ] \\&\\& [ ! -f '$TMP5/slept-once' ]; then : > '$TMP5/slept-once'; : > .slept; sleep 120; fi" "$SCRATCHS/verify.sh"
 echo '{ "tiers": [ { "name": "core", "paths": ["core/"], "merge": "auto", "builder": "sonnet" } ] }' > "$SCRATCHS/.o-review.json"
 git -C "$SCRATCHS" add -A; git -C "$SCRATCHS" commit -q -m "seed sandbox project"
 cat > "$TMP5/agent-stub" <<'STUB'
@@ -1642,8 +1644,8 @@ HOME="$TMP5" O_DB="$TMP5/.o/o.db" O_PORT="$PORT5" O_NO_OPEN=1 O_SANDBOX=bwrap O_
 DAEMON5_PID=$!
 for _i in $(seq 1 30); do [ "$(ocurl -s -o /dev/null -w '%{http_code}' "$BASE5/api/health" 2>/dev/null || true)" = "200" ] && break; sleep 0.5; done
 for _i in $(seq 1 10); do kill -0 "$SLOWPID" 2>/dev/null || break; sleep 0.5; done
-kill -0 "$SLOWPID" 2>/dev/null && fail "restart: the orphaned verify was not killed at boot"
-wait_status_at "$BASE5" "$IID_SLOW" "Done" 90 || { tail -30 "$TMP5/daemon.log"; fail "restart: interrupted issue never Done"; }
+kill -0 "$SLOWPID" 2>/dev/null && { grep -v '^\[orch\] tick' "$TMP5/daemon.log" | tail -25; ps -o pid,ppid,args -p "$SLOWPID" || true; readlink "/proc/$SLOWPID/cwd" || true; fail "restart: the orphaned verify was not killed at boot"; }
+wait_status_at "$BASE5" "$IID_SLOW" "Done" 90 || { grep -v '^\[orch\] tick' "$TMP5/daemon.log" | tail -40; sqlite3 "$TMP5/.o/o.db" "SELECT attempt,state,verify_state,substr(verify_output,1,200) FROM run WHERE issue_id='$IID_SLOW' ORDER BY started_at" || true; sqlite3 "$TMP5/.o/o.db" "SELECT ts,verb,payload FROM activity WHERE target='$IID_SLOW' ORDER BY ts" || true; ps -ef | grep -v grep | grep "$TMP5" || true; fail "restart: interrupted issue never Done"; }
 [ "$(sqlite3 "$TMP5/.o/o.db" "SELECT COUNT(*) FROM activity WHERE verb='run.resume' AND target='$IID_SLOW'")" = "1" ] || fail "restart: committed work was not resumed at verify"
 [ "$(wc -l < "$TMP5/agent-args.calls")" = "$calls_before" ] || fail "restart: the agent was run again for work it had already committed"
 [ "$(sqlite3 "$TMP5/.o/o.db" "SELECT MAX(attempt) FROM run WHERE issue_id='$IID_SLOW'")" = "1" ] || fail "restart: the restart counted as an attempt"
@@ -1656,7 +1658,7 @@ IID_DR="$(jget "$(ocurl -s -X POST "$BASE5/api/companies/$CIDS/issues" -H 'Conte
 sleep 4
 [ "$(sqlite3 "$TMP5/.o/o.db" "SELECT COUNT(*) FROM run WHERE issue_id='$IID_DR'")" = "0" ] || fail "drain: an issue was dispatched while draining"
 ocurl -s -X POST "$BASE5/api/orchestrator/drain" -H 'Content-Type: application/json' -H "Authorization: Bearer $TOK" -d '{"on":false}' >/dev/null
-wait_status_at "$BASE5" "$IID_DR" "Done" 90 || fail "drain: dispatch did not resume after un-draining"
+wait_status_at "$BASE5" "$IID_DR" "Done" 90 || { grep -v '^\[orch\] tick' "$TMP5/daemon.log" | tail -30; sqlite3 "$TMP5/.o/o.db" "SELECT attempt,state,verify_state,substr(verify_output,1,300) FROM run WHERE issue_id='$IID_DR' ORDER BY started_at" || true; sqlite3 "$TMP5/.o/o.db" "SELECT ts,verb FROM activity WHERE target='$IID_DR' ORDER BY ts" || true; fail "drain: dispatch did not resume after un-draining"; }
 pass "drain: POST /api/orchestrator/drain (token-guarded) stops new dispatch; un-drain resumes it"
 else
   echo "SKIP: agent sandbox stage (unprivileged bwrap unavailable here)"
