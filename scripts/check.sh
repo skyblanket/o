@@ -1492,6 +1492,13 @@ wait_status_at "$BASE4" "$IID_SL2" "Done" 120 || { tail -30 "$TMP4/daemon.log"; 
 sed -i "\|o/$IID_SL1|d" "$GHS/hold_ci"
 wait_status_at "$BASE4" "$IID_SL1" "Done" 120 || { tail -30 "$TMP4/daemon.log"; fail "slots: the held PR never merged after its CI finished"; }
 pass "slots: a PR waiting on CI holds no agent slot (O_MAX_CONCURRENT=1, a second issue ships meanwhile)"
+restart_d4 O_MERGE_GATE=1 O_AUTO_FILE=0
+IID_NF="$(gh_issue '[sim:no-commit] fails with no follow-up')"
+wait_status_at "$BASE4" "$IID_NF" "Failed" 120 || { tail -30 "$TMP4/daemon.log"; fail "auto-file off: no-commit issue never Failed"; }
+sleep 2
+IDN_NF="$(sqlite3 "$TMP4/o.db" "SELECT identifier FROM issue WHERE id='$IID_NF'")"
+[ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM issue WHERE fingerprint='verify-final:$IDN_NF'")" = "0" ] || fail "auto-file off: O_AUTO_FILE=0 still filed a follow-up"
+pass "auto-file off: O_AUTO_FILE=0 files no 'Fix failing verification' follow-up"
 
 # ============================================================
 # Agent sandbox — 5th daemon, O_SANDBOX=bwrap + O_API_TOKEN
@@ -1512,6 +1519,7 @@ mkdir -p "$SCRATCHS" "$TMP5/.o"
 git -C "$SCRATCHS" init -q -b main
 git -C "$SCRATCHS" config user.email "o@example.com"; git -C "$SCRATCHS" config user.name "O Test"
 cp "$SCRATCH/verify.sh" "$SCRATCHS/verify.sh"; echo "sandbox project" > "$SCRATCHS/README.md"
+echo '{ "tiers": [ { "name": "core", "paths": ["core/"], "merge": "auto", "builder": "sonnet" } ] }' > "$SCRATCHS/.o-review.json"
 git -C "$SCRATCHS" add -A; git -C "$SCRATCHS" commit -q -m "seed sandbox project"
 cat > "$TMP5/agent-stub" <<'STUB'
 #!/bin/sh
@@ -1525,8 +1533,9 @@ git worktree prune >/dev/null 2>&1 || true   # other runs' worktrees are hidden 
 n="$(cat /proc/*/environ 2>/dev/null | tr '\0' '\n' | grep -c '^O_API_TOKEN=')"
 p="$p token_procs:$n"
 echo "$p" > probes.txt
+date +%s%N > run-stamp.txt
 echo "$*" > "$SBX_ARGS"
-git add probes.txt && git commit -q -m "sandbox probes"
+git add probes.txt run-stamp.txt && git commit -q -m "sandbox probes"
 printf '%s\n' '{"type":"result","total_cost_usd":0.01,"session_id":"sbx-1"}'
 STUB
 chmod +x "$TMP5/agent-stub"
@@ -1563,6 +1572,10 @@ probes="$(git -C "$SCRATCHS" show main:probes.txt)"
 pass "sandbox: repo/hooks/config not writable, ~/.o hidden, token not visible in /proc, other runs' worktrees survive a prune; worktree commit merged"
 grep -- "--model haiku " "$TMP5/agent-args" >/dev/null || { cat "$TMP5/agent-args"; fail "model ladder: attempt 1 should run on haiku"; }
 pass "model ladder: a builder's first attempt runs on haiku"
+IID_SBX2="$(jget "$(ocurl -s -X POST "$BASE5/api/companies/$CIDS/issues" -H 'Content-Type: application/json' -d '{"title":"fix the scheduler","body":"The race is in core/sched.c."}')" 'd["id"]')"
+wait_status_at "$BASE5" "$IID_SBX2" "Done" 90 || { tail -30 "$TMP5/daemon.log"; fail "tier builder: core issue never Done"; }
+grep -- "--model sonnet " "$TMP5/agent-args" >/dev/null || { cat "$TMP5/agent-args"; fail "tier builder: an issue naming a builder=sonnet tier's path should start on sonnet"; }
+pass "tier builder: an issue naming a tier path with builder=sonnet starts on sonnet"
 else
   echo "SKIP: agent sandbox stage (unprivileged bwrap unavailable here)"
 fi

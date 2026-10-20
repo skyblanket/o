@@ -50,7 +50,10 @@ fun company_row(db, id) {
 fun company_create(db, name, mission, prefix, budget, repo, verify_cmd, protected_paths, budget_daily) {
     id = next_id("co")
     now = timestamp()
-    _ins = db_query(db, "INSERT INTO company (id, name, mission, issue_prefix, status, budget_monthly_cents, spent_cents, issue_counter, created_at, updated_at, repo, verify_cmd, protected_paths, budget_daily_cents) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [id, name, mission, prefix, "active", budget, 0, 0, now, now, repo, verify_cmd, protected_paths, budget_daily])
+    # budget_day starts at TODAY: creating a company is not a day rollover.
+    # (At 0 the next tick rolled it over, racing any write made right after
+    # creation, such as a test arming the no-signal breaker.)
+    _ins = db_query(db, "INSERT INTO company (id, name, mission, issue_prefix, status, budget_monthly_cents, spent_cents, issue_counter, created_at, updated_at, repo, verify_cmd, protected_paths, budget_daily_cents, budget_day) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? / 86400000)", [id, name, mission, prefix, "active", budget, 0, 0, now, now, repo, verify_cmd, protected_paths, budget_daily, now])
     id
 }
 

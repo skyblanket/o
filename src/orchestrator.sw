@@ -737,7 +737,7 @@ fun dispatch_one(db, issue, iid, attempt, running, now) {
         _a = Store.log_activity(db, company_id, "orchestrator", "run.dispatch", iid)
         ident = map_get(issue, "identifier")
         resumed = if (string_length(session_id) > 0) { "resume" } else { "fresh" }
-        model = builder_model(agent, 1 + escalations(iid))
+        model = builder_model(agent, max2(1 + escalations(iid), tier_rung(repo, rebase_onto, iid, title ++ "\n" ++ body)))
         print(f"[orch] dispatch {ident} via {runtime} ({resumed} session, attempt {attempt}, model {model})")
         sim_outcome = if (runtime == "sim") { decide_outcome(issue, attempt) } else { 'none' }
         start = worktree_start(company, repo)
@@ -757,11 +757,45 @@ fun dispatch_one(db, issue, iid, attempt, running, now) {
 fun builder_model(agent, rung) {
     own = str_or(map_get(agent, "model"), "")
     if (string_length(own) > 0) { own } else {
-        raw = getenv("O_MODEL_LADDER")
-        ladder = if (raw == nil) { ["haiku", "sonnet", "opus"] } else { [string_trim(x) for x in string_split(raw, ",") when string_length(string_trim(x)) > 0] }
+        ladder = model_ladder()
         if (length(ladder) == 0) { "" } else { Std.nth(ladder, min2(rung, length(ladder)) - 1) }
     }
 }
+
+# The ladder rung an issue starts on. A tier in .o-review.json may name a
+# stronger `builder` (e.g. "sonnet" for runtime code): an issue starts there
+# when its text names one of the tier's paths, or an earlier attempt's branch
+# touched them. Otherwise rung 1. Escalations still climb from there.
+fun tier_rung(repo, base, iid, text) {
+    if (string_length(repo) == 0) { 1 } else {
+        cfg = review_config(repo, base)
+        tiers = [t for t in cfg_list(cfg, "tiers") when string_length(str_or(map_get(t, "builder"), "")) > 0]
+        if (length(tiers) == 0) { 1 } else {
+            br = elem(shell(f"git -C {sq(repo)} rev-parse --verify --quiet refs/heads/o/{iid}"), 0) == 0
+            files = if (br) { lines_of(elem(shell(f"git -C {sq(repo)} diff --no-renames --name-only {sq(base)}...o/{iid}"), 1)) } else { [] }
+            hit = [t for t in tiers when Std.any(list_or_empty(map_get(t, "paths")), fn(p) { string_contains(text, p) == 'true' || Std.any(files, fn(f) { string_starts_with(f, p) == 'true' }) })]
+            max_of([ladder_rung(str_or(map_get(t, "builder"), "")) for t in hit], 1)
+        }
+    }
+}
+
+fun model_ladder() {
+    raw = getenv("O_MODEL_LADDER")
+    if (raw == nil) { ["haiku", "sonnet", "opus"] } else { [string_trim(x) for x in string_split(raw, ",") when string_length(string_trim(x)) > 0] }
+}
+
+# 1-based position of a model in the ladder (1 if it isn't on it).
+fun ladder_rung(m) { rung_of(model_ladder(), m, 1) }
+
+fun rung_of(ladder, m, i) {
+    if (length(ladder) == 0) { 1 } else { if (hd(ladder) == m) { i } else { rung_of(tl(ladder), m, i + 1) } }
+}
+
+fun max_of(ns, acc) {
+    if (length(ns) == 0) { acc } else { max_of(tl(ns), max2(acc, hd(ns))) }
+}
+
+fun max2(a, b) { if (a > b) { a } else { b } }
 
 # Escalations live in ~/.o/escalations/<issue_id>, one "ESCALATE: why" line
 # per escalating run. Workers append (it's their own issue's file); dispatch
@@ -2673,8 +2707,9 @@ fun file_verify_final(db, company_id, issue_id, verdict, tail) {
         fp = str_or(map_get(issue, "fingerprint"), "")
         # carry the GitHub link forward, so the redo's PR closes the same issue
         closes = if (string_starts_with(fp, "gh:") == 'true') { "\n\nCloses #" ++ string_sub(fp, 3, string_length(fp) - 3) } else { "" }
-        body = f"Issue {ident} failed verification after every retry attempt. Final verdict: {verdict}. The work is on branch {branch}. Diagnose and fix so the verify command passes.\n\nVerify output tail:\n{tail}" ++ closes
-        _sf = auto_file(db, company_id, issue, "verify-final", ident, title, body, "medium")
+        body = f"Issue {ident} failed verification after every retry attempt. Final verdict: {verdict}. The earlier attempt's work is on branch {branch}: bring it into YOUR branch with `git merge {branch}` (or cherry-pick); never check {branch} out, it belongs to another run. Diagnose and fix so the verify command passes.\n\nVerify output tail:\n{tail}" ++ closes
+        # O_AUTO_FILE=0: no follow-up; a failed issue waits for a human.
+        _sf = if (getenv("O_AUTO_FILE") == "0") { "" } else { auto_file(db, company_id, issue, "verify-final", ident, title, body, "medium") }
         ""
     }
 }
