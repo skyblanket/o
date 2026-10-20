@@ -1632,7 +1632,7 @@ IID_SLOW="$(jget "$(ocurl -s -X POST "$BASE5/api/companies/$CIDS/issues" -H 'Con
 for _i in $(seq 1 60); do [ -f "$TMP5/.o/workspaces/$IID_SLOW/.slept" ] && break; sleep 1; done
 [ -f "$TMP5/.o/workspaces/$IID_SLOW/.slept" ] || { tail -20 "$TMP5/daemon.log"; fail "restart: slow verify never started"; }
 sleep 1
-SLOWPID="$(for d in /proc/[0-9]*; do [ "$(readlink $d/cwd 2>/dev/null)" = "$TMP5/.o/workspaces/$IID_SLOW" ] && grep -q '^sleep' $d/cmdline 2>/dev/null && echo "${d#/proc/}"; done | head -1)"
+SLOWPID="$(for d in /proc/[0-9]*; do [ "$(readlink $d/cwd 2>/dev/null)" = "$TMP5/.o/workspaces/$IID_SLOW" ] && grep -q '^sleep' $d/cmdline 2>/dev/null && echo "${d#/proc/}"; done | head -1 || true)"
 [ -n "$SLOWPID" ] || fail "restart: could not find the verify's sleep"
 calls_before="$(wc -l < "$TMP5/agent-args.calls")"
 kill -9 "$DAEMON5_PID"; wait "$DAEMON5_PID" 2>/dev/null || true
