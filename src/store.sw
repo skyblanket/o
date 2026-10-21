@@ -511,6 +511,18 @@ fun run_count_for_issue(db, issue_id) {
     if (length(rows) == 0) { 0 } else { map_get(hd(rows), "n") }
 }
 
+# Every graded attempt on an issue, oldest first: what O tried, for the note
+# it leaves when it stops.
+fun run_history(db, issue_id) {
+    db_query(db, "SELECT attempt, verify_state, verify_output FROM run WHERE issue_id = ? AND verify_state != '' ORDER BY started_at", [issue_id])
+}
+
+# How many times an operator sent this issue back for another round.
+fun retry_count(db, issue_id) {
+    rows = db_query(db, "SELECT COUNT(*) AS n FROM activity WHERE verb = 'issue.retry' AND target = ?", [issue_id])
+    if (length(rows) == 0) { 0 } else { map_get(hd(rows), "n") }
+}
+
 fun last_run_for_issue(db, issue_id) {
     rows = db_query(db, "SELECT id, issue_id, agent_id, attempt, state, verify_state, verify_output, started_at, thread_id FROM run WHERE issue_id = ? ORDER BY started_at DESC LIMIT 1", [issue_id])
     if (length(rows) == 0) { nil } else { hd(rows) }

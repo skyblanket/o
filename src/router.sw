@@ -199,7 +199,15 @@ fun route_retry(db, conn, method, p, body) {
     else { if (cur == nil) { respond(conn, 404, err_json("issue not found")) }
     else { if (st != "Failed" && st != "Canceled") { respond(conn, 409, err_json("only a Failed or Canceled issue can be retried (this one is " ++ st ++ ")")) }
     else {
-        data = if (string_length(body) > 0) { json_decode(body) } else { nil }
+    data = if (string_length(body) > 0) { json_decode(body) } else { nil }
+    rounds = 1 + Store.retry_count(db, id)
+    # Rounds are capped so one hard issue can't eat the budget in a loop of new
+    # attempts; past the cap a person decides ({"force": true}) with the history
+    # O posted when it stopped.
+    if (rounds >= max_rounds() && (data == nil || map_get(data, "force") != 'true')) {
+        respond(conn, 409, err_json("this issue has had " ++ to_string(rounds) ++ " rounds (O_MAX_ROUNDS=" ++ to_string(max_rounds()) ++ "); read what was tried and send {\"force\": true} to run another"))
+    }
+    else {
         model = if (data == nil) { "" } else { default_str(map_get(data, "model"), "") }
         want = if (string_length(model) > 0) { Orchestrator.ladder_rung(model) } else { 1 }
         _e = escalate_to(id, want - 1 - Orchestrator.escalations(id), model)
@@ -213,8 +221,10 @@ fun route_retry(db, conn, method, p, body) {
         _u = Store.issue_update(db, id, "Backlog", map_get(cur, "priority"), map_get(cur, "assignee_agent_id"))
         _l = Store.log_activity(db, map_get(cur, "company_id"), "operator", "issue.retry", id)
         respond(conn, 200, json_encode(Store.issue_row(db, id)))
-    }}}
+    }}}}
 }
+
+fun max_rounds() { Orchestrator.env_int("O_MAX_ROUNDS", 3) }
 
 fun escalate_to(id, n, model) {
     if (n <= 0) { "" } else {
