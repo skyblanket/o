@@ -1590,7 +1590,10 @@ fun sim_marker(title) {
     else { if (string_contains(title, "[sim:ext-ok]") == 'true') { "ext-ok" }
     else { if (string_contains(title, "[sim:ext-broken]") == 'true') { "ext-broken" }
     else { if (string_contains(title, "[sim:net-empty]") == 'true') { "net-empty" }
-    else { "good" }}}}}}}}}}}}}
+    else { if (string_contains(title, "[sim:del-test]") == 'true') { "del-test" }
+    else { if (string_contains(title, "[sim:ci-edit]") == 'true') { "ci-edit" }
+    else { if (string_contains(title, "[sim:huge]") == 'true') { "huge" }
+    else { "good" }}}}}}}}}}}}}}}}
 }
 
 # Carry out the marker's action in the worktree. Every case except no-commit
@@ -1634,13 +1637,19 @@ fun sim_act(workspace, issue_id, marker, protected) {
                     sim_commit(workspace, f"ext/ok_{issue_id}.txt", "fine")
                 } else { if (marker == "ext-broken") {
                     sim_commit(workspace, "ext/broken", "breaks the ext tier check")
+                } else { if (marker == "del-test") {
+                    sh(f"cd {workspace} && git rm -q tests/existing.sh && git commit -q -m sim-del-test")
+                } else { if (marker == "ci-edit") {
+                    sim_commit(workspace, ".github/workflows/ci.yml", "on: push")
+                } else { if (marker == "huge") {
+                    sh(f"cd {workspace} && seq 1 1600 > big_{issue_id}.txt && git add big_{issue_id}.txt && git commit -q -m sim-huge")
                 } else { if (marker == "net-empty") {
                     # two commits that cancel out: commits exist, no net change
                     _c = sim_commit(workspace, f"sim_{issue_id}.txt", "ok")
                     sh(f"cd {workspace} && git rm -q sim_{issue_id}.txt && git commit -q -m sim-undo")
                 } else {
                     sim_commit(workspace, f"sim_{issue_id}.txt", "ok")
-                }}}}}}}}}
+                }}}}}}}}}}}}
                 }
             }
         }
@@ -2587,6 +2596,11 @@ fun do_gate(job) {
             # An empty PR: nothing to review, so no model is paid for it.
             gate_result(job, "REJECT: the PR makes no change against " ++ base ++ " (its commits net out to nothing).", "", "", "", map_get(job, "session"), 0)
         } else {
+        broken = hard_rules(cfg, rv, files, lines)
+        if (string_length(broken) > 0) {
+            # A hard rule: no model may wave this through, so none is asked.
+            gate_result(job, "REJECT: " ++ broken, "", "", "", map_get(job, "session"), 0)
+        } else {
         tier = pr_tier(cfg, files)
         new_files = lines_of(elem(sh(f"git -C {sq(rv)} diff --no-renames --name-only --diff-filter=A o-base HEAD"), 1))
         steps = mechanical_steps(cfg, rv, f"{dir}/pr-base", added, new_files, tier, tree_of(rv, "HEAD"), tree_of(rv, "o-base"))
@@ -2600,7 +2614,32 @@ fun do_gate(job) {
             gate_model_review(map_put(job, "model", map_get(tier, "gate_model")), cfg, rv, files, lines, numstat, tier, evidence)
         }
         }
+        }
     }
+}
+
+# Hard rules, checked before any step or model: what no reviewer may wave
+# through, so they hold once O makes the final call on every tier. "" when the
+# PR passes, else why not. The config comes from the base branch, so a PR
+# can't relax them.
+#   - no deleted test files (test_runners paths, tests/, test/)
+#   - no changes to CI or the gate's own config (.github/, .o-review.json,
+#     plus .o-review.json "locked_paths")
+#   - at most "max_change_lines" (default 1500) lines added + deleted
+fun hard_rules(cfg, rv, files, lines) {
+    test_dirs = ["tests/", "test/"] ++ flatten([list_or_empty(map_get(r, "paths")) for r in cfg_list(cfg, "test_runners")])
+    gone = lines_of(elem(sh(f"git -C {sq(rv)} diff --no-renames --name-only --diff-filter=D o-base HEAD"), 1))
+    gone_tests = [f for f in gone when starts_any_of(f, test_dirs) == 'true']
+    locked = [f for f in files when starts_any_of(f, [".github/", ".o-review.json"] ++ cfg_list(cfg, "locked_paths")) == 'true']
+    lim = map_get(cfg, "max_change_lines")
+    max_lines = if (lim == nil) { 1500 } else { lim }
+    if (length(gone_tests) > 0) {
+        "hard rule: the PR deletes test files (" ++ Std.join(gone_tests, ", ") ++ "). Tests are never deleted to get a change through; fix the code, or change the test in place and say why."
+    } else { if (length(locked) > 0) {
+        "hard rule: the PR changes CI or the gate's own config (" ++ Std.join(locked, ", ") ++ "), which decide whether changes are safe; those stay out of O's reach."
+    } else { if (lines > max_lines) {
+        "hard rule: the PR changes " ++ to_string(lines) ++ " lines, over the limit of " ++ to_string(max_lines) ++ " (max_change_lines). Split it into smaller PRs that each stand on their own."
+    } else { "" }}}
 }
 
 # A disposable, remote-less clone of the PR head merged with current base, so

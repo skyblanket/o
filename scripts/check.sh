@@ -1520,6 +1520,18 @@ grep "also fails on base" "$GHS/comments_$(pr_of "$IID_XO")" >/dev/null || fail 
 wait_status_at "$BASE4" "$IID_XB" "Failed" 200 || { tail -30 "$TMP4/daemon.log"; fail "gate2: a tier check the PR breaks did not block"; }
 sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_XB' ORDER BY started_at DESC LIMIT 1" | grep "passes on base without the change" >/dev/null || fail "gate2: PR-only tier failure reason not recorded"
 pass "gate2: modified test passing on base -> note, not REJECT; tier check failing on base too -> pre-existing; failing only with the PR (twice) -> REJECT"
+# Hard rules: rejected before any check or model runs, whatever a reviewer says.
+IID_HD="$(gh_issue '[sim:del-test] drop a test')"
+IID_HC="$(gh_issue '[sim:ci-edit] touch CI')"
+IID_HH="$(gh_issue '[sim:huge] one giant change')"
+for pair in "$IID_HD:deletes test files (tests/existing.sh)" "$IID_HC:changes CI or the gate's own config (.github/workflows/ci.yml)" "$IID_HH:changes 1600 lines, over the limit of 1500"; do
+  i="${pair%%:*}"; why="${pair#*:}"
+  wait_status_at "$BASE4" "$i" "Failed" 200 || { tail -30 "$TMP4/daemon.log"; fail "hard rules: $i was not stopped ($why)"; }
+  sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$i' ORDER BY started_at DESC LIMIT 1" | grep -qF "hard rule: the PR $why" \
+    || { sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$i' ORDER BY started_at DESC LIMIT 1"; fail "hard rules: reason missing ($why)"; }
+  git -C "$GHS/remote.git" log --oneline main | grep -q "o/$i" && fail "hard rules: $i was merged"
+done
+pass "hard rules: a deleted test, a CI/gate-config change and an oversized PR are rejected before any model runs"
 
 # Gate cache: a check's result is kept by content (tree + command). XC1's merge
 # is refused (main doesn't move), so XC2 is gated on the same base and its
