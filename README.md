@@ -448,7 +448,7 @@ The daemon reads its configuration from the environment. All are optional.
 | `O_SANDBOX_RW` | unset | extra comma-separated paths the sandbox keeps writable, if your agent CLI needs them. |
 | `O_MERGE_GATE` | unset | `1` sends every green PR to a merge-gate reviewer of its own (APPROVE / REJECT / UNVERIFIED), reviews in parallel. |
 | `O_MERGE_MODEL` | `claude-opus-5-5` | the merge-gate reviewer's model. |
-| `O_ESCALATE_PATHS` / `O_ESCALATE_LINES` | unset / `1000` | PRs touching these path prefixes, or bigger than this, always go to a human (on top of `.o-review.json` tiers). |
+| `O_ESCALATE_PATHS` / `O_ESCALATE_LINES` | unset / unset | PRs touching these path prefixes, or bigger than this many lines, always go to a human (on top of `.o-review.json` tiers). Off by default: the gate's hard rule `max_change_lines` bounds size. |
 | `O_GATE_TIMEOUT_S` / `O_GATE_MAX_TURNS` | `3600` / `80` | wall-clock and turn caps for one gate review, checks included. |
 | `O_PERSONAS` | unset | `1` turns on the daily persona pass (needs `O_SANDBOX=bwrap` or `O_PERSONAS_UNSANDBOXED=1`). |
 | `O_PERSONA_MODEL` | `haiku` | default model for personas (a persona's own `model` wins). |

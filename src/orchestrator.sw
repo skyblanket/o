@@ -620,13 +620,16 @@ fun tick_loop(db, dbpath, port, tick_n, running, retry) {
 fun do_tick(db, dbpath, port, tick_n, running, retry) {
     now = timestamp()
     _rb = maybe_rollover(db, now)
-    _rf = maybe_reflect(db, dbpath, port, now)
-    _pp = maybe_persona_pass(db, dbpath, port, now)
-    _pc = maybe_persona_confirm(db, dbpath, port, now)
+    # Draining starts nothing new: no builds, and no reflection, persona,
+    # post-merge or planning passes either. What's in flight still finishes.
+    quiet = draining(dbpath) == 'true'
+    _rf = if (quiet) { "" } else { maybe_reflect(db, dbpath, port, now) }
+    _pp = if (quiet) { "" } else { maybe_persona_pass(db, dbpath, port, now) }
+    _pc = if (quiet) { "" } else { maybe_persona_confirm(db, dbpath, port, now) }
     _gh = maybe_gh_poll(db, tick_n)
     _sc = maybe_self_check(db, tick_n, running)
-    _pm = maybe_postmerge(db, now)
-    _pl = maybe_plan(db, now)
+    _pm = if (quiet) { "" } else { maybe_postmerge(db, now) }
+    _pl = if (quiet) { "" } else { maybe_plan(db, now) }
     swept = sweep_stalls(db, map_keys(running), running, retry, now)
     sr = map_get(swept, "running")
     sq = map_get(swept, "retry")
@@ -1918,7 +1921,10 @@ fun tail_log(path) {
     if (file_exists(path) == 'true') {
         raw = file_read(path)
         n = string_length(raw)
-        if (n <= 4096) { raw } else { string_sub(raw, n - 4096, 4096) }
+        # start at a line boundary, so a cut never lands inside a character
+        cut = if (n <= 4096) { raw } else { string_sub(raw, n - 4096, 4096) }
+        nl = if (n <= 4096) { -1 } else { string_index_of(cut, "\n") }
+        if (nl == nil || nl < 0) { cut } else { string_sub(cut, nl + 1, string_length(cut) - nl - 1) }
     } else {
         ""
     }
@@ -2275,9 +2281,29 @@ fun start_ci(db, running, retry, info, company, run_id, issue_id, now) {
 
 fun ci_worker(orch, run_id, issue_id, ws, branch, base, gh_repo, title, required) {
     _r = reopen_closed_pr(gh_repo, branch)
-    # --force: the branch is O's own, and GitHub may have added an
-    # update-branch merge commit to it that the agent's retry doesn't have.
-    push = sh(f"git -C {ws} push -q --force origin HEAD:refs/heads/{branch}")
+    # The branch is O's, but not only O's: GitHub may have added an
+    # update-branch merge commit (fine to replace), and a person may have
+    # pushed a fix onto the PR (never to be overwritten). A commit on the
+    # remote branch that isn't a merge and was never on O's local branch is
+    # someone else's: park the issue and name it. Otherwise push with a lease
+    # on the head just fetched, so nothing that lands meanwhile is lost.
+    _ff = sh(f"git -C {ws} fetch -q origin refs/heads/{branch}:refs/o-remote/{branch} 2>/dev/null")
+    remote = string_trim(elem(sh(f"git -C {ws} rev-parse -q --verify refs/o-remote/{branch}"), 1))
+    # O's own: on its branch's reflog, or authored as the repo's git identity
+    # (the reflog is gone once O deleted and recreated the branch). Commits
+    # already on base arrive via update-branch and aren't anyone's PR work.
+    mine = lines_of(elem(sh(f"git -C {ws} log -g --format=%H refs/heads/{branch} 2>/dev/null"), 1))
+    me = string_trim(elem(sh(f"git -C {ws} config --get user.email"), 1))
+    cand = if (string_length(remote) == 0) { [] } else { lines_of(elem(sh(f"git -C {ws} rev-list --no-merges --format=%H%x20%ae {remote} ^HEAD ^origin/{base} | grep -v '^commit '"), 1)) }
+    theirs = [hd(string_split(l, " ")) for l in cand when Std.any(mine, fn(m) { m == hd(string_split(l, " ")) }) == 'false' && Std.last(string_split(l, " ")) != me]
+    lease = if (string_length(remote) == 0) { "" } else { "=" ++ branch ++ ":" ++ remote }
+    if (length(theirs) > 0) {
+        send(orch, {'ci_done', run_id, issue_id, "in_review", "", "HUMAN: someone else pushed commits to " ++ branch ++ " (" ++ Std.join([string_sub(c, 0, 10) for c in theirs], ", ") ++ "). O won't overwrite them: merge them into the PR, or delete them from the branch, then retry the issue."})
+    } else { ci_push_open(orch, run_id, issue_id, ws, branch, base, gh_repo, title, required, lease) }
+}
+
+fun ci_push_open(orch, run_id, issue_id, ws, branch, base, gh_repo, title, required, lease) {
+    push = sh(f"git -C {ws} push -q --force-with-lease{lease} origin HEAD:refs/heads/{branch}")
     if (elem(push, 0) != 0) {
         send(orch, {'ci_done', run_id, issue_id, "red_ci", "", "git push failed:\n" ++ elem(push, 1)})
     } else {
@@ -3023,11 +3049,12 @@ fun numstat_lines(rows, acc) {
 fun escalate_reason(files, lines) {
     paths = getenv("O_ESCALATE_PATHS")
     hit = if (paths == nil) { 'false' } else { any_protected(files, paths) }
-    cap = env_int("O_ESCALATE_LINES", 1000)
+    # off unless set: the gate's hard rule (max_change_lines) bounds size
+    cap = env_int("O_ESCALATE_LINES", 0)
     if (hit == 'true') {
         "touches an O_ESCALATE_PATHS path (" ++ paths ++ ")"
     } else {
-        if (lines > cap) { "changes " ++ to_string(lines) ++ " lines, over O_ESCALATE_LINES=" ++ to_string(cap) } else { "" }
+        if (cap > 0 && lines > cap) { "changes " ++ to_string(lines) ++ " lines, over O_ESCALATE_LINES=" ++ to_string(cap) } else { "" }
     }
 }
 

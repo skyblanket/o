@@ -1685,9 +1685,16 @@ pass "budget: the global daily cap logs budget.capped once, not every tick"
 # breaks a step that passed before is bisected and reverted through a PR O
 # merges, and its issue goes back to Backlog (merge.revert). A step that was
 # already red on main (broken-on-base-too) doesn't count as a break.
+# hold the first check ~7s (state files in the future) so the drain lands first
+mkdir -p "$TMP4/.o/postmerge/$CIDG"; pm_at="$(( ($(date +%s) + 5) * 1000 ))"
+echo "$pm_at" > "$TMP4/.o/postmerge/$CIDG/started"; echo "$pm_at" > "$TMP4/.o/postmerge/$CIDG/done"
 restart_d4 O_POSTMERGE_S=2 O_POSTMERGE_TIMEOUT_S=60 O_AUTO_FILE=0
-ocurl -s -X POST "$BASE4/api/orchestrator/drain" -H 'Content-Type: application/json' -d '{"on":true}' >/dev/null
 pmq() { sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='$1'"; }
+# Draining starts nothing new, post-merge checks included.
+ocurl -s -X POST "$BASE4/api/orchestrator/drain" -H 'Content-Type: application/json' -d '{"on":true}' >/dev/null
+sleep 8
+[ "$(pmq postmerge.baseline)" = "0" ] || fail "drain: a post-merge check started while draining"
+ocurl -s -X POST "$BASE4/api/orchestrator/drain" -H 'Content-Type: application/json' -d '{"on":false}' >/dev/null
 for _i in $(seq 1 60); do [ "$(pmq postmerge.baseline)" = "1" ] && break; sleep 1; done
 [ "$(pmq postmerge.baseline)" = "1" ] || { grep -v '^\[orch\] tick' "$TMP4/daemon.log" | tail -20; fail "post-merge: no baseline recorded"; }
 grep -q "already red on main, not counted as a break: test -f broken-on-base-too" "$TMP4/daemon.log" || fail "post-merge: the step red on base was not reported as already red"
@@ -1745,6 +1752,21 @@ wait_status_at "$BASE4" "$IID_RK" "Done" 180 || { grep -v '^\[orch\] tick' "$TMP
 [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='run.dispatch' AND target='$IID_RK'")" = "$ndisp_rk" ] || fail "re-adopt: the builder ran again (it should reuse the approved PR)"
 git -C "$GHS/remote.git" log --oneline main | grep "o/$IID_RK" >/dev/null || fail "re-adopt: the PR did not merge into main"
 pass "re-adopt: when the tiers stop asking for a human, a PR parked for sign-off is re-gated on current main and merged, no rebuild"
+
+# Someone else's commit on O's branch is never overwritten: after a red CI
+# round, a person pushes a fix onto the PR; O's next push parks instead.
+IID_FC="$(gh_issue '[sim:good] someone else pushes to this branch')"
+echo "o/$IID_FC" >> "$GHS/fail_ci"
+for _i in $(seq 1 90); do [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='ci.fail' AND target='$IID_FC'")" -ge 1 ] && break; sleep 1; done
+FCW="$TMP4/foreign"; rm -rf "$FCW"; git clone -q "$GHS/remote.git" "$FCW" && git -C "$FCW" checkout -q "o/$IID_FC"
+echo "human fix" > "$FCW/human.txt"; git -C "$FCW" add human.txt
+git -C "$FCW" -c user.email=someone@example.com -c user.name=Someone commit -q -m "a person's fix" && git -C "$FCW" push -q origin "o/$IID_FC"
+FSHA="$(git -C "$FCW" rev-parse --short=10 HEAD)"
+wait_status_at "$BASE4" "$IID_FC" "In Review" 180 || { grep -v '^\[orch\] tick' "$TMP4/daemon.log" | tail -20; fail "foreign commit: O did not stop before overwriting someone else's commit"; }
+sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_FC' ORDER BY started_at DESC LIMIT 1" | grep "someone else pushed commits" | grep "$FSHA" >/dev/null \
+  || { sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_FC' ORDER BY started_at DESC LIMIT 1"; fail "foreign commit: the note does not name the commit"; }
+git -C "$GHS/remote.git" log --format=%ae "o/$IID_FC" | grep someone@example.com >/dev/null || fail "foreign commit: the person's commit was overwritten"
+pass "foreign commit: a person's commit on O's branch stops O's next push; the commit is kept and named"
 
 # ============================================================
 # Agent sandbox — 5th daemon, O_SANDBOX=bwrap + O_API_TOKEN
