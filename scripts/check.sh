@@ -1549,7 +1549,7 @@ for pair in "$IID_HD:deletes test files (tests/existing.sh)" "$IID_HC:changes CI
   wait_status_at "$BASE4" "$i" "Failed" 200 || { tail -30 "$TMP4/daemon.log"; fail "hard rules: $i was not stopped ($why)"; }
   sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$i' ORDER BY started_at DESC LIMIT 1" | grep -qF "hard rule: the PR $why" \
     || { sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$i' ORDER BY started_at DESC LIMIT 1"; fail "hard rules: reason missing ($why)"; }
-  git -C "$GHS/remote.git" log --oneline main | grep -q "o/$i" && fail "hard rules: $i was merged"
+  git -C "$GHS/remote.git" log --oneline main | grep "o/$i" >/dev/null && fail "hard rules: $i was merged"
 done
 pass "hard rules: a deleted test, a skipped test, a CI/gate-config change and an oversized PR are rejected before any model runs"
 
@@ -1743,7 +1743,7 @@ restart_d4 O_MERGE_GATE=1 O_AUTO_FILE=0
 wait_status_at "$BASE4" "$IID_RK" "Done" 180 || { grep -v '^\[orch\] tick' "$TMP4/daemon.log" | tail -20; fail "re-adopt: a sign-off PR was not re-gated and merged after its tier became auto"; }
 [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='pr.adopted' AND target='$IID_RK'")" -ge 1 ] || fail "re-adopt: no pr.adopted logged"
 [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='run.dispatch' AND target='$IID_RK'")" = "$ndisp_rk" ] || fail "re-adopt: the builder ran again (it should reuse the approved PR)"
-git -C "$GHS/remote.git" log --oneline main | grep -q "o/$IID_RK" || fail "re-adopt: the PR did not merge into main"
+git -C "$GHS/remote.git" log --oneline main | grep "o/$IID_RK" >/dev/null || fail "re-adopt: the PR did not merge into main"
 pass "re-adopt: when the tiers stop asking for a human, a PR parked for sign-off is re-gated on current main and merged, no rebuild"
 
 # ============================================================
