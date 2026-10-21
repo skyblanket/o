@@ -187,6 +187,42 @@ fun route_fs(conn, method, body) {
     }
 }
 
+# POST /api/issues/:id/retry {model?} — another round for a Failed or Canceled
+# issue: fresh attempts, the last failure appended to its body so the next
+# builder starts from it, and optionally a stronger model to start on (rungs
+# of O_MODEL_LADDER, recorded as operator escalations). Token-guarded.
+fun route_retry(db, conn, method, p, body) {
+    id = string_sub(p, 12, string_length(p) - 12 - 6)
+    cur = Store.issue_row(db, id)
+    st = if (cur == nil) { "" } else { default_str(map_get(cur, "status"), "") }
+    if (method != 'POST') { respond(conn, 405, err_json("method not allowed")) }
+    else { if (cur == nil) { respond(conn, 404, err_json("issue not found")) }
+    else { if (st != "Failed" && st != "Canceled") { respond(conn, 409, err_json("only a Failed or Canceled issue can be retried (this one is " ++ st ++ ")")) }
+    else {
+        data = if (string_length(body) > 0) { json_decode(body) } else { nil }
+        model = if (data == nil) { "" } else { default_str(map_get(data, "model"), "") }
+        want = if (string_length(model) > 0) { Orchestrator.ladder_rung(model) } else { 1 }
+        _e = escalate_to(id, want - 1 - Orchestrator.escalations(id), model)
+        last = Store.last_run_for_issue(db, id)
+        vs = if (last == nil) { "" } else { default_str(map_get(last, "verify_state"), "") }
+        vo = if (last == nil) { "" } else { default_str(map_get(last, "verify_output"), "") }
+        note = if (string_length(vs) == 0 && string_length(vo) == 0) { "" } else {
+            "\n\n---\nAn earlier round of this issue failed (" ++ (if (string_length(vs) > 0) { vs } else { "run died" }) ++ "):\n\n" ++ string_truncate(vo, 3000) ++ "\n\nStart from that: don't repeat what failed."
+        }
+        _b = if (string_length(note) > 0) { Store.issue_append_body(db, id, note) } else { "" }
+        _u = Store.issue_update(db, id, "Backlog", map_get(cur, "priority"), map_get(cur, "assignee_agent_id"))
+        _l = Store.log_activity(db, map_get(cur, "company_id"), "operator", "issue.retry", id)
+        respond(conn, 200, json_encode(Store.issue_row(db, id)))
+    }}}
+}
+
+fun escalate_to(id, n, model) {
+    if (n <= 0) { "" } else {
+        _r = Orchestrator.record_escalation(id, "ESCALATE: the operator asked for another round on " ++ model ++ "; read the earlier failure in the task before changing anything.")
+        escalate_to(id, n - 1, model)
+    }
+}
+
 fun route(db, dbpath, conn, method, path, body) {
     case path {
         "/" -> respond(conn, 200, json_encode(%{name: "O", version: "v4", service: "swarmd", ui: "the React app — cd ui && npm run dev"}))
@@ -201,6 +237,7 @@ fun route(db, dbpath, conn, method, path, body) {
         p when string_starts_with(p, "/api/companies/") == 'true' -> route_company(db, conn, method, p, body)
         p when string_starts_with(p, "/api/approvals/") == 'true' -> decide_approval(db, conn, method, p, body)
         p when string_starts_with(p, "/api/runs/") == 'true' -> run_result(db, conn, p)
+        p when string_starts_with(p, "/api/issues/") == 'true' && string_ends_with(p, "/retry") == 'true' -> route_retry(db, conn, method, p, body)
         p when string_starts_with(p, "/api/issues/") == 'true' -> route_issue(db, conn, method, p, body)
         p when string_starts_with(p, "/api/agents/") == 'true' -> route_agent(db, dbpath, conn, method, p, body)
         p when string_starts_with(p, "/api/personas/") == 'true' -> update_persona(db, conn, method, p, body)

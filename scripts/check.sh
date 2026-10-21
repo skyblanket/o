@@ -568,6 +568,18 @@ else
   cat "$TMP/daemon.log" || true; fail "[sim:bad-verify] never reached Failed"
 fi
 
+# Retry: a Failed issue gets another round (fresh attempts, its last failure in
+# its body, optionally a stronger model); anything else is refused.
+sc="$(ocurl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/issues/$IID_GOOD/retry" -H 'Content-Type: application/json' -d '{}')"
+[ "$sc" = "409" ] || fail "retry: a Done issue should not be retried (got $sc)"
+rr="$(ocurl -s -X POST "$BASE/api/issues/$IID_BAD/retry" -H 'Content-Type: application/json' -d '{"model":"sonnet"}')"
+echo "$rr" | grep -q "An earlier round of this issue failed (red_tests)" || { echo "$rr"; fail "retry: the last failure was not added to the issue"; }
+[ "$(sqlite3 "$TMP/o.db" "SELECT COUNT(*) FROM activity WHERE verb='issue.retry' AND target='$IID_BAD'")" = "1" ] || fail "retry: issue.retry not logged"
+grep -q "^ESCALATE: the operator asked for another round on sonnet" "$TMP/.o/escalations/$IID_BAD" 2>/dev/null || fail "retry: model=sonnet did not start it a rung up"
+wait_status "$IID_BAD" "Failed" 120 || fail "retry: the retried issue never ran its new round"
+[ "$(sqlite3 "$TMP/o.db" "SELECT MAX(attempt) FROM run WHERE issue_id='$IID_BAD' AND started_at > (SELECT ts FROM activity WHERE verb='issue.retry' AND target='$IID_BAD')")" -ge 1 ] || fail "retry: no new attempts after the retry"
+pass "retry: POST /api/issues/:id/retry requeues a Failed issue with its last failure and a stronger model; a Done one is refused"
+
 # activity records a pass, a fail, and a completed merge
 body="$(ocurl -s "$BASE/api/activity")"
 python3 - "$body" <<'PY' || fail "verify-gate activity missing verify.pass / verify.fail / merge.done"
@@ -1483,9 +1495,11 @@ pass "gate2: modified test passing on base -> note, not REJECT; tier check faili
 # base re-judge of the pre-existing tier failure comes from the cache.
 # (wait for every other GitHub issue to settle first, auto-filed fixes too, so
 # nothing merges between the two gates)
-for _i in $(seq 1 120); do
-  [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM issue WHERE company_id='$CIDG' AND status IN ('Backlog','Todo','In Progress','Verifying')")" = "0" ] && break; sleep 1
+settled=""
+for _i in $(seq 1 300); do
+  [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM issue WHERE company_id='$CIDG' AND status IN ('Backlog','Todo','In Progress','Verifying')")" = "0" ] && { settled=1; break; }; sleep 1
 done
+[ -n "$settled" ] || { sqlite3 "$TMP4/o.db" "SELECT identifier, status, title FROM issue WHERE company_id='$CIDG' AND status IN ('Backlog','Todo','In Progress','Verifying')"; fail "gate cache: other GitHub issues never settled, so main could move between the two gates"; }
 IID_XC1="$(gh_issue '[sim:ext-ok] ext change, merge refused')"
 echo "o/$IID_XC1" >> "$GHS/block_merge"
 wait_status_at "$BASE4" "$IID_XC1" "In Review" 120 || { tail -30 "$TMP4/daemon.log"; fail "gate cache: the merge-refused PR never parked"; }
