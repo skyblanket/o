@@ -2384,7 +2384,8 @@ fun ci_worker(orch, run_id, issue_id, ws, branch, base, gh_repo, title, required
     me = string_trim(elem(sh(f"git -C {ws} config --get user.email"), 1))
     cand = if (string_length(remote) == 0) { [] } else { lines_of(elem(sh(f"git -C {ws} rev-list --no-merges --format=%H%x20%ae {remote} ^HEAD ^origin/{base} | grep -v '^commit '"), 1)) }
     theirs = [hd(string_split(l, " ")) for l in cand when Std.any(mine, fn(m) { m == hd(string_split(l, " ")) }) == 'false' && Std.last(string_split(l, " ")) != me]
-    lease = if (string_length(remote) == 0) { "" } else { "=" ++ branch ++ ":" ++ remote }
+    # always explicit: "<branch>:" (empty) means the branch must not exist yet
+    lease = "=" ++ branch ++ ":" ++ remote
     if (length(theirs) > 0) {
         send(orch, {'ci_done', run_id, issue_id, "in_review", "", "HUMAN: someone else pushed commits to " ++ branch ++ " (" ++ Std.join([string_sub(c, 0, 10) for c in theirs], ", ") ++ "). O won't overwrite them: merge them into the PR, or delete them from the branch, then retry the issue."})
     } else { ci_push_open(orch, run_id, issue_id, ws, branch, base, gh_repo, title, required, lease) }
