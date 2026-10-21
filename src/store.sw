@@ -464,6 +464,12 @@ fun issue_cost(db, iid) {
     if (length(rows) == 0) { 0 } else { map_get(hd(rows), "c") }
 }
 
+# The Claude session a run worked in; its issue's retry resumes it.
+fun run_set_thread(db, run_id, sid) {
+    _u = db_query(db, "UPDATE run SET thread_id = ? WHERE id = ?", [sid, run_id])
+    run_id
+}
+
 fun run_finish(db, run_id, state, cost_cents) {
     _u = db_query(db, "UPDATE run SET state = ?, ended_at = ?, cost_cents = CAST(ROUND(?) AS INTEGER) WHERE id = ?", [state, timestamp(), cost_cents, run_id])
     run_id
@@ -506,7 +512,7 @@ fun run_count_for_issue(db, issue_id) {
 }
 
 fun last_run_for_issue(db, issue_id) {
-    rows = db_query(db, "SELECT id, issue_id, agent_id, attempt, state, verify_state, verify_output, started_at FROM run WHERE issue_id = ? ORDER BY started_at DESC LIMIT 1", [issue_id])
+    rows = db_query(db, "SELECT id, issue_id, agent_id, attempt, state, verify_state, verify_output, started_at, thread_id FROM run WHERE issue_id = ? ORDER BY started_at DESC LIMIT 1", [issue_id])
     if (length(rows) == 0) { nil } else { hd(rows) }
 }
 

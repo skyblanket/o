@@ -172,6 +172,26 @@ fun sandbox_prefix(ws, repo) {
     }
 }
 
+# ---- isolated test runs ------------------------------------------
+# Verify, post-merge verify and gate checks run in their own network namespace
+# (a private loopback: a project's fixed test ports can't collide between
+# runs) with a private /tmp (so a /tmp lock file no longer serializes them).
+# The run's dir, the repo and $HOME are bound back on top, since any of them
+# may live under /tmp. Only isolation, not a security fence: the rest of the
+# filesystem stays writable. On when O_SANDBOX=bwrap unless O_TEST_ISOLATE=0,
+# or with O_TEST_ISOLATE=1.
+fun test_isolate_on() {
+    v = getenv("O_TEST_ISOLATE")
+    if (v == "0") { 'false' } else { if (v == "1" || getenv("O_SANDBOX") == "bwrap") { 'true' } else { 'false' } }
+}
+
+fun isolate_prefix(dirs) {
+    if (test_isolate_on() == 'true') {
+        keep = Std.join([" --bind-try " ++ sq(d) ++ " " ++ sq(d) for d in dirs when string_length(d) > 0], "")
+        "bwrap --die-with-parent --dev-bind / / --unshare-net --tmpfs /tmp" ++ keep ++ " -- "
+    } else { "" }
+}
+
 # Per-run cost ceiling for claude-code: --max-turns caps how many
 # agent turns a single issue run may take. O_MAX_TURNS overrides.
 fun max_turns() {
@@ -290,6 +310,13 @@ fun verify_timeout_ms() {
     n * 1000 + 60000
 }
 
+# Builders test what they touch; O runs the full suite itself after the
+# commit (verify, then CI and the gate), so a builder that runs it, or waits on
+# it, only burns its time limit.
+fun test_hint() {
+    " Testing: build, then run only the tests for the code you changed (a single test file or target, with a timeout). Do NOT run the project's full test suite or its CI targets (make test, test-sw, test-full, check and the like): O runs them after you commit and sends you any failure. Never sleep, poll or wait on a background job; if a command takes more than a few minutes, stop it and commit what you have."
+}
+
 fun escalate_hint() {
     " If, after a real attempt, the task is beyond what you can do reliably (you can't find the root cause, or it needs deeper expertise than you have), stop and end your final message with one line `ESCALATE: <why>`; the next attempt then goes to a stronger model. Don't escalate for a flaky test or a broken environment: say what you saw instead."
 }
@@ -297,7 +324,7 @@ fun escalate_hint() {
 fun build_prompt(title, body, repo, protected) {
     if (string_length(repo) > 0) {
         fence = if (string_length(string_trim(protected)) > 0) { " You may NOT modify, rename or delete these protected paths (the verifier rejects any commit touching them): " ++ protected ++ ". If the task can only be done by changing one of them, don't work around it: commit nothing and end your final message with one line `NEEDS_HUMAN: <the exact change the protected file needs>`; a human makes it." } else { "" }
-        "You are an autonomous engineer working in a git checkout of a real project. Make the code changes this task needs, then run `git add -A` and `git commit -m` with a clear message. Do NOT commit PROMPT.txt, result.json or err.log." ++ fence ++ " Be focused and correct." ++ escalate_hint() ++ "\n\nTask: " ++ title ++ "\n\n" ++ body
+        "You are an autonomous engineer working in a git checkout of a real project. Make the code changes this task needs, then run `git add -A` and `git commit -m` with a clear message. Do NOT commit PROMPT.txt, result.json or err.log." ++ fence ++ " Be focused and correct." ++ test_hint() ++ escalate_hint() ++ "\n\nTask: " ++ title ++ "\n\n" ++ body
     } else {
         "You are an autonomous agent in a fresh working directory. Complete the task below, creating whatever files are needed. Be concise.\n\nTask: " ++ title ++ "\n\n" ++ body
     }
@@ -318,7 +345,7 @@ fun is_retry_verdict(vstate) {
 fun build_retry_prompt(title, body, repo, protected, rebase_onto, verdict, tail) {
     bp = build_prompt(title, body, repo, protected)
     fetch = if (string_starts_with(rebase_onto, "origin/") == 'true') { "git fetch origin, then " } else { "" }
-    bp ++ "\n\nYour previous attempt failed verification (" ++ verdict ++ "). Verify output tail:\n" ++ tail ++ "\nFix the code, run the checks yourself, commit again on this branch. If the failure was a merge conflict, first " ++ fetch ++ "git rebase " ++ rebase_onto ++ " and resolve conflicts."
+    bp ++ "\n\nYour previous attempt failed verification (" ++ verdict ++ "). Verify output tail:\n" ++ tail ++ "\nFix the code, re-run the specific failing test(s) above, commit again on this branch. If the failure was a merge conflict, first " ++ fetch ++ "git rebase " ++ rebase_onto ++ " and resolve conflicts."
 }
 
 # The prompt for a dispatch: a fresh task prompt, unless this is a retry of
@@ -336,12 +363,15 @@ fun dispatch_prompt_base(db, iid, title, body, repo, protected, rebase_onto, att
     # A parked PR sent back for a rebase starts a fresh attempt count but
     # must still get the conflict prompt.
     if (attempt > 1 || vstate == "conflict") {
-        if (is_retry_verdict(vstate) == 'true') {
-            vout = if (lastrun == nil) { "" } else { str_or(map_get(lastrun, "verify_output"), "") }
+        vout = if (lastrun == nil) { "" } else { str_or(map_get(lastrun, "verify_output"), "") }
+        if (vstate == "red_agent") {
+            # the attempt died before verify: say how, not "failed verification"
+            build_prompt(title, body, repo, protected) ++ "\n\n" ++ vout
+        } else { if (is_retry_verdict(vstate) == 'true') {
             build_retry_prompt(title, body, repo, protected, rebase_onto, vstate, vout)
         } else {
             build_prompt(title, body, repo, protected)
-        }
+        }}
     } else {
         build_prompt(title, body, repo, protected)
     }
@@ -366,6 +396,80 @@ fun timeout_flat_cents() {
 fun run_cost(code, parsed) {
     if (code == 124 && parsed == 0) { timeout_flat_cents() } else { parsed }
 }
+
+# Same, but a killed run's cost is estimated from the token usage it already
+# streamed (every assistant event carries it) before falling back to the flat
+# guess: a long run that was killed is usually the most expensive one.
+fun run_cost_est(code, parsed, spath) {
+    if (code == 124 && parsed == 0) {
+        est = usage_cents(stream_events(spath))
+        if (est > 0) { est } else { timeout_flat_cents() }
+    } else { parsed }
+}
+
+fun stream_events(path) {
+    raw = if (file_exists(path) == 'true') { file_read(path) } else { "" }
+    Std.filter([json_decode(l) for l in string_split(raw, "\n") when string_starts_with(l, "{") == 'true'], fn(e) { e != nil })
+}
+
+# Per message (several events can repeat one message's usage), priced by its
+# model. USD per million tokens: input, output, cache read, cache write.
+fun usage_cents(evs) {
+    msgs = usage_by_msg(evs, %{})
+    Std.sum([msg_cents(map_get(msgs, k)) for k in map_keys(msgs)])
+}
+
+fun usage_by_msg(evs, acc) {
+    if (length(evs) == 0) { acc } else {
+        e = hd(evs)
+        m = if (map_get(e, "type") == "assistant") { map_get(e, "message") } else { nil }
+        id = if (m == nil) { nil } else { map_get(m, "id") }
+        acc2 = if (id == nil || map_get(m, "usage") == nil) { acc } else { map_put(acc, id, m) }
+        usage_by_msg(tl(evs), acc2)
+    }
+}
+
+fun msg_cents(m) {
+    u = map_get(m, "usage")
+    p = model_prices(str_or(map_get(m, "model"), ""))
+    tok = fn(k) { n = map_get(u, k); if (n == nil) { 0 } else { n } }
+    usd = (tok("input_tokens") * elem(p, 0) + tok("output_tokens") * elem(p, 1) + tok("cache_read_input_tokens") * elem(p, 2) + tok("cache_creation_input_tokens") * elem(p, 3)) / 1000000.0
+    usd * 100
+}
+
+fun model_prices(model) {
+    if (string_contains(model, "haiku") == 'true') { {1.0, 5.0, 0.1, 1.25} }
+    else { if (string_contains(model, "sonnet") == 'true') { {3.0, 15.0, 0.3, 3.75} }
+    else { {5.0, 25.0, 0.5, 6.25} } }
+}
+
+# What the next attempt is told about a run that died without finishing: how
+# it ended and the last things it was doing, so it doesn't walk into the same
+# wall (most often: running the full suite and waiting on it until the limit).
+fun crash_summary(code, spath) {
+    how = if (code == 124) { "was stopped by O's time limit (" ++ to_string(stall_timeout() / 60000) ++ " min) before it finished" } else { "ended with an error (exit " ++ to_string(code) ++ ") before it finished" }
+    tools = last_n(tool_lines(stream_events(spath), []), 6)
+    acts = if (length(tools) == 0) { "" } else { " Its last actions were:\n" ++ Std.join(["- " ++ t for t in tools], "\n") }
+    "Your previous attempt " ++ how ++ "." ++ acts ++ "\nDon't repeat what stalled it. Don't run or wait on the full test suite; make the change, run the one test that covers it, and commit."
+}
+
+fun tool_lines(evs, acc) {
+    if (length(evs) == 0) { acc } else {
+        e = hd(evs)
+        m = if (map_get(e, "type") == "assistant") { map_get(e, "message") } else { nil }
+        cs = if (m == nil) { [] } else { list_or_empty(map_get(m, "content")) }
+        uses = [tool_desc(c) for c in cs when map_get(c, "type") == "tool_use"]
+        tool_lines(tl(evs), acc ++ uses)
+    }
+}
+
+fun tool_desc(c) {
+    i = map_get(c, "input")
+    arg = if (i == nil) { "" } else { str_or(map_get(i, "command"), str_or(map_get(i, "file_path"), str_or(map_get(i, "pattern"), ""))) }
+    str_or(map_get(c, "name"), "tool") ++ ": " ++ string_truncate(string_replace(arg, "\n", " "), 160)
+}
+
+fun last_n(xs, k) { if (length(xs) <= k) { xs } else { last_n(tl(xs), k) } }
 
 # sim runtime reports a fixed fake cost so budget enforcement can be
 # exercised without real spend. claude-code reports its true cost.
@@ -693,8 +797,10 @@ fun sweep_stalls(db, ids, running, retry, now) {
             # A wedged agent worker (it outlived its own shell_managed cap plus
             # slack) is charged the timeout estimate so the spend isn't invisible.
             _m = if (phase == 'agent') {
-                est = timeout_flat_cents()
+                spath = str_or(ws, "") ++ "/stream.jsonl"
+                est = run_cost_est(124, 0, spath)
                 _f = Store.run_finish(db, run_id, "Stalled", est)
+                _v = Store.run_set_verify(db, run_id, "red_agent", crash_summary(124, spath))
                 account_cost(db, company_id, est)
             } else {
                 Store.run_set_state(db, run_id, "Stalled")
@@ -829,6 +935,20 @@ fun pick_agent(db, company_id, assignee) {
     }
 }
 
+# The Claude session a dispatch resumes. One session per ISSUE, never the
+# agent's whole history: a session that carried every issue an agent ever
+# worked grew until merely loading it cost dollars, and it "remembered" work
+# that had since been thrown away. A retry resumes its own issue's session
+# only when the last attempt ended cleanly (its verify said what to fix) and
+# the workspace it worked in still exists; a timeout or crash starts fresh,
+# its context is what went wrong.
+fun issue_session(db, iid, workspace) {
+    prev = Store.last_run_for_issue(db, iid)
+    sid = if (prev == nil) { "" } else { str_or(map_get(prev, "thread_id"), "") }
+    clean = prev != nil && str_or(map_get(prev, "state"), "") == "VerifyFailed"
+    if (clean && string_length(sid) > 0 && file_exists(workspace) == 'true') { sid } else { "" }
+}
+
 fun dispatch_one(db, issue, iid, attempt, running, now) {
     company_id = map_get(issue, "company_id")
     agent = pick_agent(db, company_id, map_get(issue, "assignee_agent_id"))
@@ -845,12 +965,9 @@ fun dispatch_one(db, issue, iid, attempt, running, now) {
         agent_repo = str_or(map_get(agent, "repo"), "")
         repo = if (string_length(company_repo) > 0) { company_repo } else { agent_repo }
         protected = str_or(map_get(company, "protected_paths"), "")
-        # The agent's durable runtime session — empty on its first ever
-        # run, then resumed on every issue after, so it accumulates context.
-        rawses = map_get(agent, "session_id")
-        session_id = if (rawses == nil) { "" } else { rawses }
         home = getenv("HOME")
         workspace = f"{home}/.o/workspaces/{iid}"
+        session_id = issue_session(db, iid, workspace)
         title = str_or(map_get(issue, "title"), "")
         body = default_body(map_get(issue, "body"))
         # Build the prompt BEFORE creating the new run row, so the retry path
@@ -1012,7 +1129,8 @@ fun run_claude_code_in(orch, run_id, issue_id, prompt, workspace, repo, session_
     stale = string_length(resume) > 0 && elem(first, 0) != 0 && string_contains(file_read(f"{workspace}/err.log"), "No conversation found") == 'true'
     result = if (stale) { claude_once(workspace, bin, "", sbx, model) } else { first }
     code = elem(result, 0)
-    cost = run_cost(code, parse_stream_cost(f"{workspace}/stream.jsonl"))
+    spath = f"{workspace}/stream.jsonl"
+    cost = run_cost_est(code, parse_stream_cost(spath), spath)
     new_session = parse_stream_session(f"{workspace}/stream.jsonl")
     final = str_or(map_get(parse_stream_result(f"{workspace}/stream.jsonl"), "result"), "")
     esc = escalation_in(final)
@@ -1024,6 +1142,7 @@ fun run_claude_code_in(orch, run_id, issue_id, prompt, workspace, repo, session_
     } else { if (code == 0) {
         send(orch, {'run_done', run_id, issue_id, 'succeeded', cost, new_session})
     } else {
+        _x = file_write(workspace ++ ".crash.txt", crash_summary(code, spath))
         send(orch, {'run_done', run_id, issue_id, 'crashed', cost, new_session})
     }}
 }
@@ -1557,6 +1676,7 @@ fun decide_outcome(issue, attempt) {
 fun persist_session(db, info, session_id) {
     if (string_length(session_id) > 0) {
         _u = Store.agent_set_session(db, map_get(info, "agent_id"), session_id)
+        _t = Store.run_set_thread(db, map_get(info, "run_id"), session_id)
         ""
     } else {
         ""
@@ -1622,6 +1742,12 @@ fun handle_done(db, running, retry, run_id, issue_id, outcome, cost, session_id)
             attempt = map_get(info, "attempt")
             _m = Store.run_finish(db, run_id, "Failed", cost)
             account_cost(db, company_id, cost)
+            # the worker's account of how it died becomes the retry's verdict
+            cf = str_or(map_get(info, "workspace"), "") ++ ".crash.txt"
+            _cr = if (file_exists(cf) == 'true') {
+                _v = Store.run_set_verify(db, run_id, "red_agent", file_read(cf))
+                sh("rm -f " ++ sq(cf))
+            } else { "" }
             if (attempt >= max_attempts()) {
                 # exhausted retries — mark the issue Failed (terminal), don't loop
                 _s = Store.issue_set_status(db, issue_id, "Failed")
@@ -1756,7 +1882,14 @@ fun timeout_cmd(secs, verify_cmd, ws, logpath) {
 # phase-3 merger re-verifies on the repo's MAIN checkout (cwd = repo), writing
 # its log outside the repo (inside the issue worktree).
 fun timeout_cmd_in(dir, secs, verify_cmd, logpath) {
-    f"cd {sq(dir)} && perl -e 'alarm shift; exec @ARGV' {secs} sh -c {sq(verify_cmd)} > {sq(logpath)} 2>&1"
+    iso = isolate_prefix([dir, git_common_dir(dir), getenv("HOME")])
+    f"cd {sq(dir)} && perl -e 'alarm shift; exec @ARGV' {secs} {iso}sh -c {sq(verify_cmd)} > {sq(logpath)} 2>&1"
+}
+
+# The repo a worktree's commits land in (its .git may live outside `dir`).
+fun git_common_dir(dir) {
+    r = sh("git -C " ++ sq(dir) ++ " rev-parse --path-format=absolute --git-common-dir 2>/dev/null")
+    if (elem(r, 0) == 0) { string_trim(elem(r, 1)) } else { "" }
 }
 
 # Last ~4KB of the verify log — the tail the retry prompt (and the run row)
@@ -2570,7 +2703,8 @@ fun base_setup_cmd(rvb, build) {
 }
 
 fun run_step_cmd(dir, cmd, logp) {
-    elem(shell_managed("cd " ++ sq(dir) ++ " && sh -c " ++ sq(cmd) ++ " > " ++ sq(logp) ++ " 2>&1", gate_timeout_ms()), 0)
+    iso = isolate_prefix([dir, git_common_dir(dir), getenv("HOME")])
+    elem(shell_managed("cd " ++ sq(dir) ++ " && " ++ iso ++ "sh -c " ++ sq(cmd) ++ " > " ++ sq(logp) ++ " 2>&1", gate_timeout_ms()), 0)
 }
 
 # ---- gate check cache --------------------------------------------
@@ -3190,7 +3324,7 @@ fun handle_merge_done(db, running, retry, run_id, issue_id, outcome, merge_sha, 
             _is = Store.issue_set_status(db, issue_id, "Done")
             _g = Store.company_mark_green(db, company_id)
             _a = Store.log_activity(db, company_id, "orchestrator", "merge.done", issue_id)
-            _fl = if (tail == "flaky") { Store.log_activity(db, company_id, "orchestrator", "merge.flaky", issue_id) } else { "" }
+            _flaky = if (tail == "flaky") { Store.log_activity(db, company_id, "orchestrator", "merge.flaky", issue_id) } else { "" }
             %{running: map_remove(running, issue_id), retry: map_remove(retry, issue_id)}
         } else {
             if (outcome == "conflict") {
