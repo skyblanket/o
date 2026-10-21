@@ -15,6 +15,9 @@ set -euo pipefail
 # Fast clock for every daemon this suite boots (and the held-out suite):
 # half-second ticks and retry backoff instead of the 5s/2s production values.
 export O_TICK_MS="${O_TICK_MS:-500}" O_BACKOFF_MS="${O_BACKOFF_MS:-300}"
+# the adaptive starting model (o#64) would read the stages' deliberate failures as
+# a weak model: off everywhere but its own stage
+export O_ADAPT=0
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -2063,6 +2066,24 @@ SE='{"action":"created","data":{"issue":{"id":"4711","title":"TypeError: x is un
 s1="$(post_err "$SE")"; s2="$(post_err "$SE")"
 [ "$(jget "$s1" 'd["created"]')" = "1" ] && [ "$(jget "$s1" 'd["severity"]')" = "high" ] && [ "$(jget "$s2" 'd["created"]')" = "0" ] && [ "$(ecount err:sentry:4711)" = "1" ] || { echo "$s1 $s2"; fail "errors: a Sentry-shaped payload was not taken in once at high severity"; }
 pass "errors: a tracker's webhook (generic or Sentry-shaped) files one issue per error; repeats update counts and raise severity (computed from rate, users and release); an error in a file O's merge changed is linked to that merge as a suspected escape"
+# Adaptive starting model (o#64): where haiku keeps failing verify on a
+# tier (<= 25% of 3+ runs in 7 days), new work on that tier starts on the next
+# rung, and the choice is logged with its numbers.
+git -C "$SEEDGH" fetch -q origin && git -C "$SEEDGH" checkout -q -B main origin/main
+python3 -c 'import json,sys;p=sys.argv[1];d=json.load(open(p));d["tiers"].append({"name":"lab","paths":["lab/"],"merge":"auto"});json.dump(d,open(p,"w"),indent=1)' "$SEEDGH/.o-review.json"
+git -C "$SEEDGH" commit -qam "lab tier" && git -C "$SEEDGH" push -q origin main
+restart_d4 O_MERGE_GATE=1 O_AUTO_FILE=0 O_ENV_RETRY_S=2 O_ADAPT=1
+for k in 1 2; do IL="$(gh_issue "[sim:bad-verify] lab/ change $k")"; wait_status_at "$BASE4" "$IL" "Failed" 300 || fail "adapt: a failing lab/ issue never stopped"; done
+ILG="$(gh_issue '[sim:good] lab/ change that works')"
+wait_status_at "$BASE4" "$ILG" "Done" 180 || fail "adapt: the lab/ issue never merged"
+m1="$(sqlite3 "$TMP4/o.db" "SELECT model FROM run WHERE issue_id='$ILG' AND attempt=1")"
+[ "$m1" = "sonnet" ] || { sqlite3 "$TMP4/o.db" "SELECT issue_id, attempt, model, tier, vpass, verify_state FROM run WHERE tier='lab'"; fail "adapt: after haiku kept failing on the lab tier, new lab work started on '$m1', not sonnet"; }
+sqlite3 "$TMP4/o.db" "SELECT payload FROM activity WHERE verb='model.adapt' AND target='$ILG'" | grep -q "tier lab: haiku passed verify in 0 of" || fail "adapt: the choice was not logged with its numbers"
+ILD="$(gh_issue '[sim:docs] docs while adapting')"; echo "o/$ILD" >> "$GHS/only_lint"
+wait_status_at "$BASE4" "$ILD" "Done" 180 || fail "adapt: the docs issue never merged"
+[ "$(sqlite3 "$TMP4/o.db" "SELECT model FROM run WHERE issue_id='$ILD' AND attempt=1")" = "haiku" ] || fail "adapt: a docs issue (haiku passing there) did not start on haiku"
+pass "adapt: where haiku passed verify in 0 of 3+ runs on a tier, new work on that tier starts on sonnet (logged with the numbers); other tiers still start on haiku"
+restart_d4 O_MERGE_GATE=1 O_AUTO_FILE=0 O_ENV_RETRY_S=2
 # inherited: base fails the same way, so the change isn't blamed
 git -C "$SEEDGH" fetch -q origin && git -C "$SEEDGH" checkout -q -B main origin/main
 echo broken > "$SEEDGH/BASE_BROKEN"; git -C "$SEEDGH" add BASE_BROKEN && git -C "$SEEDGH" commit -qm "break base" && git -C "$SEEDGH" push -q origin main

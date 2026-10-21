@@ -532,6 +532,7 @@ The daemon reads its configuration from the environment. All are optional.
 | `O_DIGEST_S` | `86400` | how often O writes `~/.o/digest.md`, the list of everything waiting on a person. |
 | `O_POLICY` | _(off)_ | `1`: keep `docs/O-POLICY.md` current in each GitHub repo, landed through O's own pipeline. |
 | `O_POLICY_S` | `3600` | how often O compares the repo's policy with the one it generates. |
+| `O_ADAPT` | `1` | adaptive starting model: when haiku passed verify in at most 25% of 3+ runs on a tier over 7 days (environment, inherited, CI-timeout and agent-crash failures don't count), new work on that tier starts one rung up. Each choice is logged as `model.adapt` with its numbers. `0` turns it off. |
 | `O_VERIFY_RETRY` | `1` | a failed verify is re-run once before it counts. Fail-then-pass is logged `verify.flaky` and ships with no retry. `0` turns it off. |
 | `O_REVIEW_MODEL` | `sonnet` | model for the pre-PR reviewer. |
 | `O_GH_BIN` | `gh` on `PATH` | GitHub CLI used for issue import and PRs. |
