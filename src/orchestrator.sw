@@ -1970,6 +1970,35 @@ fun norm_line(l) {
     string_trim(elem(sh("printf %s " ++ sq(l) ++ " | sed -E 's#/tmp/[^ ]*#/tmp/X#g; s/0x[0-9a-fA-F]+/0x#/g; s/[0-9]+/#/g'"), 1))
 }
 
+# The merge record O leaves on every PR it merges (o#66): what merged, what
+# it took, and what went wrong on the way. The gate's own comment above it
+# carries the checks and the verdict.
+fun audit_text(db, issue_id, sha) {
+    runs = Store.run_history(db, issue_id)
+    fails = [r for r in runs when string_starts_with(str_or(map_get(r, "verify_state"), ""), "red") == 'true']
+    rounds = 1 + Store.retry_count(db, issue_id)
+    "**O merge record**\n\n" ++
+    "- Merged commit: `" ++ sha ++ "`\n" ++
+    "- Builder runs: " ++ to_string(Store.run_count_for_issue(db, issue_id)) ++ " over " ++ to_string(rounds) ++ " round(s); reproduced first: " ++ (if (Store.count_target_verb(db, issue_id, "repro.ok") > 0) { "yes" } else { "no" }) ++ "\n" ++
+    "- Failures on the way: " ++ (if (length(fails) == 0) { "none" } else { Std.join(["`" ++ str_or(map_get(r, "verify_state"), "") ++ "`: " ++ first_line(str_or(map_get(r, "verify_output"), "")) for r in Std.take(fails, 5)], "; ") }) ++ "\n" ++
+    "- Environment re-runs: " ++ to_string(Store.count_target_verb(db, issue_id, "verify.env")) ++ "; failures inherited from base: " ++ to_string(Store.count_target_verb(db, issue_id, "verify.inherited")) ++ "\n" ++
+    "- Cost: $" ++ to_string(Store.issue_cost(db, issue_id) / 100.0) ++ "\n\n" ++
+    "If this merge breaks `main`, O's post-merge check bisects to it and reverts it."
+}
+
+fun audit_comment_worker(gh_repo, issue_id, text) {
+    if (string_length(gh_repo) == 0) { "" } else {
+        owner = hd(string_split(gh_repo, "/"))
+        prs = gh_json(sq(f"repos/{gh_repo}/pulls?head={owner}:o/{issue_id}&state=all"))
+        num = if (prs == nil) { nil } else { merged_pr(prs) }
+        if (num == nil) { "" } else {
+            f = getenv("HOME") ++ "/.o/audit-" ++ issue_id ++ ".md"
+            _w = file_write(f, text)
+            gh_api(f"-X POST repos/{gh_repo}/issues/{num}/comments -F body=@{sq(f)}")
+        }
+    }
+}
+
 fun learn_from_merge(db, company_id, issue_id, sha) {
     issue = Store.issue_row(db, issue_id)
     ident = if (issue == nil) { issue_id } else { str_or(map_get(issue, "identifier"), issue_id) }
@@ -2694,6 +2723,8 @@ fun handle_ci_done(db, running, retry, run_id, issue_id, outcome, sha, tail) {
             _g = Store.company_mark_green(db, company_id)
             _a = Store.log_activity(db, company_id, "orchestrator", "ci.merged", issue_id)
             _ls = learn_from_merge(db, company_id, issue_id, sha)
+            co = Store.company_row(db, company_id)
+            _au = spawn(audit_comment_worker(str_or(map_get(co, "github_repo"), ""), issue_id, audit_text(db, issue_id, sha)))
             %{running: map_remove(running, issue_id), retry: map_remove(retry, issue_id)}
         } else { if (outcome == "in_review") {
             _v = Store.run_set_verify(db, run_id, "in_review", tail)

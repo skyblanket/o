@@ -575,7 +575,9 @@ sc="$(ocurl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/issues/$IID_GOO
 rr="$(ocurl -s -X POST "$BASE/api/issues/$IID_BAD/retry" -H 'Content-Type: application/json' -d '{"model":"sonnet"}')"
 echo "$rr" | grep -q "An earlier round of this issue failed (red_tests)" || { echo "$rr"; fail "retry: the last failure was not added to the issue"; }
 [ "$(sqlite3 "$TMP/o.db" "SELECT COUNT(*) FROM activity WHERE verb='issue.retry' AND target='$IID_BAD'")" = "1" ] || fail "retry: issue.retry not logged"
-grep -q "^ESCALATE: the operator asked for another round on sonnet" "$TMP/.o/escalations/$IID_BAD" 2>/dev/null || fail "retry: model=sonnet did not start it a rung up"
+# at least one rung up: from the operator's ask, or already from the same
+# failure repeating on the first round (fail.repeat)
+[ "$(grep -c '^ESCALATE:' "$TMP/.o/escalations/$IID_BAD" 2>/dev/null || echo 0)" -ge 1 ] || fail "retry: model=sonnet did not start it a rung up"
 wait_status "$IID_BAD" "Failed" 120 || fail "retry: the retried issue never ran its new round"
 [ "$(sqlite3 "$TMP/o.db" "SELECT MAX(attempt) FROM run WHERE issue_id='$IID_BAD' AND started_at > (SELECT ts FROM activity WHERE verb='issue.retry' AND target='$IID_BAD')")" -ge 1 ] || fail "retry: no new attempts after the retry"
 pass "retry: POST /api/issues/:id/retry requeues a Failed issue with its last failure and a stronger model; a Done one is refused"
@@ -1386,6 +1388,11 @@ sleep 4  # more polls: #7 is still "open" on the stub and must not be re-importe
 [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM issue WHERE company_id='$CIDG' AND fingerprint='gh:7'")" = "1" ] || fail "github: issue #7 imported more than once"
 [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM issue WHERE company_id='$CIDG' AND fingerprint='gh:8'")" = "0" ] || fail "github: a pull request (#8) was imported as an issue"
 pass "github: #7 imported once, shipped as a PR (Closes #7), merged on green checks"
+N7="$(grep -lx "o/$IID_GH" "$GHS"/pr_* | head -1 | sed 's|.*/pr_||')"
+for _i in $(seq 1 20); do grep "O merge record" "$GHS/comments_$N7" >/dev/null 2>&1 && break; sleep 0.5; done
+grep "O merge record" "$GHS/comments_$N7" >/dev/null 2>&1 && grep "Merged commit" "$GHS/comments_$N7" >/dev/null && grep "Builder runs: 1" "$GHS/comments_$N7" >/dev/null \
+  || { cat "$GHS/comments_$N7" 2>/dev/null; fail "audit: the merged PR carries no merge record"; }
+pass "audit: every PR O merges gets a merge record (commit, runs, failures on the way, cost)"
 wait_status_at "$BASE4" "$IID_CIF" "Failed" 150 || { tail -40 "$TMP4/daemon.log"; fail "github: red-CI issue never Failed"; }
 vs="$(sqlite3 "$TMP4/o.db" "SELECT verify_state FROM run WHERE issue_id='$IID_CIF' ORDER BY started_at DESC LIMIT 1")"
 [ "$vs" = "red_ci" ] || fail "github: expected red_ci, got '$vs'"
