@@ -1544,14 +1544,18 @@ IID_HD="$(gh_issue '[sim:del-test] drop a test')"
 IID_HC="$(gh_issue '[sim:ci-edit] touch CI')"
 IID_HH="$(gh_issue '[sim:huge] one giant change')"
 IID_HS="$(gh_issue '[sim:skip-test] skip the flaky test')"
-for pair in "$IID_HD:deletes test files (tests/existing.sh)" "$IID_HC:changes CI or the gate's own config (.github/workflows/ci.yml)" "$IID_HH:changes 1600 lines, over the limit of 1500" "$IID_HS:weakens tests (1 added skip markers)"; do
+IID_HT="$(gh_issue '[sim:stub] half-done feature')"
+IID_HK="$(gh_issue '[sim:secret] wire the cloud key')"
+IID_HR="$(gh_issue '[sim:good] fix the parser crash and add a regression test')"
+for pair in "$IID_HD:deletes test files (tests/existing.sh)" "$IID_HC:changes CI or the gate's own config (.github/workflows/ci.yml)" "$IID_HH:changes 1600 lines, over the limit of 1500" "$IID_HS:weakens tests (1 added skip markers)" "$IID_HT:adds unfinished code outside tests" "$IID_HK:adds what looks like a secret" "$IID_HR:"; do
   i="${pair%%:*}"; why="${pair#*:}"
   wait_status_at "$BASE4" "$i" "Failed" 200 || { tail -30 "$TMP4/daemon.log"; fail "hard rules: $i was not stopped ($why)"; }
-  sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$i' ORDER BY started_at DESC LIMIT 1" | grep -qF "hard rule: the PR $why" \
+  [ -n "$why" ] || why="the issue asks for a test, and the PR adds or changes none"
+  sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$i' ORDER BY started_at DESC LIMIT 1" | grep -F "hard rule: " | grep -F "$why" >/dev/null \
     || { sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$i' ORDER BY started_at DESC LIMIT 1"; fail "hard rules: reason missing ($why)"; }
   git -C "$GHS/remote.git" log --oneline main | grep "o/$i" >/dev/null && fail "hard rules: $i was merged"
 done
-pass "hard rules: a deleted test, a skipped test, a CI/gate-config change and an oversized PR are rejected before any model runs"
+pass "hard rules: a deleted or skipped test, a CI/gate-config change, an oversized PR, unfinished code, a secret, and a missing asked-for test are rejected before any model runs"
 
 # Gate cache: a check's result is kept by content (tree + command). XC1's merge
 # is refused (main doesn't move), so XC2 is gated on the same base and its
@@ -1767,6 +1771,35 @@ sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_FC' ORD
   || { sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_FC' ORDER BY started_at DESC LIMIT 1"; fail "foreign commit: the note does not name the commit"; }
 git -C "$GHS/remote.git" log --format=%ae "o/$IID_FC" | grep someone@example.com >/dev/null || fail "foreign commit: the person's commit was overwritten"
 pass "foreign commit: a person's commit on O's branch stops O's next push; the commit is kept and named"
+
+# Failure classes (o#59). main's verify.sh learns two failure modes: a box that
+# runs out of disk on the first two runs (ENV_FAIL), and a base that is itself
+# broken (BASE_BROKEN).
+git -C "$SEEDGH" fetch -q origin && git -C "$SEEDGH" checkout -q -B main origin/main
+cat > "$SEEDGH/verify.sh" <<'SH'
+#!/bin/sh
+if [ -f ENV_FAIL ]; then c="$HOME/envcount"; n=$(cat "$c" 2>/dev/null || echo 0); echo $((n + 1)) > "$c"
+  if [ "$n" -lt 2 ]; then echo "write: No space left on device"; exit 1; fi; fi
+if [ -f BASE_BROKEN ]; then echo "FAIL: base is broken (test_widget)"; exit 1; fi
+if [ -f BREAK_VERIFY ]; then echo "BREAK_VERIFY present"; exit 1; fi
+exit 0
+SH
+git -C "$SEEDGH" commit -qam "verify.sh: env and base-broken modes" && git -C "$SEEDGH" push -q origin main
+restart_d4 O_MERGE_GATE=1 O_AUTO_FILE=0 O_ENV_RETRY_S=2
+# environment: re-verified on the same attempt, no builder re-run
+IID_EV="$(gh_issue '[sim:env] the box runs out of disk')"
+wait_status_at "$BASE4" "$IID_EV" "Done" 240 || { grep -v '^\[orch\] tick' "$TMP4/daemon.log" | tail -20; fail "env: an environment failure was not retried to Done"; }
+[ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='verify.env' AND target='$IID_EV'")" = "1" ] || fail "env: verify.env not logged once"
+[ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='run.dispatch' AND target='$IID_EV'")" = "1" ] || fail "env: the builder ran again for an environment failure"
+[ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='verify.fail' AND target='$IID_EV'")" = "0" ] || fail "env: an environment failure was counted against the change"
+pass "env: a verify that fails on the box (no space) re-runs at verify on the same attempt; no builder run, no attempt spent"
+# inherited: base fails the same way, so the change isn't blamed
+echo broken > "$SEEDGH/BASE_BROKEN"; git -C "$SEEDGH" add BASE_BROKEN && git -C "$SEEDGH" commit -qm "break base" && git -C "$SEEDGH" push -q origin main
+IID_IH="$(gh_issue '[sim:good] change on a broken main')"
+wait_status_at "$BASE4" "$IID_IH" "Done" 240 || { grep -v '^\[orch\] tick' "$TMP4/daemon.log" | tail -20; fail "inherited: a change on a broken main was blamed for main's failure"; }
+[ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='verify.inherited' AND target='$IID_IH'")" -ge 1 ] || fail "inherited: verify.inherited not logged"
+[ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='verify.fail' AND target='$IID_IH'")" = "0" ] || fail "inherited: main's failure was counted against the change"
+pass "inherited: a verify that fails the same way on base goes on to CI and the gate instead of back to the builder"
 
 # ============================================================
 # Agent sandbox — 5th daemon, O_SANDBOX=bwrap + O_API_TOKEN

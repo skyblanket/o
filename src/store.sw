@@ -728,6 +728,11 @@ fun issue_append_body(db, id, text) {
 # (a sign-off). Escaped = an O-merged change reverted after merge, or a fix a
 # persona re-ran and found still broken. Touches = every time a person had to
 # act: a sign-off, a protected-file edit O asked for, a retry or a manual edit.
+fun count_target_verb(db, target, verb) {
+    r = db_query(db, "SELECT COUNT(*) AS n FROM activity WHERE target = ? AND verb = ?", [target, verb])
+    if (length(r) == 0) { 0 } else { map_get(hd(r), "n") }
+}
+
 fun count_verbs(db, verbs) {
     marks = Std.join(["?" for v in verbs], ", ")
     r = db_query(db, "SELECT COUNT(*) AS n FROM activity WHERE verb IN (" ++ marks ++ ")", verbs)

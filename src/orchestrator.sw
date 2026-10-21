@@ -863,7 +863,8 @@ fun dispatch_batch(db, cands, slots, running, retry, now) {
                         _a = Store.log_activity(db, cid, "orchestrator", "run.failed_final", iid)
                         dispatch_batch(db, tl(cands), slots, running, map_remove(retry, iid), now)
                     } else {
-                        recovered = map_has_key(retry, iid) == 'false' && str_or(map_get(issue, "status"), "") == "Verifying"
+                        env_retry = map_has_key(retry, iid) == 'true' && map_get(map_get(retry, iid), "env") == 'true'
+                        recovered = (map_has_key(retry, iid) == 'false' || env_retry) && str_or(map_get(issue, "status"), "") == "Verifying"
                         running2 = if (recovered && has_committed_work(db, issue, iid) == 'true') { resume_at_verify(db, issue, iid, attempt, running, now) } else { dispatch_one(db, issue, iid, attempt, running, now) }
                         retry2 = map_remove(retry, iid)
                         dispatch_batch(db, tl(cands), slots - 1, running2, retry2, now)
@@ -1601,7 +1602,10 @@ fun sim_marker(title) {
     else { if (string_contains(title, "[sim:ci-edit]") == 'true') { "ci-edit" }
     else { if (string_contains(title, "[sim:huge]") == 'true') { "huge" }
     else { if (string_contains(title, "[sim:skip-test]") == 'true') { "skip-test" }
-    else { "good" }}}}}}}}}}}}}}}}}
+    else { if (string_contains(title, "[sim:stub]") == 'true') { "stub" }
+    else { if (string_contains(title, "[sim:secret]") == 'true') { "secret" }
+    else { if (string_contains(title, "[sim:env]") == 'true') { "env" }
+    else { "good" }}}}}}}}}}}}}}}}}}}}
 }
 
 # Carry out the marker's action in the worktree. Every case except no-commit
@@ -1649,6 +1653,12 @@ fun sim_act(workspace, issue_id, marker, protected) {
                     sh(f"cd {workspace} && git rm -q tests/existing.sh && git commit -q -m sim-del-test")
                 } else { if (marker == "ci-edit") {
                     sim_commit(workspace, ".github/workflows/ci.yml", "on: push")
+                } else { if (marker == "env") {
+                    sim_commit(workspace, "ENV_FAIL", "the verify box runs out of disk twice")
+                } else { if (marker == "stub") {
+                    sim_commit(workspace, f"src_{issue_id}.c", "int feature(void) { /* TODO: handle the error path */ return 0; }")
+                } else { if (marker == "secret") {
+                    sim_commit(workspace, f"conf_{issue_id}.env", "AWS_ACCESS_KEY_ID=" ++ "AKIA" ++ "QWERTYUIOPASDFGH")
                 } else { if (marker == "skip-test") {
                     sim_commit(workspace, f"tests/w_{issue_id}.sh", "skip(\"flaky on CI\")\nexit 0")
                 } else { if (marker == "huge") {
@@ -1659,7 +1669,7 @@ fun sim_act(workspace, issue_id, marker, protected) {
                     sh(f"cd {workspace} && git rm -q sim_{issue_id}.txt && git commit -q -m sim-undo")
                 } else {
                     sim_commit(workspace, f"sim_{issue_id}.txt", "ok")
-                }}}}}}}}}}}}}
+                }}}}}}}}}}}}}}}}
                 }
             }
         }
@@ -1863,13 +1873,76 @@ fun run_verify(orch, run_id, issue_id, ws, repo, base, verify_cmd, protected) {
                 if (elem(r2, 0) == 0) {
                     send(orch, {'verify_done', run_id, issue_id, "green", "FLAKY: the first verify run failed and an identical rerun passed. First run:\n" ++ tail})
                 } else {
-                    send(orch, {'verify_done', run_id, issue_id, "red_tests", tail_log(logpath)})
+                    t2 = tail_log(logpath)
+                    cls = classify_red(ws, repo, base, verify_cmd, t2)
+                    send(orch, {'verify_done', run_id, issue_id, map_get(cls, "verdict"), map_get(cls, "tail")})
                 }
             } else {
                 send(orch, {'verify_done', run_id, issue_id, verdict, tail})
             }
         }
     }
+}
+
+# Why a verify that failed twice failed, before it counts against the builder
+# (o#59). %{verdict, tail}:
+#   red_env        the box, not the code: disk, memory, kills, network, rate
+#                  limits. Re-run without spending an attempt.
+#   red_inherited  base fails the same verify, with every failure the change
+#                  shows: main was already broken; the change goes on with a
+#                  note and CI and the gate judge it.
+#   red_tests      anything else: the change's to fix.
+fun classify_red(ws, repo, base, verify_cmd, tail) {
+    if (env_failure(tail) == 'true') {
+        %{verdict: "red_env", tail: "ENVIRONMENT: the verify failed for reasons outside the change (" ++ env_failure_why(tail) ++ "); it runs again without spending an attempt.\n\n" ++ tail}
+    } else {
+        bt = base_verify_tail(ws, repo, base, verify_cmd)
+        mine = fail_lines(tail)
+        if (string_length(bt) > 0 && length(mine) > 0 && Std.all(mine, fn(l) { Std.any(fail_lines(bt), fn(b) { b == l }) }) == 'true') {
+            %{verdict: "red_inherited", tail: "INHERITED: " ++ base ++ " fails this verify too, with every failure this change shows; main was already broken.\n\nOn the change:\n" ++ tail ++ "\n\nOn " ++ base ++ ":\n" ++ bt}
+        } else {
+            %{verdict: "red_tests", tail: tail}
+        }
+    }
+}
+
+fun env_patterns() {
+    ["No space left on device", "Cannot allocate memory", "Out of memory", "\nKilled", "Resource temporarily unavailable", "Too many open files", "Text file busy", "Could not resolve host", "Temporary failure in name resolution", "429 Too Many Requests"]
+}
+
+fun env_failure(tail) { if (string_length(env_failure_why(tail)) > 0) { 'true' } else { 'false' } }
+
+fun env_failure_why(tail) {
+    hits = [p for p in env_patterns() when string_contains(tail, p) == 'true']
+    if (length(hits) == 0) { "" } else { hd(hits) }
+}
+
+# The lines that name failures, normalised so the same failure matches across
+# runs: digits, hex and temp paths stripped.
+fun fail_lines(text) {
+    ls = [l for l in lines_of(text) when string_contains(l, "FAIL") == 'true' || string_contains(l, "Error") == 'true' || string_contains(l, "error:") == 'true' || string_contains(l, "panic") == 'true' || string_contains(l, "assert") == 'true']
+    Std.unique([string_trim(elem(sh("printf %s " ++ sq(l) ++ " | sed -E 's#/tmp/[^ ]*#/tmp/X#g; s/0x[0-9a-fA-F]+/0x#/g; s/[0-9]+/#/g'"), 1)) for l in Std.take(ls, 40)])
+}
+
+# The verify's tail on base itself: a throwaway worktree at base, cached by
+# base tree + command (main doesn't change per issue). "" when base passes.
+fun base_verify_tail(ws, repo, base, verify_cmd) {
+    tree = tree_of(repo, base)
+    key = if (string_length(tree) > 0) { "verify-base|" ++ tree ++ "|" ++ verify_cmd } else { "" }
+    dir = ws ++ "-base"
+    logp = ws ++ "/verify-base.log"
+    p = if (gate_cache_on() && string_length(key) > 0) { gate_cache_path(key) } else { "" }
+    code = if (string_length(p) > 0 && file_exists(p ++ ".code") == 'true') {
+        _c = sh("cp " ++ sq(p ++ ".log") ++ " " ++ sq(logp))
+        to_int(string_trim(file_read(p ++ ".code")))
+    } else {
+        _w = sh(f"rm -rf {sq(dir)}; git -C {sq(repo)} worktree prune; git -C {sq(repo)} worktree add -q --detach {sq(dir)} {base}")
+        c = elem(shell_managed(timeout_cmd(verify_timeout_s(), verify_cmd, dir, logp), verify_timeout_ms()), 0)
+        _r = sh(f"git -C {sq(repo)} worktree remove --force {sq(dir)}")
+        _s = if (string_length(p) > 0) { _l = sh("cp " ++ sq(logp) ++ " " ++ sq(p ++ ".log")); file_write(p ++ ".code", to_string(c) ++ "\n") } else { "" }
+        c
+    }
+    if (code == 0) { "" } else { tail_log(logp) }
 }
 
 # The base branch a worktree is diffed/rebased against: the repo's current
@@ -1999,9 +2072,24 @@ fun handle_verify_done(db, running, retry, run_id, issue_id, verdict, tail) {
             } else {
                 enqueue_merge(db, running, retry, info, run_id, issue_id, now)
             }
+        } else { if (verdict == "red_env" && Store.count_target_verb(db, issue_id, "verify.env") < 3) {
+            # the box failed, not the change: after a pause, verify again on
+            # the same attempt; the builder doesn't run (resume_at_verify)
+            _a = Store.log_activity(db, company_id, "orchestrator", "verify.env", issue_id)
+            _v = Store.run_set_verify(db, run_id, "red_env", tail)
+            _st = Store.run_set_state(db, run_id, "EnvFailed")
+            %{running: map_remove(running, issue_id), retry: map_put(retry, issue_id, %{attempt: map_get(info, "attempt"), due_at: now + env_int("O_ENV_RETRY_S", 120) * 1000, env: 'true'})}
+        } else { if (verdict == "red_inherited") {
+            _a = Store.log_activity(db, company_id, "orchestrator", "verify.inherited", issue_id)
+            _v = Store.run_set_verify(db, run_id, "inherited", tail)
+            if (review_enabled() == 'true') {
+                start_review(db, running, retry, info, run_id, issue_id, now)
+            } else {
+                enqueue_merge(db, running, retry, info, run_id, issue_id, now)
+            }
         } else {
-            verify_red(db, running, retry, info, run_id, issue_id, verdict, tail, now)
-        }
+            verify_red(db, running, retry, info, run_id, issue_id, (if (verdict == "red_env") { "red_tests" } else { verdict }), tail, now)
+        }}}
     }
 }
 
@@ -2636,7 +2724,7 @@ fun do_gate(job) {
             # An empty PR: nothing to review, so no model is paid for it.
             gate_result(job, "REJECT: the PR makes no change against " ++ base ++ " (its commits net out to nothing).", "", "", "", map_get(job, "session"), 0)
         } else {
-        broken = hard_rules(cfg, rv, files, lines)
+        broken = hard_rules(cfg, rv, files, lines, str_or(map_get(job, "title"), "") ++ "\n" ++ str_or(map_get(job, "body"), ""))
         if (string_length(broken) > 0) {
             # A hard rule: no model may wave this through, so none is asked.
             gate_result(job, "REJECT: " ++ broken, "", "", "", map_get(job, "session"), 0)
@@ -2667,8 +2755,14 @@ fun do_gate(job) {
 #     (assert*/expect*) and no added skip markers
 #   - no changes to CI or the gate's own config (.github/, .o-review.json,
 #     plus .o-review.json "locked_paths")
-#   - at most "max_change_lines" (default 1500) lines added + deleted
-fun hard_rules(cfg, rv, files, lines) {
+#   - at most "max_change_lines" (default 1500) lines added + deleted, and
+#     at most "max_change_files" files when the repo sets it
+#   - no unfinished code outside tests (TODO, FIXME, unimplemented!,
+#     NotImplementedError)
+#   - no secrets in added lines (cloud keys, private keys, tokens)
+#   - no submodule changes
+#   - an issue that asks for a test gets one
+fun hard_rules(cfg, rv, files, lines, issue) {
     test_dirs = ["tests/", "test/"] ++ flatten([list_or_empty(map_get(r, "paths")) for r in cfg_list(cfg, "test_runners")])
     gone = lines_of(elem(sh(f"git -C {sq(rv)} diff --no-renames --name-only --diff-filter=D o-base HEAD"), 1))
     gone_tests = [f for f in gone when starts_any_of(f, test_dirs) == 'true']
@@ -2679,6 +2773,16 @@ fun hard_rules(cfg, rv, files, lines) {
     locked = [f for f in files when starts_any_of(f, [".github/", ".o-review.json"] ++ cfg_list(cfg, "locked_paths")) == 'true']
     lim = map_get(cfg, "max_change_lines")
     max_lines = if (lim == nil) { 1500 } else { lim }
+    flim = map_get(cfg, "max_change_files")
+    max_files = if (flim == nil) { 0 } else { flim }
+    excl = Std.join([sq(":(exclude)" ++ d) for d in Std.unique(test_dirs)], " ")
+    added = f"git -C {sq(rv)} diff --no-renames -U0 o-base HEAD -- . {excl} | grep -E '^[+][^+]'"
+    stubs = lines_of(elem(sh(added ++ " | grep -E 'TODO|FIXME|unimplemented!|NotImplementedError' | head -3"), 1))
+    all_added = f"git -C {sq(rv)} diff --no-renames -U0 o-base HEAD | grep -E '^[+][^+]'"
+    secrets = lines_of(elem(sh(all_added ++ " | grep -E 'AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|gh[pousr]_[A-Za-z0-9]{36}|xox[baprs]-[A-Za-z0-9-]{10,}|sk-[A-Za-z0-9]{32,}' | head -3"), 1))
+    submods = lines_of(elem(sh(f"git -C {sq(rv)} diff --raw o-base HEAD | grep -E '^:(160000|[0-7]+ 160000)' | head -3"), 1))
+    wants_test = string_contains(string_lower(issue), "add a test") == 'true' || string_contains(string_lower(issue), "add tests") == 'true' || string_contains(string_lower(issue), "regression test") == 'true'
+    tests_touched = Std.any(files, fn(f) { starts_any_of(f, test_dirs) == 'true' })
     if (length(gone_tests) > 0) {
         "hard rule: the PR deletes test files (" ++ Std.join(gone_tests, ", ") ++ "). Tests are never deleted to get a change through; fix the code, or change the test in place and say why."
     } else { if (lost > 0 || skips > 0) {
@@ -2687,7 +2791,17 @@ fun hard_rules(cfg, rv, files, lines) {
         "hard rule: the PR changes CI or the gate's own config (" ++ Std.join(locked, ", ") ++ "), which decide whether changes are safe; those stay out of O's reach."
     } else { if (lines > max_lines) {
         "hard rule: the PR changes " ++ to_string(lines) ++ " lines, over the limit of " ++ to_string(max_lines) ++ " (max_change_lines). Split it into smaller PRs that each stand on their own."
-    } else { "" }}}}
+    } else { if (max_files > 0 && length(files) > max_files) {
+        "hard rule: the PR changes " ++ to_string(length(files)) ++ " files, over the limit of " ++ to_string(max_files) ++ " (max_change_files). Split it into smaller PRs that each stand on their own."
+    } else { if (length(secrets) > 0) {
+        "hard rule: the PR adds what looks like a secret (" ++ to_string(length(secrets)) ++ " line(s), e.g. a cloud key, private key or token). Secrets never go in the repository."
+    } else { if (length(submods) > 0) {
+        "hard rule: the PR changes a submodule pointer. Submodule bumps aren't O's to make."
+    } else { if (length(stubs) > 0) {
+        "hard rule: the PR adds unfinished code outside tests: " ++ string_truncate(Std.join([string_trim(string_sub(l, 1, string_length(l) - 1)) for l in stubs], " | "), 400) ++ ". Finish it, or leave it out of this change."
+    } else { if (wants_test && tests_touched == 'false') {
+        "hard rule: the issue asks for a test, and the PR adds or changes none. Add the test it asks for."
+    } else { "" }}}}}}}}}
 }
 
 # A disposable, remote-less clone of the PR head merged with current base, so
