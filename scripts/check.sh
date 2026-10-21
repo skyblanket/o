@@ -1718,7 +1718,8 @@ for _i in $(seq 1 120); do [ "$(pmq postmerge.reverted)" = "1" ] && break; sleep
 git -C "$GHS/remote.git" show main:ext/broken >/dev/null 2>&1 && fail "post-merge: ext/broken still on main after the revert"
 git -C "$GHS/remote.git" show main:docs/later.md >/dev/null 2>&1 || fail "post-merge: the harmless later merge was reverted too"
 [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='merge.revert' AND target='iss_pmtest'")" = "1" ] || fail "post-merge: the culprit's issue not marked merge.revert"
-[ "$(sqlite3 "$TMP4/o.db" "SELECT status FROM issue WHERE id='iss_pmtest'")" = "Backlog" ] || fail "post-merge: the culprit's issue not sent back to Backlog"
+# sent back: Backlog, or already picked up again (the daemon isn't drained)
+case "$(sqlite3 "$TMP4/o.db" "SELECT status FROM issue WHERE id='iss_pmtest'")" in Backlog|"In Progress"|Verifying) ;; *) fail "post-merge: the culprit's issue not sent back to Backlog" ;; esac
 sqlite3 "$TMP4/o.db" "SELECT body FROM issue WHERE id='iss_pmtest'" | grep -q "broke main" || fail "post-merge: the failure was not added to the issue"
 pass "post-merge: a merge that breaks main is bisected (not the later one), reverted via a merged PR, its issue sent back; a step red on base doesn't count"
 
