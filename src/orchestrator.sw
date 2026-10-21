@@ -2014,16 +2014,16 @@ fun enqueue_local_merge(db, running, retry, info, company, run_id, issue_id, now
 # attempt, then fail the issue (retries exhausted) or schedule a structured
 # retry whose prompt carries the verdict + tail.
 # One PR per issue: when O gives up on an issue in PR mode, its PR is closed
-# right away (with the reason), so a superseded attempt can never be merged
-# next to the follow-up that redoes it.
-fun close_pr_worker(gh_repo, issue_id, reason) {
+# right away (with what was tried), so a stale attempt can never be merged.
+# Another round on the issue reopens this same PR (ci_worker).
+fun close_pr_worker(gh_repo, issue_id, tried, reason) {
     owner = hd(string_split(gh_repo, "/"))
     prs = gh_json(sq(f"repos/{gh_repo}/pulls?head={owner}:o/{issue_id}&state=open"))
     num = if (prs == nil) { nil } else { if (length(prs) == 0) { nil } else { map_get(hd(prs), "number") } }
     if (num == nil) { "" } else {
         home = getenv("HOME")
         f = f"{home}/.o/close-{issue_id}.md"
-        _w = file_write(f, "O exhausted its attempts on this change and is closing it so it can't be merged by mistake. A follow-up issue will redo it against current main.\n\nLast verdict:\n" ++ reason)
+        _w = file_write(f, "O stopped on this change and is closing it so it can't be merged by mistake. Another round on the issue reopens this PR.\n\nWhat was tried:\n" ++ tried ++ "\n\nLast verdict:\n" ++ reason)
         _c = gh_api(f"-X POST repos/{gh_repo}/issues/{num}/comments -F body=@{sq(f)}")
         gh_api(f"-X PATCH repos/{gh_repo}/pulls/{num} -f state=closed")
     }
@@ -2041,7 +2041,13 @@ fun verify_red(db, running, retry, info, run_id, issue_id, verdict, tail, now) {
         _a2 = Store.log_activity(db, company_id, "orchestrator", "run.failed_final", issue_id)
         _sf = file_verify_final(db, company_id, issue_id, verdict, tail)
         co = Store.company_row(db, company_id)
-        _cp = if (is_pr_mode(co) == 'true') { spawn(close_pr_worker(str_or(map_get(co, "github_repo"), ""), issue_id, verdict ++ "\n" ++ tail)) } else { "" }
+        tried = tried_summary(db, issue_id)
+        gh = str_or(map_get(co, "github_repo"), "")
+        _cp = if (is_pr_mode(co) == 'true') { spawn(close_pr_worker(gh, issue_id, tried, verdict ++ "\n" ++ tail)) } else { "" }
+        fp = str_or(map_get(Store.issue_row(db, issue_id), "fingerprint"), "")
+        _g = if (string_length(gh) > 0 && string_starts_with(fp, "gh:") == 'true') {
+            spawn(stopped_comment_worker(gh, string_sub(fp, 3, string_length(fp) - 3), issue_id, tried))
+        } else { "" }
         %{running: map_remove(running, issue_id), retry: map_remove(retry, issue_id)}
     } else {
         retry2 = schedule_retry(retry, issue_id, attempt, now)
@@ -2248,6 +2254,7 @@ fun start_ci(db, running, retry, info, company, run_id, issue_id, now) {
 }
 
 fun ci_worker(orch, run_id, issue_id, ws, branch, base, gh_repo, title, required) {
+    _r = reopen_closed_pr(gh_repo, branch)
     # --force: the branch is O's own, and GitHub may have added an
     # update-branch merge commit to it that the agent's retry doesn't have.
     push = sh(f"git -C {ws} push -q --force origin HEAD:refs/heads/{branch}")
@@ -2268,6 +2275,20 @@ fun ci_worker(orch, run_id, issue_id, ws, branch, base, gh_repo, title, required
         } else {
             ci_poll(orch, run_id, issue_id, gh_repo, branch, num, base, required, timestamp(), timestamp() + ci_timeout_s() * 1000)
         }
+    }
+}
+
+# One PR per issue across rounds: a PR O closed when it stopped comes back
+# instead of a new one. Must run before the push: GitHub won't reopen a PR
+# whose branch moved while it was closed. Best effort; a failed reopen just
+# means ci_worker opens a fresh PR.
+fun reopen_closed_pr(gh_repo, branch) {
+    owner = hd(string_split(gh_repo, "/"))
+    prs = gh_json(sq(f"repos/{gh_repo}/pulls?head={owner}:{branch}&state=closed"))
+    shut = if (prs == nil) { [] } else { [p for p in prs when map_get(p, "merged_at") == nil] }
+    if (length(shut) == 0) { "" } else {
+        num = map_get(hd(shut), "number")
+        gh_api(f"-X PATCH repos/{gh_repo}/pulls/{num} -f state=open")
     }
 }
 
@@ -3852,6 +3873,25 @@ fun str_or_map(m) { if (m == nil) { %{} } else { m } }
 fun needs_human_comment_worker(gh_repo, num, issue_id, ask) {
     path = getenv("HOME") ++ "/.o/needs-human-" ++ issue_id ++ ".md"
     _x = file_write(path, "**O needs a human here.** The fix touches a protected path, which only a maintainer may change. The builder asks:\n\n" ++ string_truncate(ask, 6000) ++ "\n\nMake that change (or say how), then move the issue back to Backlog in O.")
+    gh_api(f"-X POST repos/{gh_repo}/issues/{num}/comments -F body=@{sq(path)}")
+}
+
+# One line per graded attempt: "attempt 2: red_verify: <first line of why>".
+fun tried_summary(db, issue_id) {
+    rows = Store.run_history(db, issue_id)
+    rounds = 1 + Store.retry_count(db, issue_id)
+    lines = ["- attempt " ++ to_string(map_get(r, "attempt")) ++ ": " ++ str_or(map_get(r, "verify_state"), "") ++ ": " ++ first_line(str_or(map_get(r, "verify_output"), "")) for r in rows]
+    to_string(length(rows)) ++ " attempts over " ++ to_string(rounds) ++ " round(s):\n" ++ Std.join(lines, "\n")
+}
+
+fun first_line(text) {
+    ls = [string_trim(l) for l in string_split(text, "\n") when string_length(string_trim(l)) > 0]
+    if (length(ls) == 0) { "(no output)" } else { string_truncate(hd(ls), 200) }
+}
+
+fun stopped_comment_worker(gh_repo, num, issue_id, tried) {
+    path = getenv("HOME") ++ "/.o/stopped-" ++ issue_id ++ ".md"
+    _x = file_write(path, "**O stopped on this issue** after its attempts ran out; nothing was merged. What it tried:\n\n" ++ string_truncate(tried, 6000) ++ "\n\nAnother round (`POST /api/issues/" ++ issue_id ++ "/retry`) starts from this history and reuses the same PR.")
     gh_api(f"-X POST repos/{gh_repo}/issues/{num}/comments -F body=@{sq(path)}")
 }
 

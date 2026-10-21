@@ -579,6 +579,14 @@ grep -q "^ESCALATE: the operator asked for another round on sonnet" "$TMP/.o/esc
 wait_status "$IID_BAD" "Failed" 120 || fail "retry: the retried issue never ran its new round"
 [ "$(sqlite3 "$TMP/o.db" "SELECT MAX(attempt) FROM run WHERE issue_id='$IID_BAD' AND started_at > (SELECT ts FROM activity WHERE verb='issue.retry' AND target='$IID_BAD')")" -ge 1 ] || fail "retry: no new attempts after the retry"
 pass "retry: POST /api/issues/:id/retry requeues a Failed issue with its last failure and a stronger model; a Done one is refused"
+# Round 3 is the last by default: plant an earlier retry, then a fourth round needs force.
+sqlite3 "$TMP/o.db" "INSERT INTO activity (id, company_id, actor, verb, target, payload, ts) SELECT 'act_round_test', company_id, 'operator', 'issue.retry', id, '', 1 FROM issue WHERE id='$IID_BAD'"
+rr="$(ocurl -s -w ' %{http_code}' -X POST "$BASE/api/issues/$IID_BAD/retry" -H 'Content-Type: application/json' -d '{}')"
+case "$rr" in *"had 3 rounds"*409) ;; *) fail "rounds: a fourth round should be refused without force (got $rr)" ;; esac
+sc="$(ocurl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/issues/$IID_BAD/retry" -H 'Content-Type: application/json' -d '{"force":true}')"
+[ "$sc" = "200" ] || fail "rounds: force should allow another round (got $sc)"
+wait_status "$IID_BAD" "Failed" 120 || fail "rounds: the forced round never finished"
+pass "rounds: after O_MAX_ROUNDS (3) a retry needs {\"force\": true}"
 
 # Proof: the all-time track record, from the activity log.
 pr="$(ocurl -s "$BASE/api/proof")"
@@ -1176,6 +1184,8 @@ case "$method $path" in
   "GET repos/acme/widgets/pulls?head="*)
     b="${path#*head=acme:}"; b="${b%%&*}"; n="$(num_for "$b")"
     ma=""; [ -n "$n" ] && [ -f "$GHS/merged_$n" ] && ma=',"merged_at":"2026-01-01T00:00:00Z"'
+    shut=""; [ -n "$n" ] && { [ -f "$GHS/closed_$n" ] || [ -f "$GHS/merged_$n" ]; } && shut=1
+    case "$path" in *state=open*) [ -n "$shut" ] && n="" ;; *state=closed*) [ -z "$shut" ] && n="" ;; esac
     if [ -n "$n" ]; then echo "[{\"number\":$n$ma}]"; else echo "[]"; fi ;;
   "POST repos/acme/widgets/pulls")
     n=$(( $(ls "$GHS" | grep -c '^pr_') + 1 )); echo "$head" > "$GHS/pr_$n"
@@ -1189,7 +1199,9 @@ case "$method $path" in
       && git push -q origin main && touch "$GHS/merged_$n" \
       && echo "{\"merged\":true,\"sha\":\"$(git rev-parse HEAD)\"}" ;;
   "PATCH repos/acme/widgets/pulls/"*)
-    n="${path#repos/acme/widgets/pulls/}"; [ "$newstate" = closed ] && touch "$GHS/closed_$n"; echo "{\"number\":$n}" ;;
+    n="${path#repos/acme/widgets/pulls/}"; [ "$newstate" = closed ] && touch "$GHS/closed_$n"
+    [ "$newstate" = open ] && [ -f "$GHS/closed_$n" ] && { rm -f "$GHS/closed_$n"; touch "$GHS/reopened_$n"; }
+    echo "{\"number\":$n}" ;;
   "GET repos/acme/widgets/compare/"*)
     spec="${path#repos/acme/widgets/compare/}"; cbase="${spec%%...*}"; csha="${spec#*...}"
     nb="$(git -C "$GHS/remote.git" rev-list --count "$csha..$cbase" 2>/dev/null || echo 0)"; echo "{\"behind_by\":$nb}" ;;
@@ -1346,6 +1358,18 @@ sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_CIF' OR
   || fail "github: a real CI failure should be re-run once before red_ci"
 git -C "$GHS/remote.git" log --oneline main | grep "o/$IID_CIF" >/dev/null && fail "github: red-CI PR was merged"
 pass "github: failing checks -> red_ci x3 -> Failed (check names in the retry tail), never merged"
+NCIF="$(grep -lx "o/$IID_CIF" "$GHS"/pr_* | head -1 | sed 's|.*/pr_||')"
+for _i in $(seq 1 20); do [ -f "$GHS/closed_$NCIF" ] && grep -q "What was tried" "$GHS/comments_$NCIF" 2>/dev/null && break; sleep 0.5; done
+[ -f "$GHS/closed_$NCIF" ] || fail "one PR per issue: O did not close the PR when it stopped"
+grep -q "3 attempts over 1 round(s)" "$GHS/comments_$NCIF" && grep -q "attempt 3: red_ci" "$GHS/comments_$NCIF" \
+  || { cat "$GHS/comments_$NCIF"; fail "one PR per issue: the close note lacks the attempt history"; }
+ocurl -s -X POST "$BASE4/api/issues/$IID_CIF/retry" -H 'Content-Type: application/json' -d '{}' >/dev/null
+for _i in $(seq 1 90); do [ -f "$GHS/reopened_$NCIF" ] && break; sleep 1; done
+[ -f "$GHS/reopened_$NCIF" ] || { tail -30 "$TMP4/daemon.log"; fail "one PR per issue: the next round did not reopen the closed PR"; }
+wait_status_at "$BASE4" "$IID_CIF" "Failed" 150 || fail "one PR per issue: the second round never finished"
+[ "$(grep -lx "o/$IID_CIF" "$GHS"/pr_* | wc -l)" = "1" ] || fail "one PR per issue: a second round opened a new PR"
+grep -q "6 attempts over 2 round(s)" "$GHS/comments_$NCIF" || fail "one PR per issue: the second close note lacks both rounds"
+pass "one PR per issue: stopping closes the PR with what was tried; another round reopens the same PR"
 wait_status_at "$BASE4" "$IID_BLK" "In Review" 90 || { tail -40 "$TMP4/daemon.log"; fail "github: merge-refused issue never parked In Review"; }
 sleep 6
 [ "$(sqlite3 "$TMP4/o.db" "SELECT status FROM issue WHERE id='$IID_BLK'")" = "In Review" ] || fail "github: In Review issue was re-dispatched"
