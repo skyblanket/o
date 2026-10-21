@@ -73,6 +73,12 @@ fun issues_in_review(db) {
     db_query(db, "SELECT i.id, i.company_id, c.github_repo, c.repo FROM issue i JOIN company c ON c.id = i.company_id WHERE i.status = 'In Review' AND c.status = 'active' AND c.ship = 'pr' AND c.github_repo != ''", [])
 }
 
+# Issues waiting on a person (o#65), oldest first: parked In Review or
+# stopped (Failed), on an active company.
+fun issues_waiting(db) {
+    db_query(db, "SELECT i.id, i.identifier, i.title, i.status, i.fingerprint, i.updated_at, i.company_id, c.github_repo FROM issue i JOIN company c ON c.id = i.company_id WHERE i.status IN ('In Review', 'Failed') AND c.status = 'active' ORDER BY i.updated_at ASC", [])
+}
+
 # Issues on a PR-mode company that ran at least once but are not parked In
 # Review: a human may have merged their PR anyway (the self-check looks).
 fun issues_maybe_merged(db) {

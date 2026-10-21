@@ -209,29 +209,13 @@ fun route_retry(db, conn, method, p, body) {
     }
     else {
         model = if (data == nil) { "" } else { default_str(map_get(data, "model"), "") }
-        want = if (string_length(model) > 0) { Orchestrator.ladder_rung(model) } else { 1 }
-        _e = escalate_to(id, want - 1 - Orchestrator.escalations(id), model)
-        last = Store.last_run_for_issue(db, id)
-        vs = if (last == nil) { "" } else { default_str(map_get(last, "verify_state"), "") }
-        vo = if (last == nil) { "" } else { default_str(map_get(last, "verify_output"), "") }
-        note = if (string_length(vs) == 0 && string_length(vo) == 0) { "" } else {
-            "\n\n---\nAn earlier round of this issue failed (" ++ (if (string_length(vs) > 0) { vs } else { "run died" }) ++ "):\n\n" ++ string_truncate(vo, 3000) ++ "\n\nStart from that: don't repeat what failed."
-        }
-        _b = if (string_length(note) > 0) { Store.issue_append_body(db, id, note) } else { "" }
-        _u = Store.issue_update(db, id, "Backlog", map_get(cur, "priority"), map_get(cur, "assignee_agent_id"))
-        _l = Store.log_activity(db, map_get(cur, "company_id"), "operator", "issue.retry", id)
+        _q = Orchestrator.requeue_round(db, id, model, "", "operator")
         respond(conn, 200, json_encode(Store.issue_row(db, id)))
     }}}}
 }
 
 fun max_rounds() { Orchestrator.env_int("O_MAX_ROUNDS", 3) }
 
-fun escalate_to(id, n, model) {
-    if (n <= 0) { "" } else {
-        _r = Orchestrator.record_escalation(id, "ESCALATE: the operator asked for another round on " ++ model ++ "; read the earlier failure in the task before changing anything.")
-        escalate_to(id, n - 1, model)
-    }
-}
 
 fun route(db, dbpath, conn, method, path, body) {
     case path {
@@ -240,6 +224,7 @@ fun route(db, dbpath, conn, method, path, body) {
         "/api/runs" -> respond(conn, 200, json_encode(Store.runs_all(db)))
         "/api/activity" -> respond(conn, 200, json_encode(Store.activity_recent(db)))
         "/api/proof" -> respond(conn, 200, json_encode(Store.proof(db)))
+        "/api/waiting" -> respond(conn, 200, json_encode(Orchestrator.waiting_list(db)))
         "/api/orchestrator" -> orch_snapshot(conn)
         "/api/orchestrator/drain" -> route_drain(dbpath, conn, method, body)
         "/api/fs" -> route_fs(conn, method, body)
