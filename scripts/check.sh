@@ -1173,6 +1173,15 @@ case "$in" in
       [ "$n" -gt "$(cat "$GHS/gate_peak" 2>/dev/null || echo 0)" ] && echo "$n" > "$GHS/gate_peak" ) 9>"$GHS/gate.lock"
     sleep 2
     ( flock 9; echo $(( $(cat "$GHS/gate_inflight") - 1 )) > "$GHS/gate_inflight" ) 9>"$GHS/gate.lock"
+    # acceptance criteria (o#61): answer them, with real or fake evidence
+    case "$in" in *"== Acceptance criteria"*) echo seen >> "$GHS/crit_seen" ;; esac
+    f="$(printf '%s' "$in" | grep -o 'sim_[A-Za-z0-9_]*\.txt' | head -1)"
+    case "$in" in
+      *"[crit:good]"*) c="CRITERION 1: PASS - $f:1 holds it\\nCRITERION 2: PASS - cmd: make test" ;;
+      *"[crit:fake]"*) c="CRITERION 1: PASS - $f:99 holds it\\nCRITERION 2: PASS - cmd: make test" ;;
+      *"[crit:unsure]"*) c="CRITERION 1: PASS - $f:1\\nCRITERION 2: UNCERTAIN - could not run the suite" ;;
+      *) c="" ;;
+    esac
     case "$in" in
       *"[gate:changes]"*) v="VERDICT: REJECT: add a regression test for the new path" ;;
       *"[gate:escalate]"*) v="VERDICT: UNVERIFIED: could not run the fuzzer here" ;;
@@ -1186,7 +1195,7 @@ case "$in" in
     # An interim result first, as the CLI emits when commands are still running
     # in the background: O must read the LAST result event, not this one.
     printf '{"type":"result","result":"The suite is still running in the background.","total_cost_usd":0.01,"session_id":"%s"}\n' "$sid"
-    printf '{"type":"result","result":"Reviewed in context.\\nNOTE: lesson from an earlier review: run the stub suite\\n%s","total_cost_usd":0.02,"session_id":"%s"}\n' "$v" "$sid"
+    printf '{"type":"result","result":"Reviewed in context.\\nNOTE: lesson from an earlier review: run the stub suite\\n%s\\n%s","total_cost_usd":0.02,"session_id":"%s"}\n' "$c" "$v" "$sid"
     exit 0 ;;
 esac
 case "$in" in
@@ -1871,6 +1880,22 @@ wait_status_at "$BASE4" "$IID_EV" "Done" 240 || { grep -v '^\[orch\] tick' "$TMP
 [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='run.dispatch' AND target='$IID_EV'")" = "1" ] || fail "env: the builder ran again for an environment failure"
 [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='verify.fail' AND target='$IID_EV'")" = "0" ] || fail "env: an environment failure was counted against the change"
 pass "env: a verify that fails on the box (no space) re-runs at verify on the same attempt; no builder run, no attempt spent"
+# acceptance criteria (o#61): an issue's checklist or "Done when" bullets go
+# to the gate, which must answer each with evidence; O checks the file:line
+# and commands itself, and an APPROVE that doesn't prove every one is a REJECT.
+crit_issue() { jget "$(ocurl -s -X POST "$BASE4/api/companies/$CIDG/issues" -H 'Content-Type: application/json' -d "{\"title\":\"$1\",\"body\":\"$2\"}")" 'd["id"]'; }
+IID_CG="$(crit_issue '[sim:good] [crit:good] proven criteria' 'Add it.\n\n- [ ] the file exists\n- [ ] the suite passes')"
+IID_CF="$(crit_issue '[sim:good] [crit:fake] fake evidence' 'Add it.\n\n- [ ] the file exists\n- [ ] the suite passes')"
+IID_CU="$(crit_issue '[sim:good] [crit:unsure] unsure criterion' 'Add it.\n\nDone when:\n- the file exists\n- the suite passes')"
+wait_status_at "$BASE4" "$IID_CG" "Done" 180 || { grep -v '^\[orch\] tick' "$TMP4/daemon.log" | tail -20; sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_CG' ORDER BY started_at DESC LIMIT 1"; fail "criteria: an APPROVE that proved every criterion did not merge"; }
+[ -s "$GHS/crit_seen" ] || fail "criteria: the issue's acceptance criteria never reached the gate"
+pass "criteria: an issue's checklist goes to the gate; every criterion PASS with a real file:line or a command it ran -> merged"
+wait_status_at "$BASE4" "$IID_CF" "Failed" 300 || fail "criteria: an APPROVE citing a line that doesn't exist was not rejected"
+sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_CF' ORDER BY started_at DESC LIMIT 1" | grep "without evidence O could check" >/dev/null || fail "criteria: fake evidence was not the reason"
+wait_status_at "$BASE4" "$IID_CU" "Failed" 300 || fail "criteria: an APPROVE with an UNCERTAIN criterion was not rejected"
+sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_CU' ORDER BY started_at DESC LIMIT 1" | grep "criterion 2: UNCERTAIN" >/dev/null || fail "criteria: the uncertain 'Done when' criterion was not the reason"
+for i in "$IID_CF" "$IID_CU"; do git -C "$GHS/remote.git" log --oneline main | grep "o/$i" >/dev/null && fail "criteria: $i merged without proving its criteria"; done
+pass "criteria: an APPROVE citing a file:line that doesn't exist, or leaving a 'Done when' criterion UNCERTAIN, is a REJECT and never merges"
 # inherited: base fails the same way, so the change isn't blamed
 git -C "$SEEDGH" fetch -q origin && git -C "$SEEDGH" checkout -q -B main origin/main
 echo broken > "$SEEDGH/BASE_BROKEN"; git -C "$SEEDGH" add BASE_BROKEN && git -C "$SEEDGH" commit -qm "break base" && git -C "$SEEDGH" push -q origin main

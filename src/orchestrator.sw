@@ -3227,7 +3227,10 @@ fun gate_model_review(job, cfg, rv, files, lines, numstat, tier, evidence) {
     cost = run_cost(elem(_r, 0), if (usd == nil) { 0 } else { usd * 100 })
     new_session = str_or(map_get(res, "session_id"), "")
     cmds = bash_commands(f"{dir}/gate.jsonl")
-    v = parse_verdict(string_split(text, "\n"), "")
+    v0 = parse_verdict(string_split(text, "\n"), "")
+    crits = acceptance_criteria(str_or(map_get(job, "body"), ""))
+    unproven = if (v0 == "APPROVE" && length(crits) > 0) { criteria_problems(text, crits, rv, cmds) } else { [] }
+    v = if (length(unproven) > 0) { "REJECT: acceptance criteria not proven: " ++ Std.join(unproven, "; ") } else { v0 }
     forced = escalate_reason(files, lines)
     verdict = if (string_length(v) == 0) { "UNVERIFIED: the maintainer gave no VERDICT line (fail-closed)" }
         else { if (v == "APPROVE" && length(cmds) == 0) { "UNVERIFIED: approved without running a single command; an APPROVE must be executed, not read" }
@@ -3236,6 +3239,94 @@ fun gate_model_review(job, cfg, rv, files, lines, numstat, tier, evidence) {
         else { v } } } }
     cmd_md = if (length(cmds) == 0) { "_(the maintainer ran no commands)_\n" } else { Std.join(["- `" ++ c ++ "`" for c in cmds], "\n") ++ "\n" }
     gate_result(job, verdict, text, evidence, cmd_md, new_session, cost)
+}
+
+# ---- acceptance criteria (o#61) ---------------------------------
+# An issue's checklist ("- [ ] ...") or, without one, the bullets under a
+# "Done when" / "Acceptance" line are its acceptance criteria. The gate
+# answers each with `CRITERION <n>: PASS|FAIL|UNCERTAIN - <evidence>`, and O
+# checks the answers itself: an APPROVE stands only when every criterion is
+# PASS with a file:line that exists in the checkout, or a command the gate
+# actually ran. Anything else turns the APPROVE into a REJECT.
+fun acceptance_criteria(body) {
+    ls = [string_trim(l) for l in string_split(body, "\n")]
+    boxes = [string_trim(string_sub(l, 5, string_length(l) - 5)) for l in ls when is_checkbox(l) == 'true']
+    found = if (length(boxes) > 0) { boxes } else { done_when(ls, 'false', []) }
+    Std.take([c for c in found when string_length(c) > 0], 12)
+}
+
+fun is_checkbox(l) {
+    low = string_lower(l)
+    if (string_starts_with(low, "- [ ]") == 'true' || string_starts_with(low, "- [x]") == 'true' || string_starts_with(low, "* [ ]") == 'true' || string_starts_with(low, "* [x]") == 'true') { 'true' } else { 'false' }
+}
+
+fun done_when(ls, inside, acc) {
+    if (length(ls) == 0) { acc } else {
+        l = hd(ls)
+        low = string_lower(string_replace(string_replace(l, "#", ""), "*", ""))
+        bullet = string_starts_with(l, "- ") == 'true' || string_starts_with(l, "* ") == 'true'
+        if (inside == 'true' && bullet) { done_when(tl(ls), 'true', acc ++ [string_trim(string_sub(l, 2, string_length(l) - 2))]) }
+        else { if (inside == 'true' && string_length(l) > 0 && length(acc) > 0) { acc }
+        else { if (string_starts_with(string_trim(low), "done when") == 'true' || string_starts_with(string_trim(low), "acceptance") == 'true') { done_when(tl(ls), 'true', acc) }
+        else { done_when(tl(ls), inside, acc) } } }
+    }
+}
+
+fun criteria_prompt(crits) {
+    if (length(crits) == 0) { "" } else {
+        "\n\n== Acceptance criteria (from the issue) ==\n" ++ Std.join(numbered(crits, 1), "\n") ++ "\nBefore the verdict, answer every criterion on its own line:\n`CRITERION <n>: PASS - <file>:<line> showing it` (a path relative to the checkout, or `cmd: <a command you ran>` whose output shows it), or `CRITERION <n>: FAIL - <why>`, or `CRITERION <n>: UNCERTAIN - <what you could not check>`. O checks every file:line and command itself; an APPROVE with any criterion not PASS, unanswered, or citing a file or line that doesn't exist is turned into a REJECT."
+    }
+}
+
+# Problems with the gate's criterion answers ([] when every one is proven).
+fun criteria_problems(text, crits, rv, cmds) {
+    ls = [string_trim(string_replace(string_replace(l, "`", ""), "*", "")) for l in string_split(text, "\n")]
+    each_criterion(ls, 1, length(crits), rv, cmds)
+}
+
+fun each_criterion(ls, n, k, rv, cmds) {
+    if (n > k) { [] } else { criterion_problem(ls, n, rv, cmds) ++ each_criterion(ls, n + 1, k, rv, cmds) }
+}
+
+fun numbered(xs, n) {
+    if (length(xs) == 0) { [] } else { [to_string(n) ++ ". " ++ hd(xs)] ++ numbered(tl(xs), n + 1) }
+}
+
+fun criterion_problem(ls, n, rv, cmds) {
+    tag = "CRITERION " ++ to_string(n) ++ ":"
+    mine = [string_trim(string_sub(l, string_length(tag), string_length(l) - string_length(tag))) for l in ls when string_starts_with(l, tag) == 'true']
+    if (length(mine) == 0) { ["criterion " ++ to_string(n) ++ " was not answered"] } else {
+        a = Std.last(mine)
+        if (string_starts_with(a, "PASS") == 'false') { ["criterion " ++ to_string(n) ++ ": " ++ string_truncate(a, 200)] }
+        else { if (evidence_ok(a, rv, cmds) == 'true') { [] }
+        else { ["criterion " ++ to_string(n) ++ " claims PASS without evidence O could check (no existing file:line in the checkout, no command the gate ran): " ++ string_truncate(a, 200)] } }
+    }
+}
+
+fun evidence_ok(a, rv, cmds) {
+    ci = string_index_of(a, "cmd:")
+    by_cmd = if (ci < 0) { 'false' } else {
+        c = string_trim(string_sub(a, ci + 4, string_length(a) - ci - 4))
+        if (string_length(c) > 0 && Std.any(cmds, fn(x) { string_contains(x, c) == 'true' || string_contains(c, x) == 'true' })) { 'true' } else { 'false' }
+    }
+    if (by_cmd == 'true') { 'true' } else {
+        words = [string_trim(string_replace(string_replace(string_replace(string_replace(string_replace(w, "(", ""), ")", ""), ",", ""), ";", ""), "\"", "")) for w in string_split(string_replace(a, "\t", " "), " ")]
+        if (Std.any(words, fn(w) { file_line_ok(w, rv) == 'true' })) { 'true' } else { 'false' }
+    }
+}
+
+# "path/to/f.c:12" (or ":12-20", "#L12") names an existing line of the checkout.
+fun file_line_ok(w, rv) {
+    t = string_replace(string_replace(w, "#L", ":"), "./", "")
+    t2 = if (string_ends_with(t, ".") == 'true' || string_ends_with(t, ":") == 'true') { string_sub(t, 0, string_length(t) - 1) } else { t }
+    parts = string_split(t2, ":")
+    if (length(parts) < 2) { 'false' } else {
+        path = hd(parts)
+        n = to_int(hd(string_split(Std.nth(parts, 1), "-")))
+        full = rv ++ "/" ++ path
+        if (n == nil || n < 1 || string_length(path) == 0 || string_contains(path, "..") == 'true' || file_exists(full) == 'false') { 'false' }
+        else { if (n <= length(string_split(file_read(full), "\n"))) { 'true' } else { 'false' } }
+    }
 }
 
 # Post the decision with its evidence on the PR, and hand it back.
@@ -3284,7 +3375,7 @@ fun append_notes(path, text) {
 
 fun gate_pr_message(job, cfg, rv, numstat, hist, diff, tier, evidence) {
     cmds = "build: " ++ cfg_str(cfg, "build") ++ "\nsuite: " ++ cfg_str(cfg, "suite") ++ "\nextra for this change's tier: " ++ Std.join(map_get(tier, "extra"), "; ")
-    "== Review PR #" ++ to_string(map_get(job, "num")) ++ ": " ++ map_get(job, "title") ++ " ==\nCheckout (PR merged with current " ++ map_get(job, "base") ++ "): " ++ rv ++ "\nRisk tier: " ++ (if (string_length(map_get(tier, "names")) > 0) { map_get(tier, "names") } else { "default" }) ++ "\nRepo commands (.o-review.json):\n" ++ cmds ++ "\n\nO already ran these checks itself:\n" ++ (if (string_length(evidence) > 0) { evidence } else { "(none configured)\n" }) ++ "\nIssue:\n" ++ map_get(job, "body") ++ "\n\nFiles changed (added, removed, path):\n" ++ numstat ++ "\nRecent history of these files on the base:\n" ++ hist ++ "\nDiff:\n" ++ diff ++ "\n\n" ++ gate_rubric()
+    "== Review PR #" ++ to_string(map_get(job, "num")) ++ ": " ++ map_get(job, "title") ++ " ==\nCheckout (PR merged with current " ++ map_get(job, "base") ++ "): " ++ rv ++ "\nRisk tier: " ++ (if (string_length(map_get(tier, "names")) > 0) { map_get(tier, "names") } else { "default" }) ++ "\nRepo commands (.o-review.json):\n" ++ cmds ++ "\n\nO already ran these checks itself:\n" ++ (if (string_length(evidence) > 0) { evidence } else { "(none configured)\n" }) ++ "\nIssue:\n" ++ map_get(job, "body") ++ criteria_prompt(acceptance_criteria(str_or(map_get(job, "body"), ""))) ++ "\n\nFiles changed (added, removed, path):\n" ++ numstat ++ "\nRecent history of these files on the base:\n" ++ hist ++ "\nDiff:\n" ++ diff ++ "\n\n" ++ gate_rubric()
 }
 
 # The reviewer rubric (from the swarmrt reviewer brief, generalised).

@@ -153,6 +153,11 @@ O edits real repositories on its own. The guard rails are the point.
   regresses the base (post-merge verify goes red, and stays red on a re-run so a
   single flaky test doesn't count), O reverts the merge on the base branch and
   **keeps the branch** for forensics.
+- **Acceptance criteria need proof.** When an issue has a checklist (`- [ ]`)
+  or a "Done when" list, the merge gate must answer each item `PASS`, `FAIL` or
+  `UNCERTAIN` with evidence. O checks the evidence itself: an approval stands
+  only when every item is `PASS` and cites a file:line that exists in the
+  checkout, or a command the gate actually ran. Anything else is a rejection.
 - **Merge gate hard rules.** Before any model reviews a PR, O rejects it
   outright when it deletes or weakens tests (fewer assertion lines, added skip
   markers), touches `.github/` or `.o-review.json`, changes more than
