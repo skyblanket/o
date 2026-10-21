@@ -153,6 +153,27 @@ O edits real repositories on its own. The guard rails are the point.
   regresses the base (post-merge verify goes red, and stays red on a re-run so a
   single flaky test doesn't count), O reverts the merge on the base branch and
   **keeps the branch** for forensics.
+- **Merge gate hard rules.** Before any model reviews a PR, O rejects it
+  outright when it deletes or weakens tests (fewer assertion lines, added skip
+  markers), touches `.github/` or `.o-review.json`, changes more than
+  `max_change_lines` lines (1500) or `max_change_files` files, adds unfinished
+  code outside tests (`TODO`, `FIXME`, `unimplemented!`, `NotImplementedError`),
+  adds a secret, bumps a submodule, or skips a test its issue asked for. The
+  rules come from the base branch, so a PR can't relax them.
+- **Merges are pinned.** O merges exactly the PR head CI checked; if the branch
+  moved, CI and the gate run again. Someone else's commit on an `o/` branch is
+  never overwritten: O parks the issue and names it.
+- **Failures are classified.** A verify that fails twice is checked before it
+  counts against the builder: a box failure (disk, memory, network) re-runs at
+  verify without spending an attempt, and a failure base shares (main already
+  broken) goes on to CI and the gate with a note.
+- **Post-merge check (PR mode).** Once a day O runs the build, suite and every
+  tier's extra checks on a fresh clone of `main`, step by step against the last
+  green baseline. A step that broke is bisected to the merge that broke it,
+  which O reverts through a PR and sends back to be redone (counted as escaped).
+- **Bounded retries.** Three attempts per round, three rounds per issue; when
+  O stops, it closes the PR with what was tried, and another round reopens the
+  same PR.
 - **Budget circuit breakers.** Every run is metered onto the company's daily and
   monthly budgets; a run killed on its wall-clock cap (which reports no cost) is
   charged a flat estimate. Hitting a cap pauses the company (`budget-daily` /
@@ -448,7 +469,11 @@ The daemon reads its configuration from the environment. All are optional.
 | `O_SANDBOX_RW` | unset | extra comma-separated paths the sandbox keeps writable, if your agent CLI needs them. |
 | `O_MERGE_GATE` | unset | `1` sends every green PR to a merge-gate reviewer of its own (APPROVE / REJECT / UNVERIFIED), reviews in parallel. |
 | `O_MERGE_MODEL` | `claude-opus-5-5` | the merge-gate reviewer's model. |
-| `O_ESCALATE_PATHS` / `O_ESCALATE_LINES` | unset / `1000` | PRs touching these path prefixes, or bigger than this, always go to a human (on top of `.o-review.json` tiers). |
+| `O_ESCALATE_PATHS` / `O_ESCALATE_LINES` | unset / unset | PRs touching these path prefixes, or bigger than this many lines, always go to a human (on top of `.o-review.json` tiers). Off by default: the gate's hard rule `max_change_lines` bounds size. |
+| `O_MAX_ROUNDS` | `3` | Retry rounds per issue (`POST /api/issues/:id/retry`); past it a retry needs `{"force": true}`. |
+| `O_ENV_RETRY_S` | `120` | Pause before re-verifying after an environment failure (no attempt spent; at most 3 per issue). |
+| `O_POSTMERGE_S` / `O_POSTMERGE_TIMEOUT_S` | `86400` / `7200` | How often the post-merge check runs on `main` in PR mode (`0` = off), and its per-step time limit. |
+| `O_PLAN` / `O_PLAN_S` / `O_PLAN_TAKE` / `O_PLAN_MODEL` | off / `86400` / `5` / `opus` | The planning pass: O picks up to `O_PLAN_TAKE` open issues to work on (adding the work label with its reason) and may file up to 3 new ones. |
 | `O_GATE_TIMEOUT_S` / `O_GATE_MAX_TURNS` | `3600` / `80` | wall-clock and turn caps for one gate review, checks included. |
 | `O_PERSONAS` | unset | `1` turns on the daily persona pass (needs `O_SANDBOX=bwrap` or `O_PERSONAS_UNSANDBOXED=1`). |
 | `O_PERSONA_MODEL` | `haiku` | default model for personas (a persona's own `model` wins). |

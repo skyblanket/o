@@ -354,7 +354,9 @@ fun build_retry_prompt(title, body, repo, protected, rebase_onto, verdict, tail)
 fun dispatch_prompt(db, iid, title, body, repo, protected, rebase_onto, attempt) {
     esc = escalation_lines(iid)
     note = if (length(esc) == 0) { "" } else { "\n\nA previous agent on this task asked for a stronger model and said: " ++ Std.last(esc) ++ "\nIts work so far is on this branch." }
-    dispatch_prompt_base(db, iid, title, body, repo, protected, rebase_onto, attempt) ++ note
+    locked = repro_locked_paths(iid)
+    lnote = if (length(locked) == 0) { "" } else { "\n\nThe bug is reproduced by a test already committed on this branch, now locked: " ++ Std.join(locked, ", ") ++ ". It fails today. Make it pass by fixing the code. Do not modify, move or delete it: a PR that changes a locked test is rejected." }
+    dispatch_prompt_base(db, iid, title, body, repo, protected, rebase_onto, attempt) ++ lnote ++ note
 }
 
 fun dispatch_prompt_base(db, iid, title, body, repo, protected, rebase_onto, attempt) {
@@ -598,6 +600,9 @@ fun tick_loop(db, dbpath, port, tick_n, running, retry) {
         {'merge_done', run_id, issue_id, outcome, merge_sha, tail} ->
             r = handle_merge_done(db, running, retry, run_id, issue_id, outcome, merge_sha, tail)
             tick_loop(db, dbpath, port, tick_n, map_get(r, "running"), map_get(r, "retry"))
+        {'repro_done', run_id, issue_id, ok, text, locked} ->
+            r = handle_repro_done(db, running, retry, run_id, issue_id, ok, text, locked)
+            tick_loop(db, dbpath, port, tick_n, map_get(r, "running"), map_get(r, "retry"))
         {'plan_done', company_id, cost, taken, filed} ->
             _pd = handle_plan_done(db, company_id, cost, taken, filed)
             tick_loop(db, dbpath, port, tick_n, running, retry)
@@ -620,13 +625,16 @@ fun tick_loop(db, dbpath, port, tick_n, running, retry) {
 fun do_tick(db, dbpath, port, tick_n, running, retry) {
     now = timestamp()
     _rb = maybe_rollover(db, now)
-    _rf = maybe_reflect(db, dbpath, port, now)
-    _pp = maybe_persona_pass(db, dbpath, port, now)
-    _pc = maybe_persona_confirm(db, dbpath, port, now)
+    # Draining starts nothing new: no builds, and no reflection, persona,
+    # post-merge or planning passes either. What's in flight still finishes.
+    quiet = draining(dbpath) == 'true'
+    _rf = if (quiet) { "" } else { maybe_reflect(db, dbpath, port, now) }
+    _pp = if (quiet) { "" } else { maybe_persona_pass(db, dbpath, port, now) }
+    _pc = if (quiet) { "" } else { maybe_persona_confirm(db, dbpath, port, now) }
     _gh = maybe_gh_poll(db, tick_n)
     _sc = maybe_self_check(db, tick_n, running)
-    _pm = maybe_postmerge(db, now)
-    _pl = maybe_plan(db, now)
+    _pm = if (quiet) { "" } else { maybe_postmerge(db, now) }
+    _pl = if (quiet) { "" } else { maybe_plan(db, now) }
     swept = sweep_stalls(db, map_keys(running), running, retry, now)
     sr = map_get(swept, "running")
     sq = map_get(swept, "retry")
@@ -860,7 +868,8 @@ fun dispatch_batch(db, cands, slots, running, retry, now) {
                         _a = Store.log_activity(db, cid, "orchestrator", "run.failed_final", iid)
                         dispatch_batch(db, tl(cands), slots, running, map_remove(retry, iid), now)
                     } else {
-                        recovered = map_has_key(retry, iid) == 'false' && str_or(map_get(issue, "status"), "") == "Verifying"
+                        env_retry = map_has_key(retry, iid) == 'true' && map_get(map_get(retry, iid), "env") == 'true'
+                        recovered = (map_has_key(retry, iid) == 'false' || env_retry) && str_or(map_get(issue, "status"), "") == "Verifying"
                         running2 = if (recovered && has_committed_work(db, issue, iid) == 'true') { resume_at_verify(db, issue, iid, attempt, running, now) } else { dispatch_one(db, issue, iid, attempt, running, now) }
                         retry2 = map_remove(retry, iid)
                         dispatch_batch(db, tl(cands), slots - 1, running2, retry2, now)
@@ -982,7 +991,8 @@ fun dispatch_one(db, issue, iid, attempt, running, now) {
         # reads the PREVIOUS run's verify verdict (not the one we're about to
         # insert, which would sort first by started_at).
         rebase_onto = if (string_length(repo) > 0) { company_base(company, repo) } else { "main" }
-        prompt = dispatch_prompt(db, iid, title, body, repo, protected, rebase_onto, attempt)
+        repro = needs_repro(iid, attempt)
+        prompt = if (repro == 'true') { repro_prompt(title, body) } else { dispatch_prompt(db, iid, title, body, repo, protected, rebase_onto, attempt) }
         run_id = Store.run_create(db, iid, agent_id, attempt, "Running", workspace)
         _s = Store.issue_set_status(db, iid, "In Progress")
         _as = Store.issue_assign(db, iid, agent_id)
@@ -993,8 +1003,9 @@ fun dispatch_one(db, issue, iid, attempt, running, now) {
         print(f"[orch] dispatch {ident} via {runtime} ({resumed} session, attempt {attempt}, model {model})")
         sim_outcome = if (runtime == "sim") { decide_outcome(issue, attempt) } else { 'none' }
         start = worktree_start(company, repo)
-        wpid = spawn(run_worker(self(), run_id, iid, runtime, prompt, workspace, repo, session_id, sim_outcome, title, protected, start, model))
-        map_put(running, iid, %{run_id: run_id, worker_pid: wpid, started_at: now, attempt: attempt, company_id: company_id, agent_id: agent_id, phase: 'agent', workspace: workspace})
+        _rl = if (repro == 'true') { Store.log_activity(db, company_id, "orchestrator", "repro.start", iid) } else { "" }
+        wpid = spawn(run_worker(self(), run_id, iid, runtime, prompt, workspace, repo, (if (repro == 'true') { "" } else { session_id }), sim_outcome, (if (repro == 'true') { title ++ " [phase:repro]" } else { title }), protected, start, model))
+        map_put(running, iid, %{run_id: run_id, worker_pid: wpid, started_at: now, attempt: attempt, company_id: company_id, agent_id: agent_id, phase: (if (repro == 'true') { 'repro' } else { 'agent' }), workspace: workspace})
     }
 }
 
@@ -1580,7 +1591,16 @@ fun run_sim(orch, run_id, issue_id, outcome, workspace, repo, title, protected, 
 }
 
 # Which behaviour a repo-aware sim run performs, decoded from the issue title.
+# The reproducer phase and [bug:...] markers come first (o#58).
 fun sim_marker(title) {
+    if (string_contains(title, "[phase:repro]") == 'true') {
+        if (string_contains(title, "[bug:norepro]") == 'true') { "repro-pass" } else { "repro-fail" }
+    } else { if (string_contains(title, "[bug:cheat]") == 'true') { "bug-cheat" }
+    else { if (string_contains(title, "[bug:") == 'true') { "bug-fix" }
+    else { sim_marker_base(title) }}}
+}
+
+fun sim_marker_base(title) {
     if (string_contains(title, "[sim:no-commit]") == 'true') { "no-commit" }
     else { if (string_contains(title, "[sim:bad-verify]") == 'true') { "bad-verify" }
     else { if (string_contains(title, "[sim:protected]") == 'true') { "protected" }
@@ -1598,13 +1618,29 @@ fun sim_marker(title) {
     else { if (string_contains(title, "[sim:ci-edit]") == 'true') { "ci-edit" }
     else { if (string_contains(title, "[sim:huge]") == 'true') { "huge" }
     else { if (string_contains(title, "[sim:skip-test]") == 'true') { "skip-test" }
-    else { "good" }}}}}}}}}}}}}}}}}
+    else { if (string_contains(title, "[sim:stub]") == 'true') { "stub" }
+    else { if (string_contains(title, "[sim:secret]") == 'true') { "secret" }
+    else { if (string_contains(title, "[sim:env]") == 'true') { "env" }
+    else { "good" }}}}}}}}}}}}}}}}}}}}
 }
 
 # Carry out the marker's action in the worktree. Every case except no-commit
 # writes ONE tracked file and commits it (add by exact path, so PROMPT.txt
 # stays untracked).
 fun sim_act(workspace, issue_id, marker, protected) {
+    if (marker == "repro-fail") {
+        # a test that needs the fix: fails until fix_<id> exists
+        sim_commit(workspace, f"tests/r_{issue_id}.sh", f"[ -f fix_{issue_id} ]")
+    } else { if (marker == "repro-pass") {
+        sim_commit(workspace, f"tests/r_{issue_id}.sh", "exit 0")
+    } else { if (marker == "bug-fix") {
+        sim_commit(workspace, f"fix_{issue_id}", "fixed")
+    } else { if (marker == "bug-cheat") {
+        sim_commit(workspace, f"tests/r_{issue_id}.sh", "exit 0")
+    } else { sim_act_base(workspace, issue_id, marker, protected) }}}}
+}
+
+fun sim_act_base(workspace, issue_id, marker, protected) {
     if (marker == "no-commit") {
         ""
     } else {
@@ -1646,6 +1682,12 @@ fun sim_act(workspace, issue_id, marker, protected) {
                     sh(f"cd {workspace} && git rm -q tests/existing.sh && git commit -q -m sim-del-test")
                 } else { if (marker == "ci-edit") {
                     sim_commit(workspace, ".github/workflows/ci.yml", "on: push")
+                } else { if (marker == "env") {
+                    sim_commit(workspace, "ENV_FAIL", "the verify box runs out of disk twice")
+                } else { if (marker == "stub") {
+                    sim_commit(workspace, f"src_{issue_id}.c", "int feature(void) { /* TODO: handle the error path */ return 0; }")
+                } else { if (marker == "secret") {
+                    sim_commit(workspace, f"conf_{issue_id}.env", "AWS_ACCESS_KEY_ID=" ++ "AKIA" ++ "QWERTYUIOPASDFGH")
                 } else { if (marker == "skip-test") {
                     sim_commit(workspace, f"tests/w_{issue_id}.sh", "skip(\"flaky on CI\")\nexit 0")
                 } else { if (marker == "huge") {
@@ -1656,7 +1698,7 @@ fun sim_act(workspace, issue_id, marker, protected) {
                     sh(f"cd {workspace} && git rm -q sim_{issue_id}.txt && git commit -q -m sim-undo")
                 } else {
                     sim_commit(workspace, f"sim_{issue_id}.txt", "ok")
-                }}}}}}}}}}}}}
+                }}}}}}}}}}}}}}}}
                 }
             }
         }
@@ -1730,6 +1772,14 @@ fun handle_done(db, running, retry, run_id, issue_id, outcome, cost, session_id)
                 spawn(needs_human_comment_worker(gh, string_sub(fp, 3, string_length(fp) - 3), issue_id, ask))
             } else { "" }
             %{running: map_remove(running, issue_id), retry: map_remove(retry, issue_id)}
+        } else { if (outcome == 'succeeded' && map_get(info, "phase") == 'repro') {
+            account_cost(db, company_id, cost)
+            company = Store.company_row(db, company_id)
+            repo = str_or(map_get(company, "repo"), "")
+            _m = Store.run_finish(db, run_id, "Reproducing", cost)
+            cpid = spawn(repro_check_worker(self(), run_id, issue_id, map_get(info, "workspace"), repo, company_base(company, repo), str_or(map_get(company, "verify_cmd"), "")))
+            info2 = map_put(map_put(map_put(info, "phase", 'repro_check'), "started_at", now), "worker_pid", cpid)
+            %{running: map_put(running, issue_id, info2), retry: retry}
         } else { if (outcome == 'succeeded') {
             # Spend is real whichever path we take, so account it immediately.
             account_cost(db, company_id, cost)
@@ -1779,7 +1829,7 @@ fun handle_done(db, running, retry, run_id, issue_id, outcome, cost, session_id)
                 retry2 = schedule_retry(retry, issue_id, attempt, now)
                 %{running: map_remove(running, issue_id), retry: retry2}
             }
-        }}
+        }}}
     }
 }
 
@@ -1860,13 +1910,76 @@ fun run_verify(orch, run_id, issue_id, ws, repo, base, verify_cmd, protected) {
                 if (elem(r2, 0) == 0) {
                     send(orch, {'verify_done', run_id, issue_id, "green", "FLAKY: the first verify run failed and an identical rerun passed. First run:\n" ++ tail})
                 } else {
-                    send(orch, {'verify_done', run_id, issue_id, "red_tests", tail_log(logpath)})
+                    t2 = tail_log(logpath)
+                    cls = classify_red(ws, repo, base, verify_cmd, t2)
+                    send(orch, {'verify_done', run_id, issue_id, map_get(cls, "verdict"), map_get(cls, "tail")})
                 }
             } else {
                 send(orch, {'verify_done', run_id, issue_id, verdict, tail})
             }
         }
     }
+}
+
+# Why a verify that failed twice failed, before it counts against the builder
+# (o#59). %{verdict, tail}:
+#   red_env        the box, not the code: disk, memory, kills, network, rate
+#                  limits. Re-run without spending an attempt.
+#   red_inherited  base fails the same verify, with every failure the change
+#                  shows: main was already broken; the change goes on with a
+#                  note and CI and the gate judge it.
+#   red_tests      anything else: the change's to fix.
+fun classify_red(ws, repo, base, verify_cmd, tail) {
+    if (env_failure(tail) == 'true') {
+        %{verdict: "red_env", tail: "ENVIRONMENT: the verify failed for reasons outside the change (" ++ env_failure_why(tail) ++ "); it runs again without spending an attempt.\n\n" ++ tail}
+    } else {
+        bt = base_verify_tail(ws, repo, base, verify_cmd)
+        mine = fail_lines(tail)
+        if (string_length(bt) > 0 && length(mine) > 0 && Std.all(mine, fn(l) { Std.any(fail_lines(bt), fn(b) { b == l }) }) == 'true') {
+            %{verdict: "red_inherited", tail: "INHERITED: " ++ base ++ " fails this verify too, with every failure this change shows; main was already broken.\n\nOn the change:\n" ++ tail ++ "\n\nOn " ++ base ++ ":\n" ++ bt}
+        } else {
+            %{verdict: "red_tests", tail: tail}
+        }
+    }
+}
+
+fun env_patterns() {
+    ["No space left on device", "Cannot allocate memory", "Out of memory", "\nKilled", "Resource temporarily unavailable", "Too many open files", "Text file busy", "Could not resolve host", "Temporary failure in name resolution", "429 Too Many Requests"]
+}
+
+fun env_failure(tail) { if (string_length(env_failure_why(tail)) > 0) { 'true' } else { 'false' } }
+
+fun env_failure_why(tail) {
+    hits = [p for p in env_patterns() when string_contains(tail, p) == 'true']
+    if (length(hits) == 0) { "" } else { hd(hits) }
+}
+
+# The lines that name failures, normalised so the same failure matches across
+# runs: digits, hex and temp paths stripped.
+fun fail_lines(text) {
+    ls = [l for l in lines_of(text) when string_contains(l, "FAIL") == 'true' || string_contains(l, "Error") == 'true' || string_contains(l, "error:") == 'true' || string_contains(l, "panic") == 'true' || string_contains(l, "assert") == 'true']
+    Std.unique([string_trim(elem(sh("printf %s " ++ sq(l) ++ " | sed -E 's#/tmp/[^ ]*#/tmp/X#g; s/0x[0-9a-fA-F]+/0x#/g; s/[0-9]+/#/g'"), 1)) for l in Std.take(ls, 40)])
+}
+
+# The verify's tail on base itself: a throwaway worktree at base, cached by
+# base tree + command (main doesn't change per issue). "" when base passes.
+fun base_verify_tail(ws, repo, base, verify_cmd) {
+    tree = tree_of(repo, base)
+    key = if (string_length(tree) > 0) { "verify-base|" ++ tree ++ "|" ++ verify_cmd } else { "" }
+    dir = ws ++ "-base"
+    logp = ws ++ "/verify-base.log"
+    p = if (gate_cache_on() && string_length(key) > 0) { gate_cache_path(key) } else { "" }
+    code = if (string_length(p) > 0 && file_exists(p ++ ".code") == 'true') {
+        _c = sh("cp " ++ sq(p ++ ".log") ++ " " ++ sq(logp))
+        to_int(string_trim(file_read(p ++ ".code")))
+    } else {
+        _w = sh(f"rm -rf {sq(dir)}; git -C {sq(repo)} worktree prune; git -C {sq(repo)} worktree add -q --detach {sq(dir)} {base}")
+        c = elem(shell_managed(timeout_cmd(verify_timeout_s(), verify_cmd, dir, logp), verify_timeout_ms()), 0)
+        _r = sh(f"git -C {sq(repo)} worktree remove --force {sq(dir)}")
+        _s = if (string_length(p) > 0) { _l = sh("cp " ++ sq(logp) ++ " " ++ sq(p ++ ".log")); file_write(p ++ ".code", to_string(c) ++ "\n") } else { "" }
+        c
+    }
+    if (code == 0) { "" } else { tail_log(logp) }
 }
 
 # The base branch a worktree is diffed/rebased against: the repo's current
@@ -1918,7 +2031,10 @@ fun tail_log(path) {
     if (file_exists(path) == 'true') {
         raw = file_read(path)
         n = string_length(raw)
-        if (n <= 4096) { raw } else { string_sub(raw, n - 4096, 4096) }
+        # start at a line boundary, so a cut never lands inside a character
+        cut = if (n <= 4096) { raw } else { string_sub(raw, n - 4096, 4096) }
+        nl = if (n <= 4096) { -1 } else { string_index_of(cut, "\n") }
+        if (nl == nil || nl < 0) { cut } else { string_sub(cut, nl + 1, string_length(cut) - nl - 1) }
     } else {
         ""
     }
@@ -1993,9 +2109,24 @@ fun handle_verify_done(db, running, retry, run_id, issue_id, verdict, tail) {
             } else {
                 enqueue_merge(db, running, retry, info, run_id, issue_id, now)
             }
+        } else { if (verdict == "red_env" && Store.count_target_verb(db, issue_id, "verify.env") < 3) {
+            # the box failed, not the change: after a pause, verify again on
+            # the same attempt; the builder doesn't run (resume_at_verify)
+            _a = Store.log_activity(db, company_id, "orchestrator", "verify.env", issue_id)
+            _v = Store.run_set_verify(db, run_id, "red_env", tail)
+            _st = Store.run_set_state(db, run_id, "EnvFailed")
+            %{running: map_remove(running, issue_id), retry: map_put(retry, issue_id, %{attempt: map_get(info, "attempt"), due_at: now + env_int("O_ENV_RETRY_S", 120) * 1000, env: 'true'})}
+        } else { if (verdict == "red_inherited") {
+            _a = Store.log_activity(db, company_id, "orchestrator", "verify.inherited", issue_id)
+            _v = Store.run_set_verify(db, run_id, "inherited", tail)
+            if (review_enabled() == 'true') {
+                start_review(db, running, retry, info, run_id, issue_id, now)
+            } else {
+                enqueue_merge(db, running, retry, info, run_id, issue_id, now)
+            }
         } else {
-            verify_red(db, running, retry, info, run_id, issue_id, verdict, tail, now)
-        }
+            verify_red(db, running, retry, info, run_id, issue_id, (if (verdict == "red_env") { "red_tests" } else { verdict }), tail, now)
+        }}}
     }
 }
 
@@ -2247,6 +2378,7 @@ fun import_gh_issues(db, company_id, items) {
         body = str_or(map_get(it, "body"), "")
         id = if (num == nil) { nil } else { Store.issue_import_github(db, company_id, num, title, body) }
         _l = if (id == nil) { "" } else { Store.log_activity(db, company_id, "github", "github.import", f"gh:{num}") }
+        _bug = if (id != nil && Std.any(list_or_empty(map_get(it, "labels")), fn(l) { string_lower(str_or(map_get(l, "name"), "")) == "bug" }) == 'true') { repro_mark_bug(id) } else { "" }
         import_gh_issues(db, company_id, tl(items))
     }
 }
@@ -2275,9 +2407,30 @@ fun start_ci(db, running, retry, info, company, run_id, issue_id, now) {
 
 fun ci_worker(orch, run_id, issue_id, ws, branch, base, gh_repo, title, required) {
     _r = reopen_closed_pr(gh_repo, branch)
-    # --force: the branch is O's own, and GitHub may have added an
-    # update-branch merge commit to it that the agent's retry doesn't have.
-    push = sh(f"git -C {ws} push -q --force origin HEAD:refs/heads/{branch}")
+    # The branch is O's, but not only O's: GitHub may have added an
+    # update-branch merge commit (fine to replace), and a person may have
+    # pushed a fix onto the PR (never to be overwritten). A commit on the
+    # remote branch that isn't a merge and was never on O's local branch is
+    # someone else's: park the issue and name it. Otherwise push with a lease
+    # on the head just fetched, so nothing that lands meanwhile is lost.
+    _ff = sh(f"git -C {ws} update-ref -d refs/o-remote/{branch}; git -C {ws} fetch -q origin +refs/heads/{branch}:refs/o-remote/{branch} 2>/dev/null")
+    remote = string_trim(elem(sh(f"git -C {ws} rev-parse -q --verify refs/o-remote/{branch}"), 1))
+    # O's own: on its branch's reflog, or authored as the repo's git identity
+    # (the reflog is gone once O deleted and recreated the branch). Commits
+    # already on base arrive via update-branch and aren't anyone's PR work.
+    mine = lines_of(elem(sh(f"git -C {ws} log -g --format=%H refs/heads/{branch} 2>/dev/null"), 1))
+    me = string_trim(elem(sh(f"git -C {ws} config --get user.email"), 1))
+    cand = if (string_length(remote) == 0) { [] } else { lines_of(elem(sh(f"git -C {ws} rev-list --no-merges --format=%H%x20%ae {remote} ^HEAD ^origin/{base} | grep -v '^commit '"), 1)) }
+    theirs = [hd(string_split(l, " ")) for l in cand when Std.any(mine, fn(m) { m == hd(string_split(l, " ")) }) == 'false' && Std.last(string_split(l, " ")) != me]
+    # always explicit: "<branch>:" (empty) means the branch must not exist yet
+    lease = "=" ++ branch ++ ":" ++ remote
+    if (length(theirs) > 0) {
+        send(orch, {'ci_done', run_id, issue_id, "in_review", "", "HUMAN: someone else pushed commits to " ++ branch ++ " (" ++ Std.join([string_sub(c, 0, 10) for c in theirs], ", ") ++ "). O won't overwrite them: merge them into the PR, or delete them from the branch, then retry the issue."})
+    } else { ci_push_open(orch, run_id, issue_id, ws, branch, base, gh_repo, title, required, lease) }
+}
+
+fun ci_push_open(orch, run_id, issue_id, ws, branch, base, gh_repo, title, required, lease) {
+    push = sh(f"git -C {ws} push -q --force-with-lease{lease} origin HEAD:refs/heads/{branch}")
     if (elem(push, 0) != 0) {
         send(orch, {'ci_done', run_id, issue_id, "red_ci", "", "git push failed:\n" ++ elem(push, 1)})
     } else {
@@ -2610,7 +2763,8 @@ fun do_gate(job) {
             # An empty PR: nothing to review, so no model is paid for it.
             gate_result(job, "REJECT: the PR makes no change against " ++ base ++ " (its commits net out to nothing).", "", "", "", map_get(job, "session"), 0)
         } else {
-        broken = hard_rules(cfg, rv, files, lines)
+        hr = hard_rules(cfg, rv, files, lines, str_or(map_get(job, "title"), "") ++ "\n" ++ str_or(map_get(job, "body"), ""))
+        broken = if (string_length(hr) > 0) { hr } else { locked_test_rule(rv, iid) }
         if (string_length(broken) > 0) {
             # A hard rule: no model may wave this through, so none is asked.
             gate_result(job, "REJECT: " ++ broken, "", "", "", map_get(job, "session"), 0)
@@ -2641,8 +2795,14 @@ fun do_gate(job) {
 #     (assert*/expect*) and no added skip markers
 #   - no changes to CI or the gate's own config (.github/, .o-review.json,
 #     plus .o-review.json "locked_paths")
-#   - at most "max_change_lines" (default 1500) lines added + deleted
-fun hard_rules(cfg, rv, files, lines) {
+#   - at most "max_change_lines" (default 1500) lines added + deleted, and
+#     at most "max_change_files" files when the repo sets it
+#   - no unfinished code outside tests (TODO, FIXME, unimplemented!,
+#     NotImplementedError)
+#   - no secrets in added lines (cloud keys, private keys, tokens)
+#   - no submodule changes
+#   - an issue that asks for a test gets one
+fun hard_rules(cfg, rv, files, lines, issue) {
     test_dirs = ["tests/", "test/"] ++ flatten([list_or_empty(map_get(r, "paths")) for r in cfg_list(cfg, "test_runners")])
     gone = lines_of(elem(sh(f"git -C {sq(rv)} diff --no-renames --name-only --diff-filter=D o-base HEAD"), 1))
     gone_tests = [f for f in gone when starts_any_of(f, test_dirs) == 'true']
@@ -2653,6 +2813,16 @@ fun hard_rules(cfg, rv, files, lines) {
     locked = [f for f in files when starts_any_of(f, [".github/", ".o-review.json"] ++ cfg_list(cfg, "locked_paths")) == 'true']
     lim = map_get(cfg, "max_change_lines")
     max_lines = if (lim == nil) { 1500 } else { lim }
+    flim = map_get(cfg, "max_change_files")
+    max_files = if (flim == nil) { 0 } else { flim }
+    excl = Std.join([sq(":(exclude)" ++ d) for d in Std.unique(test_dirs)], " ")
+    added = f"git -C {sq(rv)} diff --no-renames -U0 o-base HEAD -- . {excl} | grep -E '^[+][^+]'"
+    stubs = lines_of(elem(sh(added ++ " | grep -E 'TODO|FIXME|unimplemented!|NotImplementedError' | head -3"), 1))
+    all_added = f"git -C {sq(rv)} diff --no-renames -U0 o-base HEAD | grep -E '^[+][^+]'"
+    secrets = lines_of(elem(sh(all_added ++ " | grep -E 'AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|gh[pousr]_[A-Za-z0-9]{36}|xox[baprs]-[A-Za-z0-9-]{10,}|sk-[A-Za-z0-9]{32,}' | head -3"), 1))
+    submods = lines_of(elem(sh(f"git -C {sq(rv)} diff --raw o-base HEAD | grep -E '^:(160000|[0-7]+ 160000)' | head -3"), 1))
+    wants_test = string_contains(string_lower(issue), "add a test") == 'true' || string_contains(string_lower(issue), "add tests") == 'true' || string_contains(string_lower(issue), "regression test") == 'true'
+    tests_touched = Std.any(files, fn(f) { starts_any_of(f, test_dirs) == 'true' })
     if (length(gone_tests) > 0) {
         "hard rule: the PR deletes test files (" ++ Std.join(gone_tests, ", ") ++ "). Tests are never deleted to get a change through; fix the code, or change the test in place and say why."
     } else { if (lost > 0 || skips > 0) {
@@ -2661,7 +2831,23 @@ fun hard_rules(cfg, rv, files, lines) {
         "hard rule: the PR changes CI or the gate's own config (" ++ Std.join(locked, ", ") ++ "), which decide whether changes are safe; those stay out of O's reach."
     } else { if (lines > max_lines) {
         "hard rule: the PR changes " ++ to_string(lines) ++ " lines, over the limit of " ++ to_string(max_lines) ++ " (max_change_lines). Split it into smaller PRs that each stand on their own."
-    } else { "" }}}}
+    } else { if (max_files > 0 && length(files) > max_files) {
+        "hard rule: the PR changes " ++ to_string(length(files)) ++ " files, over the limit of " ++ to_string(max_files) ++ " (max_change_files). Split it into smaller PRs that each stand on their own."
+    } else { if (length(secrets) > 0) {
+        "hard rule: the PR adds what looks like a secret (" ++ to_string(length(secrets)) ++ " line(s), e.g. a cloud key, private key or token). Secrets never go in the repository."
+    } else { if (length(submods) > 0) {
+        "hard rule: the PR changes a submodule pointer. Submodule bumps aren't O's to make."
+    } else { if (length(stubs) > 0) {
+        "hard rule: the PR adds unfinished code outside tests: " ++ string_truncate(Std.join([string_trim(string_sub(l, 1, string_length(l) - 1)) for l in stubs], " | "), 400) ++ ". Finish it, or leave it out of this change."
+    } else { if (wants_test && tests_touched == 'false') {
+        "hard rule: the issue asks for a test, and the PR adds or changes none. Add the test it asks for."
+    } else { "" }}}}}}}}}
+}
+
+# A test the reproducer wrote and O locked must reach the merge untouched.
+fun locked_test_rule(rv, iid) {
+    changed = [hd(p) for p in repro_locked(iid) when string_trim(elem(sh("git -C " ++ sq(rv) ++ " rev-parse " ++ sq("HEAD:" ++ hd(p)) ++ " 2>/dev/null"), 1)) != Std.last(p)]
+    if (length(changed) == 0) { "" } else { "hard rule: the PR changes a locked reproducing test (" ++ Std.join(changed, ", ") ++ "). It captures the bug; fix the code so it passes instead." }
 }
 
 # A disposable, remote-less clone of the PR head merged with current base, so
@@ -3023,11 +3209,12 @@ fun numstat_lines(rows, acc) {
 fun escalate_reason(files, lines) {
     paths = getenv("O_ESCALATE_PATHS")
     hit = if (paths == nil) { 'false' } else { any_protected(files, paths) }
-    cap = env_int("O_ESCALATE_LINES", 1000)
+    # off unless set: the gate's hard rule (max_change_lines) bounds size
+    cap = env_int("O_ESCALATE_LINES", 0)
     if (hit == 'true') {
         "touches an O_ESCALATE_PATHS path (" ++ paths ++ ")"
     } else {
-        if (lines > cap) { "changes " ++ to_string(lines) ++ " lines, over O_ESCALATE_LINES=" ++ to_string(cap) } else { "" }
+        if (cap > 0 && lines > cap) { "changes " ++ to_string(lines) ++ " lines, over O_ESCALATE_LINES=" ++ to_string(cap) } else { "" }
     }
 }
 
@@ -3416,6 +3603,110 @@ fun no_longer_human(gh_repo, num, repo) {
     files = if (pf == nil) { [] } else { [str_or(map_get(f, "filename"), "") for f in pf] }
     if (length(files) == 0) { 'false' } else {
         if (map_get(pr_tier(review_config(repo, "origin/" ++ base), files), "human") == 'true') { 'false' } else { 'true' }
+    }
+}
+
+# ---- reproduce first (o#58, O_REPRO=1) -----------------------------
+# A bug (GitHub label `bug`) is reproduced before anyone fixes it. The first
+# run on it is a reproducer: it may only add a test that captures the bug.
+# O then checks it mechanically: tests only, and every new test fails on the
+# unfixed code. A reproduced test is locked (its blob recorded); the builder
+# is told to make it pass without touching it, and the gate rejects a PR that
+# changes it. A bug that can't be reproduced in two tries stops early, before
+# any build attempts are spent. State: ~/.o/repro/<issue>/{bug,locked,tries}.
+fun repro_dir(iid) { getenv("HOME") ++ "/.o/repro/" ++ iid }
+
+fun repro_mark_bug(iid) {
+    _m = sh("mkdir -p " ++ sq(repro_dir(iid)))
+    file_write(repro_dir(iid) ++ "/bug", "bug\n")
+}
+
+fun needs_repro(iid, attempt) {
+    if (getenv("O_REPRO") == "1" && attempt == 1 && file_exists(repro_dir(iid) ++ "/bug") == 'true' && file_exists(repro_dir(iid) ++ "/locked") == 'false' && repro_tries(iid) < 2) { 'true' } else { 'false' }
+}
+
+fun repro_tries(iid) {
+    f = repro_dir(iid) ++ "/tries"
+    if (file_exists(f) == 'true') { to_int_or(string_trim(file_read(f)), 0) } else { 0 }
+}
+
+# [path, blob] per locked test
+fun repro_locked(iid) {
+    f = repro_dir(iid) ++ "/locked"
+    if (file_exists(f) == 'true') { [string_split(l, "\t") for l in lines_of(file_read(f))] } else { [] }
+}
+
+fun repro_locked_paths(iid) { [hd(p) for p in repro_locked(iid)] }
+
+fun repro_prompt(title, body) {
+    "You are reproducing a reported bug before anyone fixes it. Do NOT fix it.\n\nWrite one or more tests, in the repository's test directories and following its existing test conventions, that FAIL today because of this bug and will pass once it is fixed. Commit only the test files (no changes to any other file). Each test should fail for the reason described, not for an unrelated one. If you cannot make a test fail for this reason, commit nothing and explain why in your final message.\n\n== Bug ==\n" ++ title ++ "\n\n" ++ body
+}
+
+# The reproducer's commit, checked: only test files changed, at least one
+# test added, and every added test fails here (the bug is still in the code).
+fun repro_check_worker(orch, run_id, iid, ws, repo, base, verify_cmd) {
+    cfg = review_config(repo, base)
+    test_dirs = ["tests/", "test/"] ++ flatten([list_or_empty(map_get(r, "paths")) for r in cfg_list(cfg, "test_runners")])
+    changed = lines_of(elem(sh(f"git -C {sq(ws)} diff --no-renames --name-only {base}...HEAD"), 1))
+    added = lines_of(elem(sh(f"git -C {sq(ws)} diff --no-renames --name-only --diff-filter=A {base}...HEAD"), 1))
+    other = [f for f in changed when starts_any_of(f, test_dirs) == 'false']
+    tests = [f for f in added when starts_any_of(f, test_dirs) == 'true']
+    if (length(other) > 0) {
+        send(orch, {'repro_done', run_id, iid, 'false', "The reproducer changed files that aren't tests (" ++ Std.join(other, ", ") ++ "); it may only add tests.", ""})
+    } else { if (length(tests) == 0) {
+        send(orch, {'repro_done', run_id, iid, 'false', "The reproducer added no test.", ""})
+    } else {
+        runs = [repro_run_test(cfg, ws, t, verify_cmd) for t in tests]
+        passing = [r for r in runs when map_get(r, "code") == 0]
+        if (length(passing) > 0) {
+            send(orch, {'repro_done', run_id, iid, 'false', "These tests pass on the unfixed code, so they don't reproduce the bug: " ++ Std.join([map_get(r, "file") for r in passing], ", "), ""})
+        } else {
+            locked = Std.join([t ++ "\t" ++ string_trim(elem(sh("git -C " ++ sq(ws) ++ " rev-parse " ++ sq("HEAD:" ++ t)), 1)) for t in tests], "\n")
+            send(orch, {'repro_done', run_id, iid, 'true', "Reproduced: " ++ Std.join(tests, ", ") ++ " fail(s) on the unfixed code.\n\n" ++ string_truncate(map_get(hd(runs), "tail"), 2000), locked})
+        }
+    }}
+}
+
+fun repro_run_test(cfg, ws, file, verify_cmd) {
+    runner = Std.find(cfg_list(cfg, "test_runners"), fn(r) { starts_any_of(file, list_or_empty(map_get(r, "paths"))) == 'true' })
+    cmd = if (runner == nil) { verify_cmd } else { string_replace(str_or(map_get(runner, "cmd"), ""), "{file}", sq(file)) }
+    logp = ws ++ "/repro.log"
+    r = shell_managed(timeout_cmd(verify_timeout_s(), cmd, ws, logp), verify_timeout_ms())
+    %{file: file, code: elem(r, 0), tail: tail_log(logp)}
+}
+
+# Sole DB writer for the reproducer's verdict.
+fun handle_repro_done(db, running, retry, run_id, iid, ok, text, locked) {
+    info = map_get(running, iid)
+    if (info == nil) { %{running: running, retry: retry} } else {
+        now = timestamp()
+        company_id = map_get(info, "company_id")
+        _v = Store.run_set_verify(db, run_id, (if (ok == 'true') { "reproduced" } else { "not_reproduced" }), text)
+        if (ok == 'true') {
+            _w = file_write(repro_dir(iid) ++ "/locked", locked ++ "\n")
+            _st = Store.run_set_state(db, run_id, "Reproduced")
+            _a = Store.log_activity(db, company_id, "orchestrator", "repro.ok", iid)
+            # the builder goes next, on the same attempt
+            %{running: map_remove(running, iid), retry: map_put(retry, iid, %{attempt: map_get(info, "attempt"), due_at: now})}
+        } else {
+            n = repro_tries(iid) + 1
+            _t = file_write(repro_dir(iid) ++ "/tries", to_string(n) ++ "\n")
+            _st = Store.run_set_state(db, run_id, "NotReproduced")
+            _a = Store.log_activity(db, company_id, "orchestrator", "repro.fail", iid)
+            if (n >= 2) {
+                _s = Store.issue_set_status(db, iid, "Failed")
+                _c = Store.log_activity(db, company_id, "orchestrator", "repro.cannot", iid)
+                co = Store.company_row(db, company_id)
+                gh = str_or(map_get(co, "github_repo"), "")
+                fp = str_or(map_get(Store.issue_row(db, iid), "fingerprint"), "")
+                _g = if (string_length(gh) > 0 && string_starts_with(fp, "gh:") == 'true') {
+                    spawn(stopped_comment_worker(gh, string_sub(fp, 3, string_length(fp) - 3), iid, "O could not reproduce this bug in 2 tries, so it did not try to fix it. Last result: " ++ text ++ "\n\nAdd steps that show the failure (a command and its output), then retry the issue."))
+                } else { "" }
+                %{running: map_remove(running, iid), retry: map_remove(retry, iid)}
+            } else {
+                %{running: map_remove(running, iid), retry: map_put(retry, iid, %{attempt: map_get(info, "attempt"), due_at: now + 2000})}
+            }
+        }
     }
 }
 

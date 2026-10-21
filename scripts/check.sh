@@ -1544,14 +1544,18 @@ IID_HD="$(gh_issue '[sim:del-test] drop a test')"
 IID_HC="$(gh_issue '[sim:ci-edit] touch CI')"
 IID_HH="$(gh_issue '[sim:huge] one giant change')"
 IID_HS="$(gh_issue '[sim:skip-test] skip the flaky test')"
-for pair in "$IID_HD:deletes test files (tests/existing.sh)" "$IID_HC:changes CI or the gate's own config (.github/workflows/ci.yml)" "$IID_HH:changes 1600 lines, over the limit of 1500" "$IID_HS:weakens tests (1 added skip markers)"; do
+IID_HT="$(gh_issue '[sim:stub] half-done feature')"
+IID_HK="$(gh_issue '[sim:secret] wire the cloud key')"
+IID_HR="$(gh_issue '[sim:good] fix the parser crash and add a regression test')"
+for pair in "$IID_HD:deletes test files (tests/existing.sh)" "$IID_HC:changes CI or the gate's own config (.github/workflows/ci.yml)" "$IID_HH:changes 1600 lines, over the limit of 1500" "$IID_HS:weakens tests (1 added skip markers)" "$IID_HT:adds unfinished code outside tests" "$IID_HK:adds what looks like a secret" "$IID_HR:"; do
   i="${pair%%:*}"; why="${pair#*:}"
   wait_status_at "$BASE4" "$i" "Failed" 200 || { tail -30 "$TMP4/daemon.log"; fail "hard rules: $i was not stopped ($why)"; }
-  sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$i' ORDER BY started_at DESC LIMIT 1" | grep -qF "hard rule: the PR $why" \
+  [ -n "$why" ] || why="the issue asks for a test, and the PR adds or changes none"
+  sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$i' ORDER BY started_at DESC LIMIT 1" | grep -F "hard rule: " | grep -F "$why" >/dev/null \
     || { sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$i' ORDER BY started_at DESC LIMIT 1"; fail "hard rules: reason missing ($why)"; }
   git -C "$GHS/remote.git" log --oneline main | grep "o/$i" >/dev/null && fail "hard rules: $i was merged"
 done
-pass "hard rules: a deleted test, a skipped test, a CI/gate-config change and an oversized PR are rejected before any model runs"
+pass "hard rules: a deleted or skipped test, a CI/gate-config change, an oversized PR, unfinished code, a secret, and a missing asked-for test are rejected before any model runs"
 
 # Gate cache: a check's result is kept by content (tree + command). XC1's merge
 # is refused (main doesn't move), so XC2 is gated on the same base and its
@@ -1685,9 +1689,16 @@ pass "budget: the global daily cap logs budget.capped once, not every tick"
 # breaks a step that passed before is bisected and reverted through a PR O
 # merges, and its issue goes back to Backlog (merge.revert). A step that was
 # already red on main (broken-on-base-too) doesn't count as a break.
+# hold the first check ~7s (state files in the future) so the drain lands first
+mkdir -p "$TMP4/.o/postmerge/$CIDG"; pm_at="$(( ($(date +%s) + 5) * 1000 ))"
+echo "$pm_at" > "$TMP4/.o/postmerge/$CIDG/started"; echo "$pm_at" > "$TMP4/.o/postmerge/$CIDG/done"
 restart_d4 O_POSTMERGE_S=2 O_POSTMERGE_TIMEOUT_S=60 O_AUTO_FILE=0
-ocurl -s -X POST "$BASE4/api/orchestrator/drain" -H 'Content-Type: application/json' -d '{"on":true}' >/dev/null
 pmq() { sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='$1'"; }
+# Draining starts nothing new, post-merge checks included.
+ocurl -s -X POST "$BASE4/api/orchestrator/drain" -H 'Content-Type: application/json' -d '{"on":true}' >/dev/null
+sleep 8
+[ "$(pmq postmerge.baseline)" = "0" ] || fail "drain: a post-merge check started while draining"
+ocurl -s -X POST "$BASE4/api/orchestrator/drain" -H 'Content-Type: application/json' -d '{"on":false}' >/dev/null
 for _i in $(seq 1 60); do [ "$(pmq postmerge.baseline)" = "1" ] && break; sleep 1; done
 [ "$(pmq postmerge.baseline)" = "1" ] || { grep -v '^\[orch\] tick' "$TMP4/daemon.log" | tail -20; fail "post-merge: no baseline recorded"; }
 grep -q "already red on main, not counted as a break: test -f broken-on-base-too" "$TMP4/daemon.log" || fail "post-merge: the step red on base was not reported as already red"
@@ -1707,7 +1718,8 @@ for _i in $(seq 1 120); do [ "$(pmq postmerge.reverted)" = "1" ] && break; sleep
 git -C "$GHS/remote.git" show main:ext/broken >/dev/null 2>&1 && fail "post-merge: ext/broken still on main after the revert"
 git -C "$GHS/remote.git" show main:docs/later.md >/dev/null 2>&1 || fail "post-merge: the harmless later merge was reverted too"
 [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='merge.revert' AND target='iss_pmtest'")" = "1" ] || fail "post-merge: the culprit's issue not marked merge.revert"
-[ "$(sqlite3 "$TMP4/o.db" "SELECT status FROM issue WHERE id='iss_pmtest'")" = "Backlog" ] || fail "post-merge: the culprit's issue not sent back to Backlog"
+# sent back: Backlog, or already picked up again (the daemon isn't drained)
+case "$(sqlite3 "$TMP4/o.db" "SELECT status FROM issue WHERE id='iss_pmtest'")" in Backlog|"In Progress"|Verifying) ;; *) fail "post-merge: the culprit's issue not sent back to Backlog" ;; esac
 sqlite3 "$TMP4/o.db" "SELECT body FROM issue WHERE id='iss_pmtest'" | grep -q "broke main" || fail "post-merge: the failure was not added to the issue"
 pass "post-merge: a merge that breaks main is bisected (not the later one), reverted via a merged PR, its issue sent back; a step red on base doesn't count"
 
@@ -1745,6 +1757,78 @@ wait_status_at "$BASE4" "$IID_RK" "Done" 180 || { grep -v '^\[orch\] tick' "$TMP
 [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='run.dispatch' AND target='$IID_RK'")" = "$ndisp_rk" ] || fail "re-adopt: the builder ran again (it should reuse the approved PR)"
 git -C "$GHS/remote.git" log --oneline main | grep "o/$IID_RK" >/dev/null || fail "re-adopt: the PR did not merge into main"
 pass "re-adopt: when the tiers stop asking for a human, a PR parked for sign-off is re-gated on current main and merged, no rebuild"
+
+# Someone else's commit on O's branch is never overwritten: after a red CI
+# round, a person pushes a fix onto the PR; O's next push parks instead.
+IID_FC="$(gh_issue '[sim:good] someone else pushes to this branch')"
+echo "o/$IID_FC" >> "$GHS/fail_ci"
+for _i in $(seq 1 90); do [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='ci.fail' AND target='$IID_FC'")" -ge 1 ] && break; sleep 1; done
+FCW="$TMP4/foreign"; rm -rf "$FCW"; git clone -q "$GHS/remote.git" "$FCW" && git -C "$FCW" checkout -q "o/$IID_FC"
+echo "human fix" > "$FCW/human.txt"; git -C "$FCW" add human.txt
+git -C "$FCW" -c user.email=someone@example.com -c user.name=Someone commit -q -m "a person's fix" && git -C "$FCW" push -q origin "o/$IID_FC"
+FSHA="$(git -C "$FCW" rev-parse --short=10 HEAD)"
+wait_status_at "$BASE4" "$IID_FC" "In Review" 180 || { grep -v '^\[orch\] tick' "$TMP4/daemon.log" | tail -20; fail "foreign commit: O did not stop before overwriting someone else's commit"; }
+sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_FC' ORDER BY started_at DESC LIMIT 1" | grep "someone else pushed commits" | grep "$FSHA" >/dev/null \
+  || { sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_FC' ORDER BY started_at DESC LIMIT 1"; fail "foreign commit: the note does not name the commit"; }
+git -C "$GHS/remote.git" log --format=%ae "o/$IID_FC" | grep someone@example.com >/dev/null || fail "foreign commit: the person's commit was overwritten"
+pass "foreign commit: a person's commit on O's branch stops O's next push; the commit is kept and named"
+
+# Reproduce first (o#58): a bug-labelled issue gets a reproducer run that may
+# only add a failing test; O checks it fails, locks it, then the builder fixes
+# the code. Can't reproduce in two tries -> stops before any build attempt.
+# A builder that edits the locked test is rejected by the gate.
+echo '[{"number":30,"title":"[bug:repro] parser crash","body":"x","labels":[{"name":"o"},{"name":"bug"}]},{"number":31,"title":"[bug:norepro] vague crash","body":"x","labels":[{"name":"o"},{"name":"bug"}]},{"number":32,"title":"[bug:cheat] crash fixed by editing the test","body":"x","labels":[{"name":"o"},{"name":"bug"}]}]' > "$GHS/issues.json"
+restart_d4 O_REPRO=1 O_MERGE_GATE=1 O_AUTO_FILE=0
+rid() { sqlite3 "$TMP4/o.db" "SELECT id FROM issue WHERE company_id='$CIDG' AND fingerprint='gh:$1'"; }
+for _i in $(seq 1 30); do [ -n "$(rid 30)" ] && [ -n "$(rid 31)" ] && [ -n "$(rid 32)" ] && break; sleep 1; done
+IR30="$(rid 30)"; IR31="$(rid 31)"; IR32="$(rid 32)"
+[ -n "$IR30" ] && [ -n "$IR31" ] && [ -n "$IR32" ] || fail "repro: bug issues were not imported"
+rq() { sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='$1' AND target='$2'"; }
+wait_status_at "$BASE4" "$IR30" "Done" 240 || { grep -v '^\[orch\] tick' "$TMP4/daemon.log" | tail -25; fail "repro: a reproduced bug was not fixed and merged"; }
+[ "$(rq repro.ok "$IR30")" = "1" ] && [ "$(rq run.dispatch "$IR30")" = "2" ] || fail "repro: expected one reproducer run then one builder run"
+git -C "$GHS/remote.git" show "main:tests/r_$IR30.sh" >/dev/null 2>&1 && git -C "$GHS/remote.git" show "main:fix_$IR30" >/dev/null 2>&1 || fail "repro: the locked test and the fix did not both merge"
+pass "repro: a bug is reproduced by a locked failing test first, then fixed; both merge"
+wait_status_at "$BASE4" "$IR31" "Failed" 180 || fail "repro: a bug that can't be reproduced was not stopped"
+[ "$(rq repro.cannot "$IR31")" = "1" ] && [ "$(rq repro.fail "$IR31")" = "2" ] || fail "repro: expected two failed reproductions then repro.cannot"
+[ "$(rq run.dispatch "$IR31")" = "2" ] || fail "repro: a builder ran on a bug that was never reproduced"
+for _i in $(seq 1 20); do grep "could not reproduce" "$GHS/comments_31" >/dev/null 2>&1 && break; sleep 0.5; done
+grep "could not reproduce" "$GHS/comments_31" >/dev/null 2>&1 || fail "repro: no 'could not reproduce' note on the GitHub issue"
+pass "repro: a bug that can't be reproduced stops after two reproducer runs, before any build attempt, and says so on GitHub"
+wait_status_at "$BASE4" "$IR32" "Failed" 300 || fail "repro: a builder that edits the locked test was not stopped"
+sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IR32' ORDER BY started_at DESC LIMIT 1" | grep "changes a locked reproducing test" >/dev/null || fail "repro: the locked-test rule was not the reason"
+git -C "$GHS/remote.git" log --oneline main | grep "o/$IR32" >/dev/null && fail "repro: a PR that edits the locked test merged"
+pass "repro: a PR that edits the locked reproducing test is rejected by the gate"
+echo '[]' > "$GHS/issues.json"
+
+# Failure classes (o#59). main's verify.sh learns two failure modes: a box that
+# runs out of disk on the first two runs (ENV_FAIL), and a base that is itself
+# broken (BASE_BROKEN).
+git -C "$SEEDGH" fetch -q origin && git -C "$SEEDGH" checkout -q -B main origin/main
+cat > "$SEEDGH/verify.sh" <<'SH'
+#!/bin/sh
+if [ -f ENV_FAIL ]; then c="$HOME/envcount"; n=$(cat "$c" 2>/dev/null || echo 0); echo $((n + 1)) > "$c"
+  if [ "$n" -lt 2 ]; then echo "write: No space left on device"; exit 1; fi; fi
+if [ -f BASE_BROKEN ]; then echo "FAIL: base is broken (test_widget)"; exit 1; fi
+if [ -f BREAK_VERIFY ]; then echo "BREAK_VERIFY present"; exit 1; fi
+exit 0
+SH
+git -C "$SEEDGH" commit -qam "verify.sh: env and base-broken modes" && git -C "$SEEDGH" push -q origin main
+restart_d4 O_MERGE_GATE=1 O_AUTO_FILE=0 O_ENV_RETRY_S=2
+# environment: re-verified on the same attempt, no builder re-run
+IID_EV="$(gh_issue '[sim:env] the box runs out of disk')"
+wait_status_at "$BASE4" "$IID_EV" "Done" 240 || { grep -v '^\[orch\] tick' "$TMP4/daemon.log" | tail -20; fail "env: an environment failure was not retried to Done"; }
+[ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='verify.env' AND target='$IID_EV'")" = "1" ] || fail "env: verify.env not logged once"
+[ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='run.dispatch' AND target='$IID_EV'")" = "1" ] || fail "env: the builder ran again for an environment failure"
+[ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='verify.fail' AND target='$IID_EV'")" = "0" ] || fail "env: an environment failure was counted against the change"
+pass "env: a verify that fails on the box (no space) re-runs at verify on the same attempt; no builder run, no attempt spent"
+# inherited: base fails the same way, so the change isn't blamed
+git -C "$SEEDGH" fetch -q origin && git -C "$SEEDGH" checkout -q -B main origin/main
+echo broken > "$SEEDGH/BASE_BROKEN"; git -C "$SEEDGH" add BASE_BROKEN && git -C "$SEEDGH" commit -qm "break base" && git -C "$SEEDGH" push -q origin main
+IID_IH="$(gh_issue '[sim:good] change on a broken main')"
+wait_status_at "$BASE4" "$IID_IH" "Done" 240 || { grep -v '^\[orch\] tick' "$TMP4/daemon.log" | tail -20; fail "inherited: a change on a broken main was blamed for main's failure"; }
+[ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='verify.inherited' AND target='$IID_IH'")" -ge 1 ] || fail "inherited: verify.inherited not logged"
+[ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='verify.fail' AND target='$IID_IH'")" = "0" ] || fail "inherited: main's failure was counted against the change"
+pass "inherited: a verify that fails the same way on base goes on to CI and the gate instead of back to the builder"
 
 # ============================================================
 # Agent sandbox — 5th daemon, O_SANDBOX=bwrap + O_API_TOKEN
