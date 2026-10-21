@@ -1936,9 +1936,10 @@ fun classify_red(ws, repo, base, verify_cmd, tail) {
     if (env_failure(tail) == 'true') {
         %{verdict: "red_env", tail: "ENVIRONMENT: the verify failed for reasons outside the change (" ++ env_failure_why(tail) ++ "); it runs again without spending an attempt.\n\n" ++ tail}
     } else {
-        bt = base_verify_tail(ws, repo, base, verify_cmd)
+        # base is only run when the change's failures name something to compare
         mine = fail_lines(tail)
-        if (string_length(bt) > 0 && length(mine) > 0 && Std.all(mine, fn(l) { Std.any(fail_lines(bt), fn(b) { b == l }) }) == 'true') {
+        bt = if (length(mine) == 0) { "" } else { base_verify_tail(ws, repo, base, verify_cmd) }
+        if (string_length(bt) > 0 && Std.all(mine, fn(l) { Std.any(fail_lines(bt), fn(b) { b == l }) }) == 'true') {
             %{verdict: "red_inherited", tail: "INHERITED: " ++ base ++ " fails this verify too, with every failure this change shows; main was already broken.\n\nOn the change:\n" ++ tail ++ "\n\nOn " ++ base ++ ":\n" ++ bt}
         } else {
             %{verdict: "red_tests", tail: tail}
