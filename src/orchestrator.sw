@@ -1597,7 +1597,8 @@ fun sim_marker(title) {
     else { if (string_contains(title, "[sim:del-test]") == 'true') { "del-test" }
     else { if (string_contains(title, "[sim:ci-edit]") == 'true') { "ci-edit" }
     else { if (string_contains(title, "[sim:huge]") == 'true') { "huge" }
-    else { "good" }}}}}}}}}}}}}}}}
+    else { if (string_contains(title, "[sim:skip-test]") == 'true') { "skip-test" }
+    else { "good" }}}}}}}}}}}}}}}}}
 }
 
 # Carry out the marker's action in the worktree. Every case except no-commit
@@ -1645,6 +1646,8 @@ fun sim_act(workspace, issue_id, marker, protected) {
                     sh(f"cd {workspace} && git rm -q tests/existing.sh && git commit -q -m sim-del-test")
                 } else { if (marker == "ci-edit") {
                     sim_commit(workspace, ".github/workflows/ci.yml", "on: push")
+                } else { if (marker == "skip-test") {
+                    sim_commit(workspace, f"tests/w_{issue_id}.sh", "skip(\"flaky on CI\")\nexit 0")
                 } else { if (marker == "huge") {
                     sh(f"cd {workspace} && seq 1 1600 > big_{issue_id}.txt && git add big_{issue_id}.txt && git commit -q -m sim-huge")
                 } else { if (marker == "net-empty") {
@@ -1653,7 +1656,7 @@ fun sim_act(workspace, issue_id, marker, protected) {
                     sh(f"cd {workspace} && git rm -q sim_{issue_id}.txt && git commit -q -m sim-undo")
                 } else {
                     sim_commit(workspace, f"sim_{issue_id}.txt", "ok")
-                }}}}}}}}}}}}
+                }}}}}}}}}}}}}
                 }
             }
         }
@@ -2627,6 +2630,8 @@ fun do_gate(job) {
 # PR passes, else why not. The config comes from the base branch, so a PR
 # can't relax them.
 #   - no deleted test files (test_runners paths, tests/, test/)
+#   - no weakened tests: across test files, no net loss of assertion lines
+#     (assert*/expect*) and no added skip markers
 #   - no changes to CI or the gate's own config (.github/, .o-review.json,
 #     plus .o-review.json "locked_paths")
 #   - at most "max_change_lines" (default 1500) lines added + deleted
@@ -2634,16 +2639,22 @@ fun hard_rules(cfg, rv, files, lines) {
     test_dirs = ["tests/", "test/"] ++ flatten([list_or_empty(map_get(r, "paths")) for r in cfg_list(cfg, "test_runners")])
     gone = lines_of(elem(sh(f"git -C {sq(rv)} diff --no-renames --name-only --diff-filter=D o-base HEAD"), 1))
     gone_tests = [f for f in gone when starts_any_of(f, test_dirs) == 'true']
+    tpaths = Std.join([sq(d) for d in Std.unique(test_dirs)], " ")
+    tdiff = f"git -C {sq(rv)} diff --no-renames -U0 o-base HEAD -- {tpaths}"
+    lost = to_int_or(string_trim(elem(sh(tdiff ++ " | grep -E '^-[^-]' | grep -ciE 'assert|expect'"), 1)), 0) - to_int_or(string_trim(elem(sh(tdiff ++ " | grep -E '^[+][^+]' | grep -ciE 'assert|expect'"), 1)), 0)
+    skips = to_int_or(string_trim(elem(sh(tdiff ++ " | grep -E '^[+][^+]' | grep -cE 'skip[(]|SKIP|@skip|mark[.]skip|[.]Skip[(]|xit[(]|#if 0'"), 1)), 0)
     locked = [f for f in files when starts_any_of(f, [".github/", ".o-review.json"] ++ cfg_list(cfg, "locked_paths")) == 'true']
     lim = map_get(cfg, "max_change_lines")
     max_lines = if (lim == nil) { 1500 } else { lim }
     if (length(gone_tests) > 0) {
         "hard rule: the PR deletes test files (" ++ Std.join(gone_tests, ", ") ++ "). Tests are never deleted to get a change through; fix the code, or change the test in place and say why."
+    } else { if (lost > 0 || skips > 0) {
+        "hard rule: the PR weakens tests (" ++ (if (lost > 0) { to_string(lost) ++ " fewer assertion lines" } else { "" }) ++ (if (lost > 0 && skips > 0) { ", " } else { "" }) ++ (if (skips > 0) { to_string(skips) ++ " added skip markers" } else { "" }) ++ "). Make the code pass the tests; don't loosen them."
     } else { if (length(locked) > 0) {
         "hard rule: the PR changes CI or the gate's own config (" ++ Std.join(locked, ", ") ++ "), which decide whether changes are safe; those stay out of O's reach."
     } else { if (lines > max_lines) {
         "hard rule: the PR changes " ++ to_string(lines) ++ " lines, over the limit of " ++ to_string(max_lines) ++ " (max_change_lines). Split it into smaller PRs that each stand on their own."
-    } else { "" }}}
+    } else { "" }}}}
 }
 
 # A disposable, remote-less clone of the PR head merged with current base, so

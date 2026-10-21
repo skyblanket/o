@@ -591,7 +591,8 @@ pass "rounds: after O_MAX_ROUNDS (3) a retry needs {\"force\": true}"
 # Proof: the all-time track record, from the activity log.
 pr="$(ocurl -s "$BASE/api/proof")"
 [ "$(jget "$pr" 'd["merged_by_o"] >= 1 and d["merges"] == d["merged_by_o"] + d["merged_by_human"] and d["caught_before_merge"] >= 1 and d["human_touches"] >= 1')" = "True" ] || { echo "$pr"; fail "proof: /api/proof does not add up"; }
-pass "proof: GET /api/proof reports merges by O vs humans, escaped defects, human touches and catches"
+[ "$(jget "$pr" '0 < d["resolved_issues"] <= d["merges"] and 0 <= d["first_attempt_pct"] <= 100 and 0 < d["merge_rate_pct"] <= 100 and d["runs_per_resolved_x10"] >= 10 and d["median_cycle_minutes"] >= 0')" = "True" ] || { echo "$pr"; fail "proof: first-attempt, merge-rate, runs-per-resolved or cycle-time figures are off"; }
+pass "proof: GET /api/proof reports merges by O vs humans, escaped defects, human touches, catches, first-attempt success, merge rate, runs per resolved issue and cycle time"
 
 # activity records a pass, a fail, and a completed merge
 body="$(ocurl -s "$BASE/api/activity")"
@@ -1539,14 +1540,15 @@ pass "gate2: modified test passing on base -> note, not REJECT; tier check faili
 IID_HD="$(gh_issue '[sim:del-test] drop a test')"
 IID_HC="$(gh_issue '[sim:ci-edit] touch CI')"
 IID_HH="$(gh_issue '[sim:huge] one giant change')"
-for pair in "$IID_HD:deletes test files (tests/existing.sh)" "$IID_HC:changes CI or the gate's own config (.github/workflows/ci.yml)" "$IID_HH:changes 1600 lines, over the limit of 1500"; do
+IID_HS="$(gh_issue '[sim:skip-test] skip the flaky test')"
+for pair in "$IID_HD:deletes test files (tests/existing.sh)" "$IID_HC:changes CI or the gate's own config (.github/workflows/ci.yml)" "$IID_HH:changes 1600 lines, over the limit of 1500" "$IID_HS:weakens tests (1 added skip markers)"; do
   i="${pair%%:*}"; why="${pair#*:}"
   wait_status_at "$BASE4" "$i" "Failed" 200 || { tail -30 "$TMP4/daemon.log"; fail "hard rules: $i was not stopped ($why)"; }
   sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$i' ORDER BY started_at DESC LIMIT 1" | grep -qF "hard rule: the PR $why" \
     || { sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$i' ORDER BY started_at DESC LIMIT 1"; fail "hard rules: reason missing ($why)"; }
   git -C "$GHS/remote.git" log --oneline main | grep -q "o/$i" && fail "hard rules: $i was merged"
 done
-pass "hard rules: a deleted test, a CI/gate-config change and an oversized PR are rejected before any model runs"
+pass "hard rules: a deleted test, a skipped test, a CI/gate-config change and an oversized PR are rejected before any model runs"
 
 # Gate cache: a check's result is kept by content (tree + command). XC1's merge
 # is refused (main doesn't move), so XC2 is gated on the same base and its

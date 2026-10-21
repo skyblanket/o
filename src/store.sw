@@ -744,7 +744,23 @@ fun proof(db) {
     cents = if (length(rc) == 0) { 0 } else { map_get(hd(rc), "c") }
     runs = if (length(rc) == 0) { 0 } else { map_get(hd(rc), "n") }
     merges = by_o + by_human
+    # per merged issue: when it first merged, how many builder runs it took,
+    # and how long from filing to merge (median)
+    mq = "SELECT a.target AS id, MIN(a.ts) AS mts FROM activity a WHERE a.verb IN ('ci.merged', 'merge.done', 'pr.merged') GROUP BY a.target"
+    first = db_query(db, "SELECT COUNT(*) AS n FROM (" ++ mq ++ ") m WHERE (SELECT COUNT(*) FROM run r WHERE r.issue_id = m.id) = 1", [])
+    resolved = db_query(db, "SELECT COUNT(*) AS n FROM (" ++ mq ++ ") m", [])
+    cyc = db_query(db, "SELECT (m.mts - i.created_at) / 60000 AS d FROM (" ++ mq ++ ") m JOIN issue i ON i.id = m.id ORDER BY d", [])
+    failed = db_query(db, "SELECT COUNT(*) AS n FROM issue WHERE status = 'Failed'", [])
+    nres = if (length(resolved) == 0) { 0 } else { map_get(hd(resolved), "n") }
+    nfirst = if (length(first) == 0) { 0 } else { map_get(hd(first), "n") }
+    nfail = if (length(failed) == 0) { 0 } else { map_get(hd(failed), "n") }
+    median = if (length(cyc) == 0) { 0 } else { map_get(Std.at(cyc, length(cyc) / 2), "d") }
     %{merged_by_o: by_o, merged_by_human: by_human, merges: merges,
+      resolved_issues: nres,
+      first_attempt_pct: (if (nres > 0) { (100 * nfirst) / nres } else { 0 }),
+      runs_per_resolved_x10: (if (nres > 0) { (10 * runs) / nres } else { 0 }),
+      merge_rate_pct: (if (nres + nfail > 0) { (100 * nres) / (nres + nfail) } else { 0 }),
+      median_cycle_minutes: median,
       autonomy_pct: (if (merges > 0) { (100 * by_o) / merges } else { 0 }),
       escaped: escaped, escaped_pct: (if (merges > 0) { (100 * escaped) / merges } else { 0 }),
       human_touches: touches, touches_per_merge_x10: (if (merges > 0) { (10 * touches) / merges } else { 0 }),
