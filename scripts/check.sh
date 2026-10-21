@@ -580,6 +580,11 @@ wait_status "$IID_BAD" "Failed" 120 || fail "retry: the retried issue never ran 
 [ "$(sqlite3 "$TMP/o.db" "SELECT MAX(attempt) FROM run WHERE issue_id='$IID_BAD' AND started_at > (SELECT ts FROM activity WHERE verb='issue.retry' AND target='$IID_BAD')")" -ge 1 ] || fail "retry: no new attempts after the retry"
 pass "retry: POST /api/issues/:id/retry requeues a Failed issue with its last failure and a stronger model; a Done one is refused"
 
+# Proof: the all-time track record, from the activity log.
+pr="$(ocurl -s "$BASE/api/proof")"
+[ "$(jget "$pr" 'd["merged_by_o"] >= 1 and d["merges"] == d["merged_by_o"] + d["merged_by_human"] and d["caught_before_merge"] >= 1 and d["human_touches"] >= 1')" = "True" ] || { echo "$pr"; fail "proof: /api/proof does not add up"; }
+pass "proof: GET /api/proof reports merges by O vs humans, escaped defects, human touches and catches"
+
 # activity records a pass, a fail, and a completed merge
 body="$(ocurl -s "$BASE/api/activity")"
 python3 - "$body" <<'PY' || fail "verify-gate activity missing verify.pass / verify.fail / merge.done"

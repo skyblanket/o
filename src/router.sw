@@ -229,6 +229,7 @@ fun route(db, dbpath, conn, method, path, body) {
         "/api/health" -> respond(conn, 200, json_encode(%{status: "ok", service: "o-v4", version: "v4"}))
         "/api/runs" -> respond(conn, 200, json_encode(Store.runs_all(db)))
         "/api/activity" -> respond(conn, 200, json_encode(Store.activity_recent(db)))
+        "/api/proof" -> respond(conn, 200, json_encode(Store.proof(db)))
         "/api/orchestrator" -> orch_snapshot(conn)
         "/api/orchestrator/drain" -> route_drain(dbpath, conn, method, body)
         "/api/fs" -> route_fs(conn, method, body)
