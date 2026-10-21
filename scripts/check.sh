@@ -1795,6 +1795,7 @@ wait_status_at "$BASE4" "$IID_EV" "Done" 240 || { grep -v '^\[orch\] tick' "$TMP
 [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='verify.fail' AND target='$IID_EV'")" = "0" ] || fail "env: an environment failure was counted against the change"
 pass "env: a verify that fails on the box (no space) re-runs at verify on the same attempt; no builder run, no attempt spent"
 # inherited: base fails the same way, so the change isn't blamed
+git -C "$SEEDGH" fetch -q origin && git -C "$SEEDGH" checkout -q -B main origin/main
 echo broken > "$SEEDGH/BASE_BROKEN"; git -C "$SEEDGH" add BASE_BROKEN && git -C "$SEEDGH" commit -qm "break base" && git -C "$SEEDGH" push -q origin main
 IID_IH="$(gh_issue '[sim:good] change on a broken main')"
 wait_status_at "$BASE4" "$IID_IH" "Done" 240 || { grep -v '^\[orch\] tick' "$TMP4/daemon.log" | tail -20; fail "inherited: a change on a broken main was blamed for main's failure"; }
