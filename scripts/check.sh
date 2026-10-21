@@ -1225,7 +1225,7 @@ method=GET; path=""; head=""; bodyf=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -X) method="$2"; shift ;;
-    -f|-F) case "$2" in head=*) head="${2#head=}" ;; body=@*) bodyf="${2#body=@}" ;; state=*) newstate="${2#state=}" ;; title=*) ititle="${2#title=}" ;; esac; shift ;;
+    -f|-F) case "$2" in head=*) head="${2#head=}" ;; body=@*) bodyf="${2#body=@}" ;; state=*) newstate="${2#state=}" ;; title=*) ititle="${2#title=}" ;; labels*) lname="${2#*=}" ;; esac; shift ;;
     *) path="$1" ;;
   esac
   shift
@@ -1239,12 +1239,17 @@ case "$method $path" in
     case "$path" in *labels=*) lb="${path#*labels=}"; lb="${lb%%&*}" ;; *) lb="" ;; esac
     LB="$lb" python3 -c 'import json,os,sys;lb=os.environ["LB"];d=json.load(open(sys.argv[1]));print(json.dumps([i for i in d if not lb or "labels" not in i or lb in [l["name"] for l in i["labels"]]]))' "$GHS/issues.json" ;;
   "POST repos/acme/widgets/issues/"*/labels)
-    n="${path#repos/acme/widgets/issues/}"; n="${n%/labels}"; touch "$GHS/labeled_$n"
+    n="${path#repos/acme/widgets/issues/}"; n="${n%/labels}"
+    [ "$lname" = needs-human ] && { touch "$GHS/nh_$n"; echo '[]'; exit 0; }
+    touch "$GHS/labeled_$n"
     N="$n" python3 -c 'import json,os,sys;p=sys.argv[1];d=json.load(open(p));[i.setdefault("labels",[]).append({"name":"o"}) for i in d if str(i["number"])==os.environ["N"]];json.dump(d,open(p,"w"))' "$GHS/issues.json"; echo '[]' ;;
   "POST repos/acme/widgets/issues")
     n=$(( 2000 + $(ls "$GHS" | grep -c '^created_') )); echo "$ititle" > "$GHS/created_$n"
     N="$n" T="$ititle" B="$(cat "$bodyf")" python3 -c 'import json,os,sys;p=sys.argv[1];d=json.load(open(p));d.append({"number":int(os.environ["N"]),"title":os.environ["T"],"body":os.environ["B"],"labels":[{"name":"o"}]});json.dump(d,open(p,"w"))' "$GHS/issues.json"
     echo "{\"number\":$n}" ;;
+  "DELETE repos/acme/widgets/issues/"*/labels/*)
+    n="${path#repos/acme/widgets/issues/}"; n="${n%%/labels/*}"; touch "$GHS/unnh_$n"; echo '[]' ;;
+  "GET repos/acme/widgets/issues/comments"*) cat "$GHS/cmts.json" 2>/dev/null || echo '[]' ;;
   "GET repos/acme/widgets/pulls?head="*)
     b="${path#*head=acme:}"; b="${b%%&*}"; n="$(num_for "$b")"
     ma=""; [ -n "$n" ] && [ -f "$GHS/merged_$n" ] && ma=',"merged_at":"2026-01-01T00:00:00Z"'
@@ -1283,7 +1288,7 @@ case "$method $path" in
     sha="$(git -C "$GHS/remote.git" rev-parse "refs/heads/$b" 2>/dev/null)"; echo "$b" > "$GHS/sha_$sha"
     m=false; st=open; [ -f "$GHS/merged_$n" ] && { m=true; st=closed; }; [ -f "$GHS/closed_$n" ] && st=closed
     ms=clean; listed dirty_pr "$b" && ms=dirty
-    echo "{\"number\":$n,\"state\":\"$st\",\"merged\":$m,\"mergeable_state\":\"$ms\",\"head\":{\"sha\":\"$sha\"}}" ;;
+    echo "{\"number\":$n,\"state\":\"$st\",\"merged\":$m,\"mergeable_state\":\"$ms\",\"head\":{\"sha\":\"$sha\",\"ref\":\"$b\"}}" ;;
   "GET repos/acme/widgets/commits/"*/check-runs*)
     sha="${path#repos/acme/widgets/commits/}"; sha="${sha%%/*}"; b="$(cat "$GHS/sha_$sha" 2>/dev/null)"
     n="$(num_for "$b")"; c=success
@@ -1726,8 +1731,8 @@ wait_status_at "$BASE4" "$IID_CIF" "Done" 30 || { grep -v '^\[orch\] tick' "$TMP
 [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='selfcheck.unstranded' AND target='$IID_NF'")" -ge 1 ] || fail "self-check: In Review with a red latest run was not moved to Backlog"
 [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='selfcheck.worktree_repaired' AND target='$IID_EXT'")" = "1" ] || fail "self-check: a broken worktree was not repaired"
 [ -e "$WS_EXT" ] && fail "self-check: the broken worktree is still there"
-for _i in $(seq 1 60); do grep -q "O needs a human" "$GHS/comments_901" 2>/dev/null && break; sleep 1; done
-grep -q "O needs a human" "$GHS/comments_901" 2>/dev/null || { grep -v '^\[orch\] tick' "$TMP4/daemon.log" | tail -20; fail "needs-human: the ask was not posted on GitHub issue #901"; }
+for _i in $(seq 1 60); do grep -q "O needs a person" "$GHS/comments_901" 2>/dev/null && break; sleep 1; done
+grep -q "O needs a person" "$GHS/comments_901" 2>/dev/null || { grep -v '^\[orch\] tick' "$TMP4/daemon.log" | tail -20; fail "needs-human: the ask was not posted on GitHub issue #901"; }
 pass "self-check: merged-while-Failed -> Done, stranded In Review -> Backlog, broken worktree repaired; NEEDS_HUMAN posted on the GitHub issue"
 echo '[]' > "$GHS/issues.json"
 
@@ -1896,6 +1901,67 @@ wait_status_at "$BASE4" "$IID_CU" "Failed" 300 || fail "criteria: an APPROVE wit
 sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_CU' ORDER BY started_at DESC LIMIT 1" | grep "criterion 2: UNCERTAIN" >/dev/null || fail "criteria: the uncertain 'Done when' criterion was not the reason"
 for i in "$IID_CF" "$IID_CU"; do git -C "$GHS/remote.git" log --oneline main | grep "o/$i" >/dev/null && fail "criteria: $i merged without proving its criteria"; done
 pass "criteria: an APPROVE citing a file:line that doesn't exist, or leaving a 'Done when' criterion UNCERTAIN, is a REJECT and never merges"
+# When O needs a person (o#65): one question with evidence and recommended
+# replies, a needs-human label, and `/o` commands from maintainers only. An
+# approval is bound to the PR's head commit.
+echo '[{"number":41,"title":"[sim:needs-human] needs a protected change","body":"x","labels":[{"name":"o"}]},{"number":42,"title":"[sim:bad-verify] keeps failing","body":"x","labels":[{"name":"o"}]}]' > "$GHS/issues.json"
+restart_d4 O_MERGE_GATE=1 O_AUTO_FILE=0 O_ESCALATE_PATHS=sim_ O_DIGEST_S=2
+for _i in $(seq 1 30); do [ -n "$(rid 41)" ] && [ -n "$(rid 42)" ] && break; sleep 1; done
+IH41="$(rid 41)"; IH42="$(rid 42)"
+[ -n "$IH41" ] && [ -n "$IH42" ] || fail "ask: GitHub issues were not imported"
+IHA="$(gh_issue '[sim:good] escalated by path')"
+hq() { sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='$1' AND target='$2'"; }
+add_cmt() {  # issue/PR number, comment id, author association, body
+  python3 -c 'import json,os,sys;p=sys.argv[1];d=json.load(open(p)) if os.path.exists(p) else [];d.insert(0,{"id":int(sys.argv[3]),"issue_url":"https://api.github.com/repos/acme/widgets/issues/"+sys.argv[2],"user":{"login":"u"+sys.argv[3]},"author_association":sys.argv[4],"body":sys.argv[5]});t=p+".tmp";json.dump(d,open(t,"w"));os.replace(t,p)' "$GHS/cmts.json" "$1" "$2" "$3" "$4"
+}
+wait_status_at "$BASE4" "$IH41" "In Review" 120 || fail "ask: needs-human issue did not park"
+wait_status_at "$BASE4" "$IH42" "Failed" 300 || fail "ask: a failing issue did not stop"
+wait_status_at "$BASE4" "$IHA" "In Review" 180 || { grep -v '^\[orch\] tick' "$TMP4/daemon.log" | tail -20; fail "ask: an O_ESCALATE_PATHS change did not park for a person"; }
+NA="$(pr_of "$IHA")"
+for _i in $(seq 1 30); do [ -f "$GHS/nh_41" ] && [ -f "$GHS/nh_42" ] && [ -f "$GHS/nh_$NA" ] && break; sleep 1; done
+for n in 41 42 "$NA"; do
+  grep -q "O needs a person" "$GHS/comments_$n" && grep -q "(recommended)" "$GHS/comments_$n" && grep -q "What O would do" "$GHS/comments_$n" || { cat "$GHS/comments_$n" 2>/dev/null; fail "ask: #$n has no one-question ask with a recommended reply"; }
+  [ -f "$GHS/nh_$n" ] || fail "ask: #$n is not labelled needs-human"
+done
+grep -q "/o retry --model opus" "$GHS/comments_42" || fail "ask: a stopped issue's ask does not offer another round on opus"
+SHA_A="$(git -C "$GHS/remote.git" rev-parse "o/$IHA")"
+grep -q "/o approve ${SHA_A%"${SHA_A#???????}"}" "$GHS/comments_$NA" || { cat "$GHS/comments_$NA"; fail "ask: the parked PR's ask does not name its head commit"; }
+pass "ask: a protected-path stop, a stopped issue and a PR parked for sign-off each get one question (evidence, what O would do, a recommended reply) and the needs-human label"
+add_cmt 42 9101 NONE "/o stop"
+add_cmt 41 9102 OWNER "Thanks.
+/o answer use the config flag instead"
+for _i in $(seq 1 120); do [ "$(hq run.dispatch "$IH41")" -ge 2 ] && break; sleep 1; done
+[ "$(hq run.dispatch "$IH41")" -ge 2 ] || { grep -v '^\[orch\] tick' "$TMP4/daemon.log" | tail -20; fail "commands: /o answer did not start another round"; }
+sqlite3 "$TMP4/o.db" "SELECT body FROM issue WHERE id='$IH41'" | grep -q "use the config flag instead" || fail "commands: the answer did not reach the task"
+for _i in $(seq 1 20); do [ -f "$GHS/unnh_41" ] && break; sleep 0.5; done
+[ -f "$GHS/unnh_41" ] || fail "commands: the needs-human label stayed after the answer"
+grep -q "another round with your answer" "$GHS/comments_41" || fail "commands: /o answer was not acknowledged on GitHub"
+[ "$(hq cmd.stop "$IH42")" = "0" ] && [ "$(sqlite3 "$TMP4/o.db" "SELECT status FROM issue WHERE id='$IH42'")" = "Failed" ] || fail "commands: a non-maintainer's /o stop was applied"
+add_cmt 42 9103 MEMBER "/o stop"
+wait_status_at "$BASE4" "$IH42" "Canceled" 60 || fail "commands: a member's /o stop did not cancel the issue"
+pass "commands: /o answer runs another round with the answer in the task and drops the label; /o stop from a member cancels; a non-maintainer's command is ignored"
+add_cmt "$NA" 9104 OWNER "/o approve 0000000"
+for _i in $(seq 1 60); do [ "$(hq cmd.approve_stale "$IHA")" = "1" ] && break; sleep 1; done
+[ "$(hq cmd.approve_stale "$IHA")" = "1" ] || fail "commands: a stale /o approve was not refused"
+grep -q "has lapsed" "$GHS/comments_$NA" || fail "commands: the stale approval was not explained"
+[ "$(sqlite3 "$TMP4/o.db" "SELECT status FROM issue WHERE id='$IHA'")" = "In Review" ] || fail "commands: a stale approval moved the issue"
+add_cmt "$NA" 9105 COLLABORATOR "/o approve ${SHA_A%"${SHA_A#????????}"}"
+wait_status_at "$BASE4" "$IHA" "Done" 120 || { grep -v '^\[orch\] tick' "$TMP4/daemon.log" | tail -20; fail "commands: /o approve <head> did not merge the parked PR"; }
+git -C "$GHS/remote.git" log --oneline main | grep "o/$IHA" >/dev/null || fail "commands: the approved PR is not on main"
+pass "commands: /o approve of an old commit lapses with a note; /o approve of the PR's head merges exactly that commit"
+wait_status_at "$BASE4" "$IH41" "In Review" 120 || fail "commands: the answered issue did not come back for a person"
+add_cmt 41 9106 OWNER "/o retry --model opus"
+for _i in $(seq 1 120); do [ "$(hq run.dispatch "$IH41")" -ge 3 ] && break; sleep 1; done
+[ "$(hq run.dispatch "$IH41")" -ge 3 ] && [ "$(hq cmd.retry "$IH41")" = "1" ] || fail "commands: /o retry did not start another round"
+grep -q "another round on opus" "$TMP4/.o/escalations/$IH41" || fail "commands: /o retry --model opus did not ask for opus"
+pass "commands: /o retry --model opus starts another round on opus"
+wl="$(ocurl -s "$BASE4/api/waiting")"
+[ "$(jget "$wl" 'len(d) >= 1 and all(d[i]["waiting_since"] <= d[i+1]["waiting_since"] for i in range(len(d)-1))')" = "True" ] || { echo "$wl"; fail "digest: GET /api/waiting is not the waiting list, oldest first"; }
+for _i in $(seq 1 20); do [ -s "$TMP4/.o/digest.md" ] && break; sleep 0.5; done
+grep -q "Waiting on a person" "$TMP4/.o/digest.md" || fail "digest: no daily digest written"
+pass "digest: GET /api/waiting and ~/.o/digest.md list everything waiting on a person, oldest first"
+echo '[]' > "$GHS/issues.json"
+restart_d4 O_MERGE_GATE=1 O_AUTO_FILE=0 O_ENV_RETRY_S=2
 # inherited: base fails the same way, so the change isn't blamed
 git -C "$SEEDGH" fetch -q origin && git -C "$SEEDGH" checkout -q -B main origin/main
 echo broken > "$SEEDGH/BASE_BROKEN"; git -C "$SEEDGH" add BASE_BROKEN && git -C "$SEEDGH" commit -qm "break base" && git -C "$SEEDGH" push -q origin main

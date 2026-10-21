@@ -591,6 +591,9 @@ fun tick_loop(db, dbpath, port, tick_n, running, retry) {
         {'ci_done', run_id, issue_id, outcome, sha, tail} ->
             r = handle_ci_done(db, running, retry, run_id, issue_id, outcome, sha, tail)
             tick_loop(db, dbpath, port, tick_n, map_get(r, "running"), map_get(r, "retry"))
+        {'human_cmd', issue_id, m} ->
+            r = handle_human_cmd(db, running, retry, issue_id, m)
+            tick_loop(db, dbpath, port, tick_n, map_get(r, "running"), map_get(r, "retry"))
         {'pr_state', issue_id, state, num} ->
             r = handle_pr_state(db, running, retry, issue_id, state, num)
             tick_loop(db, dbpath, port, tick_n, map_get(r, "running"), map_get(r, "retry"))
@@ -635,6 +638,7 @@ fun do_tick(db, dbpath, port, tick_n, running, retry) {
     _sc = maybe_self_check(db, tick_n, running)
     _pm = if (quiet) { "" } else { maybe_postmerge(db, now) }
     _pl = if (quiet) { "" } else { maybe_plan(db, now) }
+    _dg = maybe_digest(db, now)
     swept = sweep_stalls(db, map_keys(running), running, retry, now)
     sr = map_get(swept, "running")
     sq = map_get(swept, "retry")
@@ -2455,7 +2459,8 @@ fun maybe_gh_poll(db, tick_n) {
     poll_ms = env_int("O_GH_POLL_S", 60) * 1000
     if ((tick_n * tick_interval()) % poll_ms < tick_interval()) {
         _i = gh_poll_each(Store.companies_with_github(db))
-        review_poll_each(db, Store.issues_in_review(db))
+        _rp = review_poll_each(db, Store.issues_in_review(db))
+        cmd_poll_each(db, Store.companies_with_github(db))
     } else {
         ""
     }
@@ -2776,6 +2781,11 @@ fun handle_ci_done(db, running, retry, run_id, issue_id, outcome, sha, tail) {
             _au = spawn(audit_comment_worker(str_or(map_get(co, "github_repo"), ""), issue_id, audit_text(db, issue_id, sha)))
             %{running: map_remove(running, issue_id), retry: map_remove(retry, issue_id)}
         } else { if (outcome == "in_review") {
+            gh = str_or(map_get(company, "github_repo"), "")
+            prn = map_get(info, "pr")
+            _ask = if (string_length(gh) > 0 && prn != nil && (string_starts_with(tail, "HUMAN") == 'true' || string_starts_with(tail, "UNVERIFIED") == 'true')) {
+                spawn(ask_worker(gh, prn, getenv("HOME") ++ "/.o/gate-ask-" ++ issue_id ++ ".md", gate_ask(tail, str_or(map_get(info, "head"), ""))))
+            } else { "" }
             _v = Store.run_set_verify(db, run_id, "in_review", tail)
             _st = Store.run_set_state(db, run_id, "InReview")
             _is = Store.issue_set_status(db, issue_id, "In Review")
@@ -3499,7 +3509,7 @@ fun review_poll_each(db, rows) {
         last = Store.last_run_for_issue(db, iid)
         parked = if (last == nil) { "" } else { str_or(map_get(last, "verify_output"), "") }
         adoptable = if (merge_gate_enabled() == 'true' && string_starts_with(parked, "CI green on PR") == 'true') { 'true' } else { 'false' }
-        signoff = if (merge_gate_enabled() == 'true' && string_starts_with(parked, "HUMAN:") == 'true') { str_or(map_get(r, "repo"), "") } else { "" }
+        signoff = if (merge_gate_enabled() == 'true' && string_starts_with(parked, "HUMAN:") == 'true' && string_contains(parked, "needs a human sign-off") == 'true') { str_or(map_get(r, "repo"), "") } else { "" }
         _s = spawn(review_poll_worker(self(), iid, map_get(r, "github_repo"), adoptable, signoff))
         review_poll_each(db, tl(rows))
     }
@@ -4745,10 +4755,290 @@ fun persona_confirm_result(db, run, persona, reps, code, text) {
 
 fun str_or_map(m) { if (m == nil) { %{} } else { m } }
 
+# ---- when O needs a person (o#65) ------------------------------
+# O asks one question: the evidence, the suspected cause at file:line, what O
+# would do, and 2-4 replies with the first recommended. The GitHub issue (or
+# PR) gets the `needs-human` label while it waits. On every GitHub poll O reads
+# new comments on waiting issues and their open PRs; a line starting `/o` from
+# the repo's owner, a member or a collaborator (or a login in O_COMMAND_USERS)
+# is acted on:
+#   /o retry [--model M]   another round (M: haiku, sonnet, opus)
+#   /o answer <text>       another round with the answer added to the task
+#   /o approve <sha7>      merge the parked PR, only if its head is that commit
+#   /o stop                cancel the issue
+# Each command is answered on GitHub and applied once. A daily digest
+# (~/.o/digest.md, GET /api/waiting) lists everything waiting, oldest first.
+fun human_ask(question, evidence, would, options) {
+    cause = first_file_line(evidence)
+    ev = string_replace(string_truncate(evidence, 5000), "```", "'''")
+    "**O needs a person.** " ++ question ++ "\n\n**Evidence:**\n\n```\n" ++ ev ++ "\n```\n\n" ++ (if (string_length(cause) > 0) { "**Suspected cause:** `" ++ cause ++ "`\n\n" } else { "" }) ++ "**What O would do:** " ++ would ++ "\n\n**Reply with one line:**\n" ++ Std.join(ask_options(options, 1), "\n") ++ "\n\n_Only replies from this repository's owner, members and collaborators count. An approval names the commit it approves and lapses if the PR's head moves._"
+}
+
+fun ask_options(xs, n) {
+    if (length(xs) == 0) { [] } else { [to_string(n) ++ ". " ++ hd(xs) ++ (if (n == 1) { " **(recommended)**" } else { "" })] ++ ask_options(tl(xs), n + 1) }
+}
+
+# The first "path/file.ext:12" in a text, or "".
+fun first_file_line(text) {
+    ws = flatten([string_split(l, " ") for l in lines_of(text)])
+    hits = [w for w in [strip_punct(x) for x in ws] when looks_file_line(w) == 'true']
+    if (length(hits) == 0) { "" } else { hd(hits) }
+}
+
+fun strip_punct(w) {
+    string_trim(string_replace(string_replace(string_replace(string_replace(string_replace(string_replace(w, "(", ""), ")", ""), ",", ""), ";", ""), "\"", ""), "`", ""))
+}
+
+fun looks_file_line(w) {
+    parts = string_split(w, ":")
+    if (length(parts) < 2) { 'false' } else {
+        p = hd(parts)
+        n = to_int(hd(string_split(Std.nth(parts, 1), "-")))
+        if (n != nil && n > 0 && string_length(p) > 2 && (string_contains(p, ".") == 'true' || string_contains(p, "/") == 'true')) { 'true' } else { 'false' }
+    }
+}
+
+fun nh_label() { "needs-human" }
+
+fun ask_worker(gh_repo, num, path, body) {
+    _x = file_write(path, body)
+    _c = gh_api(f"-X POST repos/{gh_repo}/issues/{num}/comments -F body=@{sq(path)}")
+    gh_api(f"-X POST repos/{gh_repo}/issues/{num}/labels -f {sq("labels[]=" ++ nh_label())}")
+}
+
+fun gate_ask(verdict, head) {
+    sha7 = string_sub(head, 0, 7)
+    human = string_starts_with(verdict, "HUMAN") == 'true'
+    human_ask("The merge gate wants a person's decision on this PR at `" ++ sha7 ++ "`.", verdict,
+        if (human) { "Merge it: the gate approved, and only a person's sign-off is missing." } else { "Nothing until a person decides: the gate could not run the change." },
+        ["`/o approve " ++ sha7 ++ "` merges exactly this commit", "`/o retry` rebuilds it (or `/o answer <what to change>`)", "`/o stop` cancels the issue"])
+}
+
+fun cmd_dir(iid) { getenv("HOME") ++ "/.o/cmd/" ++ iid }
+
+fun issues_waiting_poll(db) {
+    cutoff = timestamp() - 30 * 86400000
+    [r for r in Store.issues_waiting(db) when string_length(str_or(map_get(r, "github_repo"), "")) > 0 && map_get(r, "updated_at") != nil && map_get(r, "updated_at") >= cutoff]
+}
+
+# One call per repo per poll: the repo's newest comments (issues and PRs),
+# newer than the last one seen. The first poll only records where to start.
+fun cmd_poll_each(db, cos) {
+    if (length(cos) == 0) { "" } else {
+        c = hd(cos)
+        cid = map_get(c, "id")
+        waiting = [%{id: map_get(r, "id"), inum: gh_num(str_or(map_get(r, "fingerprint"), ""))} for r in issues_waiting_poll(db) when map_get(r, "company_id") == cid]
+        _s = if (length(waiting) == 0) { "" } else { spawn(cmd_poll_worker(self(), cid, map_get(c, "github_repo"), waiting)) }
+        cmd_poll_each(db, tl(cos))
+    }
+}
+
+fun gh_num(fp) { if (string_starts_with(fp, "gh:") == 'true') { to_int_or(string_sub(fp, 3, string_length(fp) - 3), 0) } else { 0 } }
+
+fun cmd_poll_worker(orch, cid, gh_repo, waiting) {
+    seenp = cmd_dir("c-" ++ cid) ++ "/seen"
+    first = file_exists(seenp) == 'false'
+    seen = if (first) { 0 } else { to_int_or(string_trim(file_read(seenp)), 0) }
+    got = gh_json(sq(f"repos/{gh_repo}/issues/comments?sort=created&direction=desc&per_page=100"))
+    cs = if (got == nil) { [] } else { [c for c in got when map_get(c, "id") != nil && map_get(c, "id") > seen] }
+    cmds = if (first) { [] } else { [c for c in cs when cmd_allowed(c) == 'true' && string_length(cmd_line(str_or(map_get(c, "body"), ""))) > 0] }
+    _s = [cmd_route(orch, gh_repo, waiting, c) for c in Std.reverse(cmds)]
+    if (got == nil || (length(cs) == 0 && file_exists(seenp) == 'true')) { "" } else {
+        _m = sh(f"mkdir -p {sq(cmd_dir("c-" ++ cid))}")
+        file_write(seenp, to_string(max_id(cs, seen)))
+    }
+}
+
+# A command on issue/PR #n: find the waiting issue it is about (its GitHub
+# issue, or the PR on its o/<id> branch) and the PR's current head.
+fun cmd_route(orch, gh_repo, waiting, c) {
+    n = to_int_or(Std.last(string_split(str_or(map_get(c, "issue_url"), ""), "/")), 0)
+    by_issue = [w for w in waiting when map_get(w, "inum") == n && n > 0]
+    owner = hd(string_split(gh_repo, "/"))
+    target = if (length(by_issue) > 0) {
+        iid = map_get(hd(by_issue), "id")
+        prs = gh_json(sq(f"repos/{gh_repo}/pulls?head={owner}:o/{iid}&state=open"))
+        pn = if (prs == nil) { 0 } else { if (length(prs) == 0) { 0 } else { map_get(hd(prs), "number") } }
+        %{id: iid, inum: n, pr: pn, head: (if (pn > 0) { pr_head(gh_repo, pn) } else { "" })}
+    } else {
+        pr = if (n > 0) { gh_json(f"repos/{gh_repo}/pulls/{n}") } else { nil }
+        h = if (pr == nil) { nil } else { map_get(pr, "head") }
+        ref = if (h == nil) { "" } else { str_or(map_get(h, "ref"), "") }
+        hit = [w for w in waiting when string_length(ref) > 2 && ref == "o/" ++ map_get(w, "id")]
+        if (length(hit) == 0 || str_or(map_get(pr, "state"), "") != "open") { nil } else { %{id: map_get(hd(hit), "id"), inum: map_get(hd(hit), "inum"), pr: n, head: str_or(map_get(h, "sha"), "")} }
+    }
+    if (target == nil) { "" } else {
+        send(orch, {'human_cmd', map_get(target, "id"), %{line: cmd_line(str_or(map_get(c, "body"), "")), who: str_or(map_get(map_get(c, "user"), "login"), ""), cmt: map_get(c, "id"), where: n, pr: map_get(target, "pr"), inum: map_get(target, "inum"), head: map_get(target, "head")}})
+    }
+}
+
+fun max_id(cs, acc) {
+    if (length(cs) == 0) { acc } else { i = map_get(hd(cs), "id"); max_id(tl(cs), if (i > acc) { i } else { acc }) }
+}
+
+fun pr_head(gh_repo, num) {
+    pr = gh_json(f"repos/{gh_repo}/pulls/{num}")
+    h = if (pr == nil) { nil } else { map_get(pr, "head") }
+    if (h == nil) { "" } else { str_or(map_get(h, "sha"), "") }
+}
+
+# The first line of a comment that is a command ("/o ..."), or "".
+fun cmd_line(body) {
+    ls = [string_trim(string_replace(l, "`", "")) for l in string_split(body, "\n")]
+    hits = [l for l in ls when string_starts_with(l, "/o ") == 'true']
+    if (length(hits) == 0) { "" } else { hd(hits) }
+}
+
+fun cmd_allowed(c) {
+    assoc = str_or(map_get(c, "author_association"), "")
+    login = str_or(map_get(map_get(c, "user"), "login"), "")
+    extra = str_or(getenv("O_COMMAND_USERS"), "")
+    if (assoc == "OWNER" || assoc == "MEMBER" || assoc == "COLLABORATOR") { 'true' }
+    else { if (string_length(login) > 0 && Std.any(string_split(extra, ","), fn(u) { string_trim(u) == login })) { 'true' } else { 'false' } }
+}
+
+fun cmd_model(arg) {
+    ws = [w for w in string_split(arg, " ") when string_length(w) > 0]
+    pick = model_after(ws)
+    if (pick == "haiku" || pick == "sonnet" || pick == "opus") { pick } else { "" }
+}
+
+fun model_after(ws) {
+    if (length(ws) < 2) { "" } else { if (hd(ws) == "--model") { string_lower(hd(tl(ws))) } else { model_after(tl(ws)) } }
+}
+
+fun handle_human_cmd(db, running, retry, iid, m) {
+    done = cmd_dir(iid) ++ "/done-" ++ to_string(map_get(m, "cmt"))
+    issue = Store.issue_row(db, iid)
+    if (issue == nil || file_exists(done) == 'true') { %{running: running, retry: retry} } else {
+        _d = sh(f"mkdir -p {sq(cmd_dir(iid))}")
+        _w = file_write(done, "")
+        cid = map_get(issue, "company_id")
+        gh = str_or(map_get(Store.company_row(db, cid), "github_repo"), "")
+        st = str_or(map_get(issue, "status"), "")
+        line = map_get(m, "line")
+        who = map_get(m, "who")
+        where = map_get(m, "where")
+        prnum = map_get(m, "pr")
+        head = map_get(m, "head")
+        rest = string_trim(string_sub(line, 2, string_length(line) - 2))
+        verb = string_lower(hd(string_split(rest, " ")))
+        arg = string_trim(string_sub(rest, string_length(verb), string_length(rest) - string_length(verb)))
+        labelled = Std.unique([n for n in [where, prnum, map_get(m, "inum")] when n > 0])
+        rp = cmd_dir(iid) ++ "/reply-" ++ to_string(map_get(m, "cmt")) ++ ".md"
+        said = "@" ++ who ++ " `" ++ line ++ "`: "
+        if (map_has_key(running, iid) == 'true' || (st != "In Review" && st != "Failed")) {
+            _a = Store.log_activity(db, cid, "github", "cmd.ignored", iid)
+            _r = spawn(cmd_reply_worker(gh, where, rp, said ++ "not applied; O is not waiting on a person for this issue (it is " ++ st ++ ").", []))
+            %{running: running, retry: retry}
+        } else { if (verb == "retry" || (verb == "answer" && string_length(arg) > 0)) {
+            model = if (verb == "retry") { cmd_model(arg) } else { "" }
+            answer = if (verb == "answer") { "A maintainer (@" ++ who ++ ") answered O's question:\n\n" ++ arg } else { "" }
+            _q = requeue_round(db, iid, model, answer, "github")
+            _a = Store.log_activity(db, cid, "github", "cmd." ++ verb, iid)
+            _r = spawn(cmd_reply_worker(gh, where, rp, said ++ "O is starting another round" ++ (if (string_length(model) > 0) { " on " ++ model } else { "" }) ++ (if (verb == "answer") { " with your answer in the task" } else { "" }) ++ ".", labelled))
+            %{running: running, retry: map_remove(retry, iid)}
+        } else { if (verb == "approve") {
+            sha7 = hd(string_split(arg, " "))
+            fresh = st == "In Review" && prnum > 0 && string_length(head) >= 7 && string_length(sha7) >= 7 && string_starts_with(head, sha7) == 'true'
+            if (fresh) {
+                _a = Store.log_activity(db, cid, "github", "cmd.approve", iid)
+                _r = spawn(cmd_reply_worker(gh, where, rp, said ++ "approved; O is merging PR #" ++ to_string(prnum) ++ " at `" ++ string_sub(head, 0, 7) ++ "`.", labelled))
+                approve_merge(db, running, retry, issue, gh, prnum, head)
+            } else {
+                _a = Store.log_activity(db, cid, "github", "cmd.approve_stale", iid)
+                why = if (prnum == 0 || st != "In Review") { "there is no PR waiting for an approval" } else { "the PR's head is now `" ++ string_sub(head, 0, 7) ++ "`, so an approval of `" ++ sha7 ++ "` has lapsed. Review the new commit and approve it by its sha" }
+                _r = spawn(cmd_reply_worker(gh, where, rp, said ++ "not applied: " ++ why ++ ".", []))
+                %{running: running, retry: retry}
+            }
+        } else { if (verb == "stop") {
+            _s = Store.issue_set_status(db, iid, "Canceled")
+            _a = Store.log_activity(db, cid, "github", "cmd.stop", iid)
+            _r = spawn(cmd_reply_worker(gh, where, rp, said ++ "O has stopped work on this issue.", labelled))
+            %{running: running, retry: map_remove(retry, iid)}
+        } else {
+            _r = spawn(cmd_reply_worker(gh, where, rp, said ++ "not a command O knows. Use `/o retry [--model opus]`, `/o answer <text>`, `/o approve <sha7>` or `/o stop`.", []))
+            %{running: running, retry: retry}
+        }}}}
+    }
+}
+
+# A person approved the parked PR at its current head: merge exactly that
+# commit (pinned; a head that moves meanwhile parks it again).
+fun approve_merge(db, running, retry, issue, gh, prnum, head) {
+    iid = map_get(issue, "id")
+    last = Store.last_run_for_issue(db, iid)
+    run_id = if (last == nil) { "" } else { map_get(last, "id") }
+    now = timestamp()
+    _i = Store.issue_set_status(db, iid, "Verifying")
+    _r = Store.run_set_state(db, run_id, "Verifying")
+    mpid = spawn(merge_worker(self(), run_id, iid, gh, f"o/{iid}", prnum, head))
+    ws = getenv("HOME") ++ "/.o/workspaces/" ++ iid
+    info = %{run_id: run_id, worker_pid: mpid, started_at: now, attempt: (if (last == nil) { 1 } else { map_get(last, "attempt") }), company_id: map_get(issue, "company_id"), agent_id: map_get(issue, "assignee_agent_id"), phase: 'ci', workspace: ws, pr: prnum, head: head}
+    %{running: map_put(running, iid, info), retry: map_remove(retry, iid)}
+}
+
+fun cmd_reply_worker(gh_repo, num, path, text, unlabel) {
+    _x = file_write(path, text)
+    _c = gh_api(f"-X POST repos/{gh_repo}/issues/{num}/comments -F body=@{sq(path)}")
+    [gh_api(f"-X DELETE repos/{gh_repo}/issues/{n}/labels/{nh_label()}") for n in unlabel]
+}
+
+# Another round for an issue a person sent back (POST /api/issues/:id/retry,
+# `/o retry`, `/o answer`): the model they asked for, the last failure and any
+# answer added to the task, then back to Backlog.
+fun requeue_round(db, id, model, answer, actor) {
+    cur = Store.issue_row(db, id)
+    want = if (string_length(model) > 0) { ladder_rung(model) } else { 1 }
+    _e = escalate_n(id, want - 1 - escalations(id), model)
+    last = Store.last_run_for_issue(db, id)
+    vs = if (last == nil) { "" } else { str_or(map_get(last, "verify_state"), "") }
+    vo = if (last == nil) { "" } else { str_or(map_get(last, "verify_output"), "") }
+    note = if (string_length(vs) == 0 && string_length(vo) == 0) { "" } else {
+        "\n\n---\nAn earlier round of this issue failed (" ++ (if (string_length(vs) > 0) { vs } else { "run died" }) ++ "):\n\n" ++ string_truncate(vo, 3000) ++ "\n\nStart from that: don't repeat what failed."
+    }
+    _b = if (string_length(note) > 0) { Store.issue_append_body(db, id, note) } else { "" }
+    _ab = if (string_length(answer) > 0) { Store.issue_append_body(db, id, "\n\n---\n" ++ answer) } else { "" }
+    _u = Store.issue_update(db, id, "Backlog", map_get(cur, "priority"), map_get(cur, "assignee_agent_id"))
+    Store.log_activity(db, map_get(cur, "company_id"), actor, "issue.retry", id)
+}
+
+fun escalate_n(id, n, model) {
+    if (n <= 0) { "" } else {
+        _r = record_escalation(id, "ESCALATE: the operator asked for another round on " ++ model ++ "; read the earlier failure in the task before changing anything.")
+        escalate_n(id, n - 1, model)
+    }
+}
+
+# Everything waiting on a person, oldest first (GET /api/waiting, the digest).
+fun waiting_list(db) {
+    now = timestamp()
+    [waiting_row(db, r, now) for r in Store.issues_waiting(db)]
+}
+
+fun waiting_row(db, r, now) {
+    last = Store.last_run_for_issue(db, map_get(r, "id"))
+    since = if (map_get(r, "updated_at") == nil) { now } else { map_get(r, "updated_at") }
+    %{id: map_get(r, "id"), identifier: str_or(map_get(r, "identifier"), ""), title: str_or(map_get(r, "title"), ""), status: str_or(map_get(r, "status"), ""), github_repo: str_or(map_get(r, "github_repo"), ""), fingerprint: str_or(map_get(r, "fingerprint"), ""), waiting_since: since, waiting_hours: (now - since) / 3600000, reason: (if (last == nil) { "" } else { first_line(str_or(map_get(last, "verify_output"), "")) })}
+}
+
+fun maybe_digest(db, now) {
+    every = env_int("O_DIGEST_S", 86400) * 1000
+    f = getenv("HOME") ++ "/.o/digest.started"
+    last = if (file_exists(f) == 'true') { to_int_or(string_trim(file_read(f)), 0) } else { 0 }
+    if (every <= 0 || now - last < every) { "" } else {
+        _w = file_write(f, to_string(now))
+        ws = waiting_list(db)
+        lines = ["- " ++ to_string(map_get(w, "waiting_hours")) ++ "h  " ++ map_get(w, "identifier") ++ " " ++ map_get(w, "title") ++ " (" ++ map_get(w, "status") ++ (if (string_starts_with(map_get(w, "fingerprint"), "gh:") == 'true') { ", " ++ map_get(w, "github_repo") ++ "#" ++ string_sub(map_get(w, "fingerprint"), 3, string_length(map_get(w, "fingerprint")) - 3) } else { "" }) ++ "): " ++ map_get(w, "reason") for w in ws]
+        file_write(getenv("HOME") ++ "/.o/digest.md", "# Waiting on a person (" ++ to_string(length(ws)) ++ "), oldest first\n\n" ++ (if (length(ws) == 0) { "Nothing.\n" } else { Std.join(lines, "\n") ++ "\n" }))
+    }
+}
+
 fun needs_human_comment_worker(gh_repo, num, issue_id, ask) {
     path = getenv("HOME") ++ "/.o/needs-human-" ++ issue_id ++ ".md"
-    _x = file_write(path, "**O needs a human here.** The fix touches a protected path, which only a maintainer may change. The builder asks:\n\n" ++ string_truncate(ask, 6000) ++ "\n\nMake that change (or say how), then move the issue back to Backlog in O.")
-    gh_api(f"-X POST repos/{gh_repo}/issues/{num}/comments -F body=@{sq(path)}")
+    ask_worker(gh_repo, num, path, human_ask("The fix needs a change to a protected path, which only a maintainer may make.", ask,
+        "Wait for that change, then build the fix on top of it.",
+        ["make the change (or merge it), then `/o retry`", "`/o answer <how to do it without that file>` starts another round with your answer", "`/o stop` cancels the issue"]))
 }
 
 # One line per graded attempt: "attempt 2: red_verify: <first line of why>".
@@ -4766,8 +5056,9 @@ fun first_line(text) {
 
 fun stopped_comment_worker(gh_repo, num, issue_id, tried) {
     path = getenv("HOME") ++ "/.o/stopped-" ++ issue_id ++ ".md"
-    _x = file_write(path, "**O stopped on this issue** after its attempts ran out; nothing was merged. What it tried:\n\n" ++ string_truncate(tried, 6000) ++ "\n\nAnother round (`POST /api/issues/" ++ issue_id ++ "/retry`) starts from this history and reuses the same PR.")
-    gh_api(f"-X POST repos/{gh_repo}/issues/{num}/comments -F body=@{sq(path)}")
+    ask_worker(gh_repo, num, path, human_ask("O stopped on this issue; nothing was merged. Should it try again?", tried,
+        "One more round on the strongest model, starting from this history (the same PR is reused).",
+        ["`/o retry --model opus` runs one more round on opus", "`/o answer <a hint>` runs another round with your hint in the task", "`/o stop` cancels the issue"]))
 }
 
 fun confirm_comment_worker(gh_repo, num, name) {

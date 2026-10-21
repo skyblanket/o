@@ -153,6 +153,22 @@ O edits real repositories on its own. The guard rails are the point.
   regresses the base (post-merge verify goes red, and stays red on a re-run so a
   single flaky test doesn't count), O reverts the merge on the base branch and
   **keeps the branch** for forensics.
+- **When O needs a person, it asks one question.** When O stops for a person
+  (a protected file, attempts used up, a PR whose tier needs a sign-off), it
+  posts one comment with the evidence, the suspected cause at `file:line`,
+  what O would do, and 2-4 replies, the first one recommended. The issue or
+  PR gets the `needs-human` label while it waits. A reply is a line starting
+  with `/o` from the repo's owner, a member or a collaborator (or a login in
+  `O_COMMAND_USERS`):
+  - `/o retry [--model opus]` runs another round.
+  - `/o answer <text>` runs another round with the answer added to the task.
+  - `/o approve <sha7>` merges the parked PR, but only if its head is still
+    that commit. An approval of an older commit lapses with a note.
+  - `/o stop` cancels the issue.
+
+  O answers each command on GitHub and applies it once. `GET /api/waiting`
+  and a daily `~/.o/digest.md` list everything waiting on a person, oldest
+  first.
 - **Acceptance criteria need proof.** When an issue has a checklist (`- [ ]`)
   or a "Done when" list, the merge gate must answer each item `PASS`, `FAIL` or
   `UNCERTAIN` with evidence. O checks the evidence itself: an approval stands
@@ -462,6 +478,8 @@ The daemon reads its configuration from the environment. All are optional.
 | `O_MODEL_LADDER` | `haiku,sonnet,opus` | builder models. Every issue starts on the first, unless a `.o-review.json` tier names a stronger `builder` (e.g. `"builder": "sonnet"` on the runtime tier): an issue whose text names one of that tier's paths, or whose earlier attempt touched them, starts there. Retries stay on the same model, with the verdict in the prompt. A run moves up one rung only when the agent itself ends it with `ESCALATE: <why>`. An agent's own `model` overrides the ladder; `""` uses the CLI default. |
 | `O_AUTOMERGE_OWNERS` | unset (no limit) | comma-separated GitHub owners O may merge into. Any other repo is PR-only: O opens, verifies and gates the PR, and its maintainers merge (a gate APPROVE parks it In Review). Set it before pointing O at repos you don't own. |
 | `O_AUTO_FILE` | on | when an issue fails for good, O files a "Fix failing verification" follow-up (one level deep). `0` turns it off: the failed issue waits for a human. Revert follow-ups (main regressed) are always filed. |
+| `O_COMMAND_USERS` | _(empty)_ | extra GitHub logins whose `/o` commands count, besides the repo's owner, members and collaborators. |
+| `O_DIGEST_S` | `86400` | how often O writes `~/.o/digest.md`, the list of everything waiting on a person. |
 | `O_VERIFY_RETRY` | `1` | a failed verify is re-run once before it counts. Fail-then-pass is logged `verify.flaky` and ships with no retry. `0` turns it off. |
 | `O_REVIEW_MODEL` | `sonnet` | model for the pre-PR reviewer. |
 | `O_GH_BIN` | `gh` on `PATH` | GitHub CLI used for issue import and PRs. |
