@@ -104,6 +104,11 @@ fun companies_with_github(db) {
     db_query(db, "SELECT id, github_repo FROM company WHERE status = 'active' AND github_repo != ''", [])
 }
 
+# PR-mode companies: the ones whose main the post-merge check watches.
+fun companies_pr_mode(db) {
+    db_query(db, "SELECT id, repo, github_repo, verify_cmd FROM company WHERE status = 'active' AND ship = 'pr' AND github_repo != '' AND repo != ''", [])
+}
+
 fun company_add_spend(db, id, cents) {
     _u = db_query(db, "UPDATE company SET spent_cents = spent_cents + CAST(ROUND(?) AS INTEGER), spent_today_cents = spent_today_cents + CAST(ROUND(?) AS INTEGER), updated_at = ? WHERE id = ?", [cents, cents, timestamp(), id])
     id

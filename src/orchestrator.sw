@@ -598,6 +598,9 @@ fun tick_loop(db, dbpath, port, tick_n, running, retry) {
         {'merge_done', run_id, issue_id, outcome, merge_sha, tail} ->
             r = handle_merge_done(db, running, retry, run_id, issue_id, outcome, merge_sha, tail)
             tick_loop(db, dbpath, port, tick_n, map_get(r, "running"), map_get(r, "retry"))
+        {'postmerge', company_id, outcome, res} ->
+            _pm = handle_postmerge(db, company_id, outcome, res)
+            tick_loop(db, dbpath, port, tick_n, running, retry)
         {'reflect_done', company_id, cost} ->
             _rd = handle_reflect_done(db, company_id, cost)
             tick_loop(db, dbpath, port, tick_n, running, retry)
@@ -619,6 +622,7 @@ fun do_tick(db, dbpath, port, tick_n, running, retry) {
     _pc = maybe_persona_confirm(db, dbpath, port, now)
     _gh = maybe_gh_poll(db, tick_n)
     _sc = maybe_self_check(db, tick_n, running)
+    _pm = maybe_postmerge(db, now)
     swept = sweep_stalls(db, map_keys(running), running, retry, now)
     sr = map_get(swept, "running")
     sq = map_get(swept, "retry")
@@ -1586,7 +1590,10 @@ fun sim_marker(title) {
     else { if (string_contains(title, "[sim:ext-ok]") == 'true') { "ext-ok" }
     else { if (string_contains(title, "[sim:ext-broken]") == 'true') { "ext-broken" }
     else { if (string_contains(title, "[sim:net-empty]") == 'true') { "net-empty" }
-    else { "good" }}}}}}}}}}}}}
+    else { if (string_contains(title, "[sim:del-test]") == 'true') { "del-test" }
+    else { if (string_contains(title, "[sim:ci-edit]") == 'true') { "ci-edit" }
+    else { if (string_contains(title, "[sim:huge]") == 'true') { "huge" }
+    else { "good" }}}}}}}}}}}}}}}}
 }
 
 # Carry out the marker's action in the worktree. Every case except no-commit
@@ -1630,13 +1637,19 @@ fun sim_act(workspace, issue_id, marker, protected) {
                     sim_commit(workspace, f"ext/ok_{issue_id}.txt", "fine")
                 } else { if (marker == "ext-broken") {
                     sim_commit(workspace, "ext/broken", "breaks the ext tier check")
+                } else { if (marker == "del-test") {
+                    sh(f"cd {workspace} && git rm -q tests/existing.sh && git commit -q -m sim-del-test")
+                } else { if (marker == "ci-edit") {
+                    sim_commit(workspace, ".github/workflows/ci.yml", "on: push")
+                } else { if (marker == "huge") {
+                    sh(f"cd {workspace} && seq 1 1600 > big_{issue_id}.txt && git add big_{issue_id}.txt && git commit -q -m sim-huge")
                 } else { if (marker == "net-empty") {
                     # two commits that cancel out: commits exist, no net change
                     _c = sim_commit(workspace, f"sim_{issue_id}.txt", "ok")
                     sh(f"cd {workspace} && git rm -q sim_{issue_id}.txt && git commit -q -m sim-undo")
                 } else {
                     sim_commit(workspace, f"sim_{issue_id}.txt", "ok")
-                }}}}}}}}}
+                }}}}}}}}}}}}
                 }
             }
         }
@@ -2583,6 +2596,11 @@ fun do_gate(job) {
             # An empty PR: nothing to review, so no model is paid for it.
             gate_result(job, "REJECT: the PR makes no change against " ++ base ++ " (its commits net out to nothing).", "", "", "", map_get(job, "session"), 0)
         } else {
+        broken = hard_rules(cfg, rv, files, lines)
+        if (string_length(broken) > 0) {
+            # A hard rule: no model may wave this through, so none is asked.
+            gate_result(job, "REJECT: " ++ broken, "", "", "", map_get(job, "session"), 0)
+        } else {
         tier = pr_tier(cfg, files)
         new_files = lines_of(elem(sh(f"git -C {sq(rv)} diff --no-renames --name-only --diff-filter=A o-base HEAD"), 1))
         steps = mechanical_steps(cfg, rv, f"{dir}/pr-base", added, new_files, tier, tree_of(rv, "HEAD"), tree_of(rv, "o-base"))
@@ -2596,7 +2614,32 @@ fun do_gate(job) {
             gate_model_review(map_put(job, "model", map_get(tier, "gate_model")), cfg, rv, files, lines, numstat, tier, evidence)
         }
         }
+        }
     }
+}
+
+# Hard rules, checked before any step or model: what no reviewer may wave
+# through, so they hold once O makes the final call on every tier. "" when the
+# PR passes, else why not. The config comes from the base branch, so a PR
+# can't relax them.
+#   - no deleted test files (test_runners paths, tests/, test/)
+#   - no changes to CI or the gate's own config (.github/, .o-review.json,
+#     plus .o-review.json "locked_paths")
+#   - at most "max_change_lines" (default 1500) lines added + deleted
+fun hard_rules(cfg, rv, files, lines) {
+    test_dirs = ["tests/", "test/"] ++ flatten([list_or_empty(map_get(r, "paths")) for r in cfg_list(cfg, "test_runners")])
+    gone = lines_of(elem(sh(f"git -C {sq(rv)} diff --no-renames --name-only --diff-filter=D o-base HEAD"), 1))
+    gone_tests = [f for f in gone when starts_any_of(f, test_dirs) == 'true']
+    locked = [f for f in files when starts_any_of(f, [".github/", ".o-review.json"] ++ cfg_list(cfg, "locked_paths")) == 'true']
+    lim = map_get(cfg, "max_change_lines")
+    max_lines = if (lim == nil) { 1500 } else { lim }
+    if (length(gone_tests) > 0) {
+        "hard rule: the PR deletes test files (" ++ Std.join(gone_tests, ", ") ++ "). Tests are never deleted to get a change through; fix the code, or change the test in place and say why."
+    } else { if (length(locked) > 0) {
+        "hard rule: the PR changes CI or the gate's own config (" ++ Std.join(locked, ", ") ++ "), which decide whether changes are safe; those stay out of O's reach."
+    } else { if (lines > max_lines) {
+        "hard rule: the PR changes " ++ to_string(lines) ++ " lines, over the limit of " ++ to_string(max_lines) ++ " (max_change_lines). Split it into smaller PRs that each stand on their own."
+    } else { "" }}}
 }
 
 # A disposable, remote-less clone of the PR head merged with current base, so
@@ -3053,6 +3096,187 @@ fun review_poll_worker(orch, issue_id, gh_repo, adoptable) {
             ""
         }}}}
     }
+}
+
+# ---- post-merge check (PR mode) -----------------------------------
+# The gate judges one PR; this judges what they did together. Every
+# O_POSTMERGE_S (default 86400; 0 = off), for each PR-mode company whose main
+# moved since the last green check: build + suite + every tier's extras on a
+# fresh clone of main, isolated like a verify. Red twice -> bisect the merges
+# since the last green commit, revert the culprit in a PR that O merges once
+# its checks pass, and send its issue back. State is files under
+# ~/.o/postmerge/<company>: green (last green sha), started, done.
+fun pm_dir(cid) { getenv("HOME") ++ "/.o/postmerge/" ++ cid }
+
+fun pm_get(cid, k) {
+    f = pm_dir(cid) ++ "/" ++ k
+    if (file_exists(f) == 'true') { string_trim(file_read(f)) } else { "" }
+}
+
+fun pm_put(cid, k, v) {
+    _m = sh(f"mkdir -p {sq(pm_dir(cid))}")
+    file_write(pm_dir(cid) ++ "/" ++ k, v)
+}
+
+fun maybe_postmerge(db, now) {
+    every = env_int("O_POSTMERGE_S", 86400) * 1000
+    if (every <= 0) { "" } else { postmerge_each(Store.companies_pr_mode(db), now, every) }
+}
+
+fun postmerge_each(rows, now, every) {
+    if (length(rows) == 0) { "" } else {
+        c = hd(rows)
+        cid = map_get(c, "id")
+        started = to_int_or(pm_get(cid, "started"), 0)
+        done = to_int_or(pm_get(cid, "done"), 0)
+        # in flight unless it reported back; a run that died with the daemon
+        # frees the slot after O_POSTMERGE_TIMEOUT_S plus an hour
+        busy = started > done && now - started < (postmerge_timeout_s() + 3600) * 1000
+        _s = if (busy || now - started < every) { "" } else {
+            _w = pm_put(cid, "started", to_string(now))
+            spawn(postmerge_worker(self(), cid, map_get(c, "repo"), map_get(c, "github_repo"), str_or(map_get(c, "verify_cmd"), ""), pm_get(cid, "green")))
+        }
+        postmerge_each(tl(rows), now, every)
+    }
+}
+
+fun to_int_or(v, d) {
+    if (string_length(v) == 0) { d } else { n = to_int(v); if (n == nil) { d } else { n } }
+}
+
+fun postmerge_timeout_s() { env_int("O_POSTMERGE_TIMEOUT_S", 7200) }
+
+# The check's steps: build, suite, then every tier's extras; the company's
+# verify_cmd when the repo has no .o-review.json.
+fun postmerge_steps(cfg, verify_cmd) {
+    steps = Std.unique([cfg_str(cfg, "build"), cfg_str(cfg, "suite")] ++ flatten([list_or_empty(map_get(t, "extra")) for t in cfg_list(cfg, "tiers")]))
+    parts = [x for x in steps when string_length(x) > 0]
+    if (length(parts) == 0 && string_length(verify_cmd) > 0) { [verify_cmd] } else { parts }
+}
+
+# Steps are judged one by one against the last green check: only a step that
+# passed there and fails now (twice) is a break. A step that was already red
+# on main (a known failure) can't hold the check red forever. The first run
+# just records the baseline.
+fun postmerge_worker(orch, cid, repo, gh_repo, verify_cmd, green) {
+    base = detect_base(repo)
+    _f = sh(f"git -C {sq(repo)} fetch -q origin {base}")
+    head = string_trim(elem(sh(f"git -C {sq(repo)} rev-parse origin/{base}"), 1))
+    if (string_length(head) == 0 || head == green) {
+        send(orch, {'postmerge', cid, "same", %{sha: head}})
+    } else {
+        dir = pm_dir(cid) ++ "/main"
+        cl = sh(f"rm -rf {sq(dir)} && git clone -q --no-hardlinks {sq(repo)} {sq(dir)} && git -C {sq(dir)} fetch -q origin refs/remotes/origin/{base}:refs/heads/pm-head && git -C {sq(dir)} checkout -q --detach {head}")
+        cfg = review_config(repo, "origin/" ++ base)
+        steps = postmerge_steps(cfg, verify_cmd)
+        log = pm_dir(cid) ++ "/check.log"
+        if (elem(cl, 0) != 0 || length(steps) == 0) {
+            send(orch, {'postmerge', cid, "error", %{sha: head, tail: "could not check out " ++ head ++ " or no check command:\n" ++ elem(cl, 1)}})
+        } else {
+            red1 = [x for x in steps when pm_step(dir, x, log) != 0]
+            red = [x for x in red1 when pm_step(dir, x, log) != 0]
+            passing = [x for x in steps when Std.any(red, fn(r) { r == x }) == 'false']
+            was = lines_of(pm_get(cid, "passing"))
+            broke = [x for x in was when Std.any(red, fn(r) { r == x }) == 'true']
+            if (string_length(green) == 0) {
+                send(orch, {'postmerge', cid, "baseline", %{sha: head, passing: passing, red: red}})
+            } else { if (length(broke) == 0) {
+                send(orch, {'postmerge', cid, "green", %{sha: head, passing: passing, red: red}})
+            } else {
+                tail = Std.join(broke, "\n") ++ "\n\n" ++ tail_log(log)
+                build = cfg_str(cfg, "build")
+                cmd = Std.join([x for x in [build] ++ broke when string_length(x) > 0], " && ")
+                bad = bisect_culprit(dir, green, head, cmd)
+                if (string_length(bad) == 0) {
+                    send(orch, {'postmerge', cid, "red", %{sha: head, tail: tail}})
+                } else {
+                    send(orch, {'postmerge', cid, "reverted", revert_culprit(dir, repo, gh_repo, base, head, bad, tail)})
+                }
+            }}
+        }
+    }
+}
+
+fun pm_step(dir, step, log) {
+    elem(shell_managed(timeout_cmd_in(dir, postmerge_timeout_s(), step, log), postmerge_timeout_s() * 1000 + 60000), 0)
+}
+
+# First bad merge on main's first-parent line between green and head; "" if
+# bisect can't tell. Any nonzero (build error, timeout) counts as bad.
+fun bisect_culprit(dir, green, head, cmd) {
+    one = "perl -e 'alarm shift; exec @ARGV' " ++ to_string(postmerge_timeout_s()) ++ " " ++ isolate_prefix([dir, getenv("HOME")]) ++ "sh -c " ++ sq(cmd) ++ " > /dev/null 2>&1 || false"
+    r = sh(f"cd {sq(dir)} && git bisect start --first-parent {head} {green} >/dev/null && git bisect run sh -c {sq(one)} >/dev/null 2>&1 && git rev-parse refs/bisect/bad; git bisect reset -q >/dev/null 2>&1")
+    sha = string_trim(Std.last(lines_of(elem(r, 1))))
+    if (string_length(sha) == 40) { sha } else { "" }
+}
+
+# Revert `bad` on top of head in a branch o/revert-<sha>, open a PR, and merge
+# it once its checks settle green. Returns what the tick loop records.
+fun revert_culprit(dir, repo, gh_repo, base, head, bad, tail) {
+    short = string_sub(bad, 0, 10)
+    branch = "o/revert-" ++ short
+    subj = string_trim(elem(sh(f"git -C {sq(dir)} log -1 --format=%s {bad}"), 1))
+    parents = length(string_split(string_trim(elem(sh(f"git -C {sq(dir)} rev-list --parents -n 1 {bad}"), 1)), " "))
+    m = if (parents > 2) { "-m 1 " } else { "" }
+    # "Merge pull request #12 from owner/o/iss_..." names the issue's branch
+    src = Std.last(string_split(subj, " "))
+    issue = if (string_contains(src, "/o/iss_") == 'true') { Std.last(string_split(src, "/o/")) } else { "" }
+    url = string_trim(elem(sh(f"git -C {sq(repo)} remote get-url origin"), 1))
+    rv = sh(f"cd {sq(dir)} && git checkout -q -B {branch} {head} && git -c user.email=o@localhost -c user.name=O revert --no-edit {m}{bad} && git push -q --force {sq(url)} HEAD:refs/heads/{branch}")
+    body = pm_dir_of(dir) ++ "/revert.md"
+    _b = file_write(body, "O's post-merge check found `" ++ base ++ "` red at " ++ head ++ " and bisected it to " ++ bad ++ " (" ++ subj ++ "). This reverts it; O merges this once its checks pass, and sends the change back to be redone.\n\nCheck output (tail):\n```\n" ++ string_truncate(tail, 3000) ++ "\n```")
+    made = if (elem(rv, 0) != 0) { nil } else { gh_json(f"-X POST repos/{gh_repo}/pulls -f {sq("title=Revert: " ++ subj)} -f head={branch} -f {sq("base=" ++ base)} -F body=@{sq(body)}") }
+    num = if (made == nil) { nil } else { map_get(made, "number") }
+    merged = if (num == nil) { 'false' } else { revert_merge_when_green(gh_repo, num, timestamp(), timestamp() + ci_timeout_s() * 1000) }
+    %{sha: head, bad: bad, subject: subj, issue: issue, pr: num, merged: merged, tail: tail, error: (if (elem(rv, 0) != 0) { elem(rv, 1) } else { "" })}
+}
+
+fun pm_dir_of(dir) { string_sub(dir, 0, string_length(dir) - 5) }
+
+# Every check on the revert PR's head must settle green (none at all counts as
+# green after O_CI_SETTLE_S); then merge. 'false' on a red check or timeout.
+fun revert_merge_when_green(gh_repo, num, pushed_at, deadline) {
+    pr = gh_json(f"repos/{gh_repo}/pulls/{num}")
+    head = if (pr == nil) { nil } else { map_get(pr, "head") }
+    sha = if (head == nil) { "" } else { str_or(map_get(head, "sha"), "") }
+    verdict = classify_checks(pr_checks(gh_repo, sha), "success", "")
+    settled = timestamp() - pushed_at >= env_int("O_CI_SETTLE_S", 30) * 1000
+    if (verdict == "success" && settled) {
+        m = gh_api(f"-X PUT repos/{gh_repo}/pulls/{num}/merge -f merge_method=merge")
+        d = if (elem(m, 0) == 0) { json_decode(elem(m, 1)) } else { nil }
+        if (d != nil && map_get(d, "merged") == 'true') { 'true' } else { 'false' }
+    } else { if (string_starts_with(verdict, "failed") == 'true' || timestamp() > deadline) { 'false' } else {
+        _s = sleep(env_int("O_CI_POLL_S", 30) * 1000)
+        revert_merge_when_green(gh_repo, num, pushed_at, deadline)
+    }}
+}
+
+# Sole DB writer: record the outcome. A reverted change counts as escaped
+# (merge.revert) and its issue goes back to Backlog with the failure.
+fun handle_postmerge(db, cid, outcome, res) {
+    _d = pm_put(cid, "done", to_string(timestamp()))
+    sha = str_or(map_get(res, "sha"), "")
+    if (outcome == "green" || outcome == "baseline") {
+        _g = pm_put(cid, "green", sha)
+        _p = pm_put(cid, "passing", Std.join(list_or_empty(map_get(res, "passing")), "\n"))
+        red = list_or_empty(map_get(res, "red"))
+        _k = if (length(red) == 0) { "" } else { print("[orch] post-merge check: already red on main, not counted as a break: " ++ Std.join(red, " | ")) }
+        Store.log_activity(db, cid, "orchestrator", "postmerge." ++ outcome, sha)
+    } else { if (outcome == "red" || outcome == "error") {
+        print("[orch] post-merge check " ++ outcome ++ " at " ++ sha ++ ":\n" ++ string_truncate(str_or(map_get(res, "tail"), ""), 1500))
+        Store.log_activity(db, cid, "orchestrator", "postmerge." ++ outcome, sha)
+    } else { if (outcome == "reverted") {
+        _r = Store.log_activity(db, cid, "orchestrator", "postmerge.red", sha)
+        iid = str_or(map_get(res, "issue"), "")
+        merged = map_get(res, "merged") == 'true'
+        print("[orch] post-merge check: " ++ str_or(map_get(res, "bad"), "") ++ " broke main; revert PR " ++ to_string(map_get(res, "pr")) ++ (if (merged) { " merged" } else { " NOT merged" }) ++ str_or(map_get(res, "error"), ""))
+        _rv = if (merged) { Store.log_activity(db, cid, "orchestrator", "postmerge.reverted", str_or(map_get(res, "bad"), "")) } else { "" }
+        if (string_length(iid) == 0 || Store.issue_row(db, iid) == nil) { "" } else {
+            _e = Store.log_activity(db, cid, "orchestrator", "merge.revert", iid)
+            _b = Store.issue_append_body(db, iid, "\n\n---\nThis change merged but broke main (O's post-merge check, " ++ sha ++ ")" ++ (if (merged) { " and was reverted" } else { "; the revert PR is open" }) ++ ". Redo it so the full check passes:\n\n" ++ string_truncate(str_or(map_get(res, "tail"), ""), 3000))
+            Store.issue_set_status(db, iid, "Backlog")
+        }
+    } else { "" }}}
 }
 
 # ---- self-checks (o#42) ------------------------------------------
