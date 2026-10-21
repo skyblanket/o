@@ -1962,6 +1962,23 @@ grep -q "Waiting on a person" "$TMP4/.o/digest.md" || fail "digest: no daily dig
 pass "digest: GET /api/waiting and ~/.o/digest.md list everything waiting on a person, oldest first"
 echo '[]' > "$GHS/issues.json"
 restart_d4 O_MERGE_GATE=1 O_AUTO_FILE=0 O_ENV_RETRY_S=2
+# Risk by what a change does (o#67): a migration, a loosened config rule and a
+# redo of a reverted change each raise the PR to the strictest gate (the
+# strongest model, every tier's extra checks), named on the gate comment.
+IID_RM="$(gh_issue '[sim:migrate-docs] document the migration')"
+echo "o/$IID_RM" >> "$GHS/only_lint"
+IID_RL="$(gh_issue '[sim:loosen] relax a lint rule')"
+IID_RR="$(gh_issue '[sim:good] redo a reverted change')"
+sqlite3 "$TMP4/o.db" "UPDATE issue SET fingerprint='revert:GH-1' WHERE id='$IID_RR'"
+for i in "$IID_RM" "$IID_RL" "$IID_RR"; do wait_status_at "$BASE4" "$i" "Done" 180 || { grep -v '^\[orch\] tick' "$TMP4/daemon.log" | tail -20; fail "risk: $i never merged"; }; done
+crm="$GHS/comments_$(pr_of "$IID_RM")"
+grep -q "Risks found" "$crm" && grep -q "database or schema migration: docs/migrate_" "$crm" || { cat "$crm"; fail "risk: a migration was not named on the gate comment"; }
+grep -F "O merge gate** (sonnet)" "$crm" >/dev/null && fail "risk: a risky docs change kept the docs tier's lighter gate"
+grep -q "test ! -f ext/broken" "$crm" || { cat "$crm"; fail "risk: a risky change did not run every tier's extra checks"; }
+grep -q "loosens a check, rule or timeout in config" "$GHS/comments_$(pr_of "$IID_RL")" || fail "risk: a loosened lint rule was not named"
+grep -q "redoes a change O merged before that was reverted" "$GHS/comments_$(pr_of "$IID_RR")" || fail "risk: a redo of a reverted change was not named"
+grep -q "Risks found" "$GHS/comments_$(pr_of "$IID_GM")" && fail "risk: a plain change was flagged"
+pass "risk: a migration, a loosened config rule and a redo of a reverted change each get the strictest gate (strongest model, every tier's checks), named on the gate comment; a plain change gets none"
 # inherited: base fails the same way, so the change isn't blamed
 git -C "$SEEDGH" fetch -q origin && git -C "$SEEDGH" checkout -q -B main origin/main
 echo broken > "$SEEDGH/BASE_BROKEN"; git -C "$SEEDGH" add BASE_BROKEN && git -C "$SEEDGH" commit -qm "break base" && git -C "$SEEDGH" push -q origin main

@@ -169,6 +169,21 @@ O edits real repositories on its own. The guard rails are the point.
   O answers each command on GitHub and applies it once. `GET /api/waiting`
   and a daily `~/.o/digest.md` list everything waiting on a person, oldest
   first.
+- **Risk by what a change does.** Some risks don't live in one path. A change
+  gets the strictest gate (`O_MERGE_MODEL` plus every tier's extra checks)
+  when it does any of these, and the gate comment names each risk found:
+  - touches a database or schema migration;
+  - adds or upgrades dependencies (manifests, lockfiles);
+  - touches auth, crypto or secrets handling;
+  - changes files that steer agents (`CLAUDE.md`, `AGENTS.md`, prompts) or the
+    build, suite or verify script;
+  - loosens a check, rule or timeout in config;
+  - redoes a change O reverted.
+
+  Per repo, `.o-review.json` `"risks"` turns a detector off
+  (`"migration": false`) or replaces its path patterns
+  (`"security": ["auth/"]`). `"uncovered": true` also flags files no tier
+  covers; it is off by default.
 - **Acceptance criteria need proof.** When an issue has a checklist (`- [ ]`)
   or a "Done when" list, the merge gate must answer each item `PASS`, `FAIL` or
   `UNCERTAIN` with evidence. O checks the evidence itself: an approval stands
