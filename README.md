@@ -115,6 +115,14 @@ Settings live in `~/.config/o/o.env` (start from `deploy/o.env.example`: set
 with their attempt counts. To add a repo, clone it on the machine and create a
 company with `ship: "pr"`, `github_repo` and a `.o-review.json` in the repo.
 
+To upgrade without cutting work off, use `scripts/upgrade.sh NEW_SWARMD`. It
+turns drain on and waits until nothing is in flight (builders, verifies, CI
+waits, gates). Then it swaps the binary (the old one is kept as
+`<bin>.prev`), restarts the daemon (`O_SERVICE=o` for the systemd unit, or
+`O_START` with a start command), and turns drain off once it is healthy. If
+work is still running after `O_UPGRADE_WAIT_S` (default 2 hours), it gives
+up and changes nothing.
+
 ## Safety model
 
 O edits real repositories on its own. The guard rails are the point.
