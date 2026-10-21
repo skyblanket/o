@@ -83,6 +83,10 @@ fun migrate(db) {
     _r_vstate = db_exec(db, "ALTER TABLE run ADD COLUMN verify_state TEXT DEFAULT ''")
     _r_vout   = db_exec(db, "ALTER TABLE run ADD COLUMN verify_output TEXT DEFAULT ''")
     _r_msha   = db_exec(db, "ALTER TABLE run ADD COLUMN merge_sha TEXT DEFAULT ''")
+    # o#64: the builder model and tier of each run, and whether its verify passed
+    _r_model  = db_exec(db, "ALTER TABLE run ADD COLUMN model TEXT DEFAULT ''")
+    _r_tier   = db_exec(db, "ALTER TABLE run ADD COLUMN tier TEXT DEFAULT ''")
+    _r_vpass  = db_exec(db, "ALTER TABLE run ADD COLUMN vpass INTEGER DEFAULT 0")
     # o#59/o#60: what a failed run failed with, normalised; and what fixed it
     _r_sig    = db_exec(db, "ALTER TABLE run ADD COLUMN failure_sig TEXT DEFAULT ''")
     _lesson   = db_exec(db, "CREATE TABLE IF NOT EXISTS lesson (id TEXT PRIMARY KEY, company_id TEXT, sig TEXT, issue_id TEXT, outcome TEXT, note TEXT, ts INTEGER)")

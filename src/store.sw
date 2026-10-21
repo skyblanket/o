@@ -513,6 +513,24 @@ fun run_set_verify(db, run_id, state, output) {
 
 # Record the merge commit sha once a run merges (or reverts) on main. The
 # forensic pointer for a "Reverted" run and the success marker for a merged one.
+fun run_set_model_tier(db, run_id, model, tier) {
+    _u = db_query(db, "UPDATE run SET model = ?, tier = ? WHERE id = ?", [model, tier, run_id])
+    run_id
+}
+
+fun run_set_vpass(db, run_id) {
+    _u = db_query(db, "UPDATE run SET vpass = 1 WHERE id = ?", [run_id])
+    run_id
+}
+
+# A model's verify results on one tier since a time: runs that passed verify,
+# and runs that failed for a reason the change owns (not the box, the base,
+# CI's clock or a crashed agent).
+fun model_pass_stats(db, cid, tier, model_like, since) {
+    r = db_query(db, "SELECT COALESCE(SUM(CASE WHEN r.vpass = 1 THEN 1 ELSE 0 END), 0) AS pass, COUNT(*) AS n FROM run r JOIN issue i ON i.id = r.issue_id WHERE i.company_id = ? AND r.tier = ? AND r.model LIKE ? AND r.started_at >= ? AND (r.vpass = 1 OR (r.verify_state LIKE 'red_%' AND r.verify_state NOT IN ('red_env', 'red_inherited', 'red_timeout', 'red_agent')))", [cid, tier, model_like, since])
+    if (length(r) == 0) { %{pass: 0, n: 0} } else { hd(r) }
+}
+
 fun run_set_merge(db, run_id, sha) {
     _u = db_query(db, "UPDATE run SET merge_sha = ? WHERE id = ?", [sha, run_id])
     run_id
@@ -633,6 +651,12 @@ fun approval_set(db, id, status) {
 }
 
 # ---- activity log --------------------------------------------
+
+fun log_activity_payload(db, company_id, actor, verb, target, payload) {
+    id = next_id("act")
+    _ins = db_query(db, "INSERT INTO activity (id, company_id, actor, verb, target, payload, ts) VALUES (?, ?, ?, ?, ?, ?, ?)", [id, company_id, actor, verb, target, payload, timestamp()])
+    id
+}
 
 fun log_activity(db, company_id, actor, verb, target) {
     id = next_id("act")

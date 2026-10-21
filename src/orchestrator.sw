@@ -1004,7 +1004,9 @@ fun dispatch_one(db, issue, iid, attempt, running, now) {
         _a = Store.log_activity(db, company_id, "orchestrator", "run.dispatch", iid)
         ident = map_get(issue, "identifier")
         resumed = if (string_length(session_id) > 0) { "resume" } else { "fresh" }
-        model = builder_model(agent, max2(1 + escalations(iid), tier_rung(repo, rebase_onto, iid, title ++ "\n" ++ body)))
+        tier_nm = issue_tier_name(repo, rebase_onto, iid, title ++ "\n" ++ body)
+        model = builder_model(agent, max2(max2(1 + escalations(iid), tier_rung(repo, rebase_onto, iid, title ++ "\n" ++ body)), adaptive_rung(db, company_id, tier_nm, iid, now)))
+        _rm = Store.run_set_model_tier(db, run_id, model, tier_nm)
         print(f"[orch] dispatch {ident} via {runtime} ({resumed} session, attempt {attempt}, model {model})")
         sim_outcome = if (runtime == "sim") { decide_outcome(issue, attempt) } else { 'none' }
         start = worktree_start(company, repo)
@@ -1034,6 +1036,41 @@ fun builder_model(agent, rung) {
 # stronger `builder` (e.g. "sonnet" for runtime code): an issue starts there
 # when its text names one of the tier's paths, or an earlier attempt's branch
 # touched them. Otherwise rung 1. Escalations still climb from there.
+# ---- adaptive starting model (o#64) -------------------------------
+# A tier's work starts one rung up when the first rung keeps failing there:
+# if the ladder starts on haiku and haiku passed verify in at most 25% of
+# its runs on this tier over 7 days (at least 3 runs; environment, inherited,
+# CI-timeout and agent-crash failures don't count), new work on that tier
+# starts on the next rung. Each such choice is logged (model.adapt) with its
+# numbers. `now` = 0 asks without logging. O_ADAPT=0 turns it off.
+fun adaptive_rung(db, cid, tier, iid, now) {
+    ladder = model_ladder()
+    first = if (length(ladder) == 0) { "" } else { hd(ladder) }
+    if (getenv("O_ADAPT") == "0" || string_contains(first, "haiku") == 'false' || length(ladder) < 2) { 1 } else {
+        st = Store.model_pass_stats(db, cid, tier, "%haiku%", timestamp() - 7 * 86400000)
+        n = map_get(st, "n")
+        p = map_get(st, "pass")
+        if (n >= 3 && 100 * p <= 25 * n) {
+            _l = if (now == 0) { "" } else { Store.log_activity_payload(db, cid, "orchestrator", "model.adapt", iid, "tier " ++ tier ++ ": " ++ first ++ " passed verify in " ++ to_string(p) ++ " of " ++ to_string(n) ++ " runs over 7 days (<= 25%), so this starts on " ++ Std.nth(ladder, 1)) }
+            2
+        } else { 1 }
+    }
+}
+
+# The tier an issue's work falls in: the first tier whose paths the issue
+# names or its branch touches, else "default".
+fun issue_tier_name(repo, base, iid, text) {
+    if (string_length(repo) == 0) { "default" } else {
+        tiers = cfg_list(review_config(repo, base), "tiers")
+        if (length(tiers) == 0) { "default" } else {
+            br = elem(sh(f"git -C {sq(repo)} rev-parse --verify --quiet refs/heads/o/{iid}"), 0) == 0
+            files = if (br) { lines_of(elem(sh(f"git -C {sq(repo)} diff --no-renames --name-only {sq(base)}...o/{iid}"), 1)) } else { [] }
+            hit = [t for t in tiers when Std.any(list_or_empty(map_get(t, "paths")), fn(p) { string_contains(text, p) == 'true' || Std.any(files, fn(f) { string_starts_with(f, p) == 'true' }) }) == 'true']
+            if (length(hit) == 0) { "default" } else { str_or(map_get(hd(hit), "name"), "default") }
+        }
+    }
+}
+
 fun tier_rung(repo, base, iid, text) {
     if (string_length(repo) == 0) { 1 } else {
         cfg = review_config(repo, base)
@@ -2246,6 +2283,7 @@ fun handle_verify_done(db, running, retry, run_id, issue_id, verdict, tail) {
             %{running: map_put(running, issue_id, map_put(map_put(map_put(info, "proven", 'true'), "worker_pid", vpid), "started_at", now)), retry: retry}
         } else { if (verdict == "green") {
             _a = Store.log_activity(db, company_id, "orchestrator", "verify.pass", issue_id)
+            _vp = Store.run_set_vpass(db, run_id)
             if (review_enabled() == 'true') {
                 start_review(db, running, retry, info, run_id, issue_id, now)
             } else {
