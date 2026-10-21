@@ -555,6 +555,15 @@ fun recurring_sigs(db, company_id) {
     db_query(db, "SELECT r.failure_sig AS sig, COUNT(DISTINCT r.issue_id) AS n FROM run r JOIN issue i ON i.id = r.issue_id WHERE i.company_id = ? AND r.failure_sig != '' GROUP BY r.failure_sig HAVING n >= 3 ORDER BY n DESC LIMIT 5", [company_id])
 }
 
+fun flaky_record(db, company_id, key) {
+    _u = db_query(db, "INSERT INTO flaky (company_id, key, count, last_ts) VALUES (?, ?, 1, ?) ON CONFLICT (company_id, key) DO UPDATE SET count = count + 1, last_ts = excluded.last_ts", [company_id, key, timestamp()])
+    key
+}
+
+fun flaky_top(db, company_id, min) {
+    db_query(db, "SELECT key, count FROM flaky WHERE company_id = ? AND count >= ? ORDER BY count DESC LIMIT 5", [company_id, min])
+}
+
 fun last_run_for_issue(db, issue_id) {
     rows = db_query(db, "SELECT id, issue_id, agent_id, attempt, state, verify_state, verify_output, started_at, thread_id, failure_sig FROM run WHERE issue_id = ? ORDER BY started_at DESC LIMIT 1", [issue_id])
     if (length(rows) == 0) { nil } else { hd(rows) }

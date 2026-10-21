@@ -87,6 +87,8 @@ fun migrate(db) {
     _r_sig    = db_exec(db, "ALTER TABLE run ADD COLUMN failure_sig TEXT DEFAULT ''")
     _lesson   = db_exec(db, "CREATE TABLE IF NOT EXISTS lesson (id TEXT PRIMARY KEY, company_id TEXT, sig TEXT, issue_id TEXT, outcome TEXT, note TEXT, ts INTEGER)")
     _ix_les   = db_exec(db, "CREATE INDEX IF NOT EXISTS ix_lesson_sig ON lesson (company_id, sig)")
+    # o#63: tests that failed and then passed on an identical re-run
+    _flaky    = db_exec(db, "CREATE TABLE IF NOT EXISTS flaky (company_id TEXT, key TEXT, count INTEGER DEFAULT 0, last_ts INTEGER, PRIMARY KEY (company_id, key))")
 
     # ---- persona pass -------------------------------------------
     # Simulated users who try a realistic task from the docs alone and report

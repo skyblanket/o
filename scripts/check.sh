@@ -653,6 +653,24 @@ wait_status "$IREP" "Done" 180 || { tail -30 "$TMP/daemon.log"; fail "repeat: th
 grep "dispatch REP-1 .*attempt 2, model haiku" "$TMP/daemon.log" >/dev/null && grep "dispatch REP-1 .*attempt 3, model sonnet" "$TMP/daemon.log" >/dev/null \
   || { grep "dispatch REP-1" "$TMP/daemon.log"; fail "repeat: the same failure twice should move attempt 3 up a rung"; }
 pass "repeat: the same failure on two attempts in a row moves the next attempt up a rung"
+# Flaky tests (o#63): the flaky verify above is in the registry; an issue that
+# fixes a flaky test must pass verify O_FLAKY_RUNS (5) times in a row.
+[ "$(sqlite3 "$TMP/o.db" "SELECT COUNT(*) FROM flaky WHERE company_id='$CFLK'")" -ge 1 ] || fail "flaky: the flaky verify was not recorded in the registry"
+cat > "$TMP/vpat.sh" <<'SH'
+#!/bin/sh
+# vpat.sh <counter-file> <failing call numbers...>: fail exactly those calls.
+c="$1"; shift; n=$(( $(cat "$c" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$c"
+for f in "$@"; do [ "$n" = "$f" ] && { echo "FAIL: test_widget flaked on call $n"; exit 1; }; done
+exit 0
+SH
+CFX="$(mkco_v 'Deflake Co' DFL "sh $TMP/vpat.sh $TMP/cnt_dfl 3")"
+ocurl -s -X POST "$BASE/api/companies/$CFX/agents" -H 'Content-Type: application/json' -d '{"name":"Sim","runtime":"sim"}' >/dev/null
+IDFL="$(jget "$(ocurl -s -X POST "$BASE/api/companies/$CFX/issues" -H 'Content-Type: application/json' -d '{"title":"[sim:good] fix the flaky widget test"}')" 'd["id"]')"
+wait_status "$IDFL" "Done" 180 || { tail -30 "$TMP/daemon.log"; fail "deflake: the flaky-test fix never shipped"; }
+[ "$(sqlite3 "$TMP/o.db" "SELECT COUNT(*) FROM activity WHERE verb='verify.repeat' AND target='$IDFL'")" = "2" ] || fail "deflake: expected a repeated verify on both attempts"
+sqlite3 "$TMP/o.db" "SELECT verify_output FROM run WHERE issue_id='$IDFL' AND attempt=1" | grep "FLAKY FIX NOT PROVEN" >/dev/null || fail "deflake: one green run was accepted as a flaky-test fix"
+[ "$(cat "$TMP/cnt_dfl")" -ge 8 ] || fail "deflake: the accepted fix did not pass 5 verifies in a row"
+pass "deflake: a flaky-test fix must pass verify 5 times in a row; a streak that breaks sends it back; flakes are recorded"
 wait_status "$IESC" "Done" 120 || { tail -30 "$TMP/daemon.log"; fail "escalate: issue never finished after escalating"; }
 EID="$(sqlite3 "$TMP/o.db" "SELECT identifier FROM issue WHERE id='$IESC'")"
 grep "dispatch $EID .*attempt 1, model haiku" "$TMP/daemon.log" >/dev/null && grep "dispatch $EID .*attempt 2, model sonnet" "$TMP/daemon.log" >/dev/null \

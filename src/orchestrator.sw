@@ -1958,6 +1958,42 @@ fun env_failure_why(tail) {
     if (length(hits) == 0) { "" } else { hd(hits) }
 }
 
+# ---- flaky tests (o#63) ----------------------------------------
+# A test that failed and then passed on an identical re-run is recorded by
+# its normalised failure line. An issue about a flaky test must pass verify
+# O_FLAKY_RUNS (5) times in a row before it counts; the planner sees tests
+# that flaked 3+ times.
+fun flaky_key(tail) {
+    named = fail_lines(tail)
+    if (length(named) > 0) { hd(named) } else { string_truncate(norm_line(first_line(string_replace(tail, "FLAKY: the first verify run failed and an identical rerun passed. First run:", ""))), 160) }
+}
+
+fun flaky_fix(db, iid) {
+    issue = Store.issue_row(db, iid)
+    t = if (issue == nil) { "" } else { string_lower(str_or(map_get(issue, "title"), "") ++ " " ++ str_or(map_get(issue, "body"), "")) }
+    # about fixing a flaky test, not merely mentioning flakiness
+    flak = string_contains(t, "flak") == 'true'
+    fixy = string_contains(t, "fix") == 'true' || string_contains(t, "deflake") == 'true' || string_contains(t, "test") == 'true'
+    if (flak && fixy) { 'true' } else { 'false' }
+}
+
+fun verify_repeat_worker(orch, run_id, iid, ws, verify_cmd, n) {
+    logp = ws ++ "/verify-repeat.log"
+    passed = verify_streak(ws, verify_cmd, logp, n, 0)
+    if (passed == n) {
+        send(orch, {'verify_done', run_id, iid, "green", "Passed " ++ to_string(n + 1) ++ " verify runs in a row (a flaky-test fix has to)."})
+    } else {
+        send(orch, {'verify_done', run_id, iid, "red_tests", "FLAKY FIX NOT PROVEN: verify passed " ++ to_string(passed + 1) ++ " time(s) in a row, then failed. The test is still flaky; find the cause (ordering, timing, shared state, ports) rather than retrying.\n\n" ++ tail_log(logp)})
+    }
+}
+
+fun verify_streak(ws, cmd, logp, n, done) {
+    if (done >= n) { done } else {
+        r = shell_managed(timeout_cmd(verify_timeout_s(), cmd, ws, logp), verify_timeout_ms())
+        if (elem(r, 0) == 0) { verify_streak(ws, cmd, logp, n, done + 1) } else { done }
+    }
+}
+
 # A failure's signature: its verdict plus the first line that names the
 # failure (or the first line), normalised like fail_lines. Same signature =
 # same failure, across attempts and issues.
@@ -2166,9 +2202,21 @@ fun handle_verify_done(db, running, retry, run_id, issue_id, verdict, tail) {
     } else {
         now = timestamp()
         company_id = map_get(info, "company_id")
-        if (verdict == "green") {
+        # a flake is recorded whichever path the green run takes next
+        _fk = if (verdict == "green" && string_starts_with(tail, "FLAKY:") == 'true') {
+            _r = Store.flaky_record(db, company_id, flaky_key(tail))
+            Store.log_activity(db, company_id, "orchestrator", "verify.flaky", issue_id)
+        } else { "" }
+        if (verdict == "green" && flaky_fix(db, issue_id) == 'true' && map_get(info, "proven") != 'true') {
+            # one green run doesn't prove a flaky test fixed: K in a row do
+            company = Store.company_row(db, company_id)
+            repo = str_or(map_get(company, "repo"), "")
+            k = env_int("O_FLAKY_RUNS", 5)
+            _a = Store.log_activity(db, company_id, "orchestrator", "verify.repeat", issue_id)
+            vpid = spawn(verify_repeat_worker(self(), run_id, issue_id, map_get(info, "workspace"), str_or(map_get(company, "verify_cmd"), ""), k - 1))
+            %{running: map_put(running, issue_id, map_put(map_put(map_put(info, "proven", 'true'), "worker_pid", vpid), "started_at", now)), retry: retry}
+        } else { if (verdict == "green") {
             _a = Store.log_activity(db, company_id, "orchestrator", "verify.pass", issue_id)
-            _f = if (string_starts_with(tail, "FLAKY:") == 'true') { Store.log_activity(db, company_id, "orchestrator", "verify.flaky", issue_id) } else { "" }
             if (review_enabled() == 'true') {
                 start_review(db, running, retry, info, run_id, issue_id, now)
             } else {
@@ -2191,7 +2239,7 @@ fun handle_verify_done(db, running, retry, run_id, issue_id, verdict, tail) {
             }
         } else {
             verify_red(db, running, retry, info, run_id, issue_id, (if (verdict == "red_env") { "red_tests" } else { verdict }), tail, now)
-        }}}
+        }}}}
     }
 }
 
@@ -3416,7 +3464,8 @@ fun plan_each(db, rows, now, every) {
             _w = file_write(f, to_string(now))
             co = Store.company_row(db, cid)
             rec = Store.recurring_sigs(db, cid)
-            ctx = "== What O has queued or in flight ==\n" ++ fmt_issues(Store.open_issue_titles(db, cid)) ++ "\n== What failed lately ==\n" ++ fmt_fails(Std.take(Store.failed_runs_for(db, cid), 8)) ++ (if (length(rec) == 0) { "" } else { "\n== Failures recurring across 3+ issues (a root cause may deserve its own issue) ==\n" ++ Std.join(["- " ++ str_or(map_get(r, "sig"), "") ++ " (" ++ to_string(map_get(r, "n")) ++ " issues)" for r in rec], "\n") ++ "\n" })
+            fl = Store.flaky_top(db, cid, 3)
+            ctx = "== What O has queued or in flight ==\n" ++ fmt_issues(Store.open_issue_titles(db, cid)) ++ "\n== What failed lately ==\n" ++ fmt_fails(Std.take(Store.failed_runs_for(db, cid), 8)) ++ (if (length(rec) == 0) { "" } else { "\n== Failures recurring across 3+ issues (a root cause may deserve its own issue) ==\n" ++ Std.join(["- " ++ str_or(map_get(r, "sig"), "") ++ " (" ++ to_string(map_get(r, "n")) ++ " issues)" for r in rec], "\n") ++ "\n" }) ++ (if (length(fl) == 0) { "" } else { "\n== Tests that flaked 3+ times (a deflake issue may be worth filing) ==\n" ++ Std.join(["- " ++ str_or(map_get(f, "key"), "") ++ " (" ++ to_string(map_get(f, "count")) ++ " flakes)" for f in fl], "\n") ++ "\n" })
             spawn(plan_worker(self(), cid, map_get(c, "github_repo"), str_or(map_get(co, "repo"), ""), ctx))
         }
         plan_each(db, tl(rows), now, every)
