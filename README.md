@@ -169,6 +169,16 @@ O edits real repositories on its own. The guard rails are the point.
   O answers each command on GitHub and applies it once. `GET /api/waiting`
   and a daily `~/.o/digest.md` list everything waiting on a person, oldest
   first.
+- **A public merge policy (`O_POLICY=1`).** O keeps `docs/O-POLICY.md` in
+  each repo current: a plain-English account of what O may merge, generated
+  from `.o-review.json` on the base branch. It covers the tiers, the hard
+  rules, the risks that get the strictest gate, the post-merge check and what
+  O never does. When the repo's copy goes stale (every `O_POLICY_S`, default
+  an hour), O files an update whose run writes exactly that file, and the
+  update goes through verify, CI and the gate like any change. Each merged PR
+  carries an **O merge record**: the commit, the gate's verdict and model,
+  the risks found, O's checks and their results, attempts, failures on the
+  way, and cost.
 - **Risk by what a change does.** Some risks don't live in one path. A change
   gets the strictest gate (`O_MERGE_MODEL` plus every tier's extra checks)
   when it does any of these, and the gate comment names each risk found:
@@ -495,6 +505,8 @@ The daemon reads its configuration from the environment. All are optional.
 | `O_AUTO_FILE` | on | when an issue fails for good, O files a "Fix failing verification" follow-up (one level deep). `0` turns it off: the failed issue waits for a human. Revert follow-ups (main regressed) are always filed. |
 | `O_COMMAND_USERS` | _(empty)_ | extra GitHub logins whose `/o` commands count, besides the repo's owner, members and collaborators. |
 | `O_DIGEST_S` | `86400` | how often O writes `~/.o/digest.md`, the list of everything waiting on a person. |
+| `O_POLICY` | _(off)_ | `1`: keep `docs/O-POLICY.md` current in each GitHub repo, landed through O's own pipeline. |
+| `O_POLICY_S` | `3600` | how often O compares the repo's policy with the one it generates. |
 | `O_VERIFY_RETRY` | `1` | a failed verify is re-run once before it counts. Fail-then-pass is logged `verify.flaky` and ships with no retry. `0` turns it off. |
 | `O_REVIEW_MODEL` | `sonnet` | model for the pre-PR reviewer. |
 | `O_GH_BIN` | `gh` on `PATH` | GitHub CLI used for issue import and PRs. |
