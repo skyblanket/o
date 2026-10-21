@@ -580,8 +580,8 @@ fun tick_loop(db, dbpath, port, tick_n, running, retry) {
         {'review_done', run_id, issue_id, approved, reason, cost} ->
             r = handle_review_done(db, running, retry, run_id, issue_id, approved, reason, cost)
             tick_loop(db, dbpath, port, tick_n, map_get(r, "running"), map_get(r, "retry"))
-        {'ci_green', run_id, issue_id, num} ->
-            r = handle_ci_green(db, running, retry, run_id, issue_id, num)
+        {'ci_green', run_id, issue_id, num, head} ->
+            r = handle_ci_green(db, running, retry, run_id, issue_id, num, head)
             tick_loop(db, dbpath, port, tick_n, map_get(r, "running"), map_get(r, "retry"))
         {'gate_done', run_id, issue_id, verdict, text, session, cost} ->
             r = handle_gate_done(db, running, retry, run_id, issue_id, verdict, text, session, cost)
@@ -2358,9 +2358,9 @@ fun ci_poll(orch, run_id, issue_id, gh_repo, branch, num, base, required, pushed
             send(orch, {'ci_done', run_id, issue_id, "in_review", "", "CI green on PR #" ++ to_string(num) ++ "; O_PR_AUTOMERGE=0, so it waits for a human to merge."})
         } else { if (merge_gate_enabled() == 'true') {
             # the maintainer decides; this CI worker's job is done
-            send(orch, {'ci_green', run_id, issue_id, num})
+            send(orch, {'ci_green', run_id, issue_id, num, sha})
         } else {
-            ci_merge(orch, run_id, issue_id, gh_repo, branch, num)
+            ci_merge(orch, run_id, issue_id, gh_repo, branch, num, sha)
         }}
     } else {
         _s = sleep(env_int("O_CI_POLL_S", 30) * 1000)
@@ -2434,17 +2434,23 @@ fun pr_checks(gh_repo, sha) {
     }
 }
 
-fun ci_merge(orch, run_id, issue_id, gh_repo, branch, num) {
-    m = gh_api(f"-X PUT repos/{gh_repo}/pulls/{num}/merge -f merge_method=merge")
+# Merge exactly the commit that was checked (`sha`, the PR head CI or the gate
+# saw): GitHub refuses if the branch moved since, and the PR goes back through
+# CI and the gate instead of merging commits nobody reviewed.
+fun ci_merge(orch, run_id, issue_id, gh_repo, branch, num, sha) {
+    pin = if (string_length(sha) > 0) { " -f sha=" ++ sha } else { "" }
+    m = gh_api(f"-X PUT repos/{gh_repo}/pulls/{num}/merge -f merge_method=merge{pin}")
     d = if (elem(m, 0) == 0) { json_decode(elem(m, 1)) } else { nil }
     if (d != nil && map_get(d, "merged") == 'true') {
         _del = gh_api(f"-X DELETE repos/{gh_repo}/git/refs/heads/{branch}")
         send(orch, {'ci_done', run_id, issue_id, "merged", str_or(map_get(d, "sha"), ""), ""})
+    } else { if (string_contains(elem(m, 1), "Head branch was modified") == 'true') {
+        send(orch, {'ci_done', run_id, issue_id, "in_review", "", "CI green on PR #" ++ to_string(num) ++ " (its head moved after it was checked, so CI and the gate run again before it merges)"})
     } else {
         # Green, but GitHub won't merge it for us (required reviews, merge
         # queue, ...): park it for a human instead of burning attempts.
         send(orch, {'ci_done', run_id, issue_id, "in_review", "", string_trim(elem(m, 1))})
-    }
+    }}
 }
 
 fun list_or_empty(v) {
@@ -2551,7 +2557,7 @@ fun merge_model() {
     if (v == nil) { "claude-opus-5-5" } else { v }
 }
 
-fun handle_ci_green(db, running, retry, run_id, issue_id, num) {
+fun handle_ci_green(db, running, retry, run_id, issue_id, num, head) {
     info = map_get(running, issue_id)
     if (info == nil) {
         %{running: running, retry: retry}
@@ -2572,7 +2578,8 @@ fun handle_ci_green(db, running, retry, run_id, issue_id, num) {
         _a = Store.log_activity(db, company_id, "orchestrator", "gate.start", issue_id)
         gpid = spawn(gate_worker(self(), job))
         info2 = map_put(map_put(map_put(info, "phase", 'gate'), "started_at", now), "worker_pid", gpid)
-        %{running: map_put(running, issue_id, map_put(info2, "pr", num)), retry: map_remove(retry, issue_id)}
+        # head: the PR commit CI passed; the merge is pinned to it
+        %{running: map_put(running, issue_id, map_put(map_put(info2, "pr", num), "head", head)), retry: map_remove(retry, issue_id)}
     }
 }
 
@@ -3024,8 +3031,8 @@ fun escalate_reason(files, lines) {
     }
 }
 
-fun merge_worker(orch, run_id, issue_id, gh_repo, branch, num) {
-    ci_merge(orch, run_id, issue_id, gh_repo, branch, num)
+fun merge_worker(orch, run_id, issue_id, gh_repo, branch, num, sha) {
+    ci_merge(orch, run_id, issue_id, gh_repo, branch, num, sha)
 }
 
 fun handle_gate_done(db, running, retry, run_id, issue_id, verdict, text, session, cost) {
@@ -3049,7 +3056,8 @@ fun handle_gate_done(db, running, retry, run_id, issue_id, verdict, text, sessio
                 # maintainers merge.
                 handle_ci_done(db, running, retry, run_id, issue_id, "in_review", "", f"HUMAN: the merge gate approved, but {gh_repo} is PR-only (not in O_AUTOMERGE_OWNERS): its maintainers merge.\n\n" ++ text)
             } else {
-                mpid = spawn(merge_worker(self(), run_id, issue_id, gh_repo, f"o/{issue_id}", num))
+                approved = str_or(map_get(info, "head"), "")
+                mpid = spawn(merge_worker(self(), run_id, issue_id, gh_repo, f"o/{issue_id}", num, approved))
                 info2 = map_put(map_put(map_put(info, "phase", 'ci'), "started_at", now), "worker_pid", mpid)
                 %{running: map_put(running, issue_id, info2), retry: map_remove(retry, issue_id)}
             }
