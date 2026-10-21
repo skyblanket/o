@@ -3324,7 +3324,7 @@ fun handle_merge_done(db, running, retry, run_id, issue_id, outcome, merge_sha, 
             _is = Store.issue_set_status(db, issue_id, "Done")
             _g = Store.company_mark_green(db, company_id)
             _a = Store.log_activity(db, company_id, "orchestrator", "merge.done", issue_id)
-            _fl = if (tail == "flaky") { Store.log_activity(db, company_id, "orchestrator", "merge.flaky", issue_id) } else { "" }
+            _flaky = if (tail == "flaky") { Store.log_activity(db, company_id, "orchestrator", "merge.flaky", issue_id) } else { "" }
             %{running: map_remove(running, issue_id), retry: map_remove(retry, issue_id)}
         } else {
             if (outcome == "conflict") {
