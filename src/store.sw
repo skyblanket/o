@@ -704,3 +704,34 @@ fun issue_append_body(db, id, text) {
     _u = db_query(db, "UPDATE issue SET body = body || ?, updated_at = ? WHERE id = ?", [text, timestamp(), id])
     id
 }
+
+# ---- proof: is O actually maintaining the repo? ---------------------
+# All time, from the activity log. "By O" is a merge O made itself (local
+# merge or its gate merging the PR); "by a human" is a PR a person merged
+# (a sign-off). Escaped = an O-merged change reverted after merge, or a fix a
+# persona re-ran and found still broken. Touches = every time a person had to
+# act: a sign-off, a protected-file edit O asked for, a retry or a manual edit.
+fun count_verbs(db, verbs) {
+    marks = Std.join(["?" for v in verbs], ", ")
+    r = db_query(db, "SELECT COUNT(*) AS n FROM activity WHERE verb IN (" ++ marks ++ ")", verbs)
+    if (length(r) == 0) { 0 } else { map_get(hd(r), "n") }
+}
+
+fun proof(db) {
+    by_o = count_verbs(db, ["ci.merged", "merge.done"])
+    by_human = count_verbs(db, ["pr.merged"])
+    escaped = count_verbs(db, ["merge.revert", "persona.still_broken"])
+    touches = count_verbs(db, ["pr.merged", "run.needs_human", "issue.retry", "issue.update"])
+    caught = count_verbs(db, ["review.reject", "gate.reject", "ci.fail", "verify.fail"])
+    rc = db_query(db, "SELECT COALESCE(SUM(cost_cents), 0) AS c, COUNT(*) AS n FROM run", [])
+    cents = if (length(rc) == 0) { 0 } else { map_get(hd(rc), "c") }
+    runs = if (length(rc) == 0) { 0 } else { map_get(hd(rc), "n") }
+    merges = by_o + by_human
+    %{merged_by_o: by_o, merged_by_human: by_human, merges: merges,
+      autonomy_pct: (if (merges > 0) { (100 * by_o) / merges } else { 0 }),
+      escaped: escaped, escaped_pct: (if (merges > 0) { (100 * escaped) / merges } else { 0 }),
+      human_touches: touches, touches_per_merge_x10: (if (merges > 0) { (10 * touches) / merges } else { 0 }),
+      caught_before_merge: caught, builder_runs: runs, spend_cents: cents,
+      cents_per_merge: (if (merges > 0) { cents / merges } else { 0 })}
+}
+
