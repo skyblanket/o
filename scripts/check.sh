@@ -1725,6 +1725,22 @@ done
 [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM issue WHERE company_id='$CIDG' AND fingerprint='gh:22'")" = "0" ] || fail "plan: an issue the planner did not take was imported"
 pass "plan: O takes the issue it chose (not human-labelled or unknown ones), says why on GitHub, files a new one; the poll imports both"
 
+# Tiers changed: a PR parked for a human's sign-off whose files no longer map
+# to a human tier is re-adopted. CI and the gate run again on current main,
+# and it merges without a rebuild.
+[ "$(sqlite3 "$TMP4/o.db" "SELECT status FROM issue WHERE id='$IID_RK'")" = "In Review" ] || fail "re-adopt: setup: $IID_RK should still be parked for sign-off"
+ndisp_rk="$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='run.dispatch' AND target='$IID_RK'")"
+git -C "$SEEDGH" fetch -q origin && git -C "$SEEDGH" checkout -q -B main origin/main
+sed -i 's|"paths": \["risky/"\], "merge": "human"|"paths": ["risky/"], "merge": "auto"|' "$SEEDGH/.o-review.json"
+grep -q '"paths": \["risky/"\], "merge": "auto"' "$SEEDGH/.o-review.json" || fail "re-adopt: setup: the tier flip did not apply"
+git -C "$SEEDGH" commit -qam "risky tier merges on O's decision" && git -C "$SEEDGH" push -q origin main
+restart_d4 O_MERGE_GATE=1 O_AUTO_FILE=0
+wait_status_at "$BASE4" "$IID_RK" "Done" 180 || { grep -v '^\[orch\] tick' "$TMP4/daemon.log" | tail -20; fail "re-adopt: a sign-off PR was not re-gated and merged after its tier became auto"; }
+[ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='pr.adopted' AND target='$IID_RK'")" -ge 1 ] || fail "re-adopt: no pr.adopted logged"
+[ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='run.dispatch' AND target='$IID_RK'")" = "$ndisp_rk" ] || fail "re-adopt: the builder ran again (it should reuse the approved PR)"
+git -C "$GHS/remote.git" log --oneline main | grep -q "o/$IID_RK" || fail "re-adopt: the PR did not merge into main"
+pass "re-adopt: when the tiers stop asking for a human, a PR parked for sign-off is re-gated on current main and merged, no rebuild"
+
 # ============================================================
 # Agent sandbox — 5th daemon, O_SANDBOX=bwrap + O_API_TOKEN
 # ============================================================

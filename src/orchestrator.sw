@@ -3063,6 +3063,10 @@ fun handle_gate_done(db, running, retry, run_id, issue_id, verdict, text, sessio
 #   closed unmerged    -> Canceled (pr.closed)
 #   still open, parked by PR-only mode, and the merge gate is now on
 #                      -> adopted: handed to the maintainer (pr.adopted)
+#   still open, parked for a human's sign-off, and the repo's tiers no longer
+#                      ask for one for its files (.o-review.json on base)
+#                      -> adopted the same way: CI and the gate run again on
+#                         current base before anything merges
 # Gate escalations and refused merges are never re-adopted: they wait for a
 # human, and the poller only notices when that human merges or closes.
 fun review_poll_each(db, rows) {
@@ -3074,16 +3078,18 @@ fun review_poll_each(db, rows) {
         last = Store.last_run_for_issue(db, iid)
         parked = if (last == nil) { "" } else { str_or(map_get(last, "verify_output"), "") }
         adoptable = if (merge_gate_enabled() == 'true' && string_starts_with(parked, "CI green on PR") == 'true') { 'true' } else { 'false' }
-        _s = spawn(review_poll_worker(self(), iid, map_get(r, "github_repo"), adoptable))
+        signoff = if (merge_gate_enabled() == 'true' && string_starts_with(parked, "HUMAN:") == 'true') { str_or(map_get(r, "repo"), "") } else { "" }
+        _s = spawn(review_poll_worker(self(), iid, map_get(r, "github_repo"), adoptable, signoff))
         review_poll_each(db, tl(rows))
     }
 }
 
-fun review_poll_worker(orch, issue_id, gh_repo, adoptable) {
+fun review_poll_worker(orch, issue_id, gh_repo, adoptable0, signoff_repo) {
     owner = hd(string_split(gh_repo, "/"))
     prs = gh_json(sq(f"repos/{gh_repo}/pulls?head={owner}:o/{issue_id}&state=all"))
     num = if (prs == nil) { nil } else { if (length(prs) == 0) { nil } else { map_get(hd(prs), "number") } }
     pr = if (num == nil) { nil } else { gh_json(f"repos/{gh_repo}/pulls/{num}") }
+    adoptable = if (adoptable0 == 'true' || (pr != nil && string_length(signoff_repo) > 0 && no_longer_human(gh_repo, num, signoff_repo) == 'true')) { 'true' } else { 'false' }
     if (pr == nil) {
         ""
     } else {
@@ -3380,6 +3386,18 @@ fun handle_postmerge(db, cid, outcome, res) {
             Store.issue_set_status(db, iid, "Backlog")
         }
     } else { "" }}}
+}
+
+# A PR parked for a human's sign-off whose files no longer map to a human tier
+# under the base branch's current .o-review.json (the tiers changed).
+fun no_longer_human(gh_repo, num, repo) {
+    base = detect_base(repo)
+    _f = sh(f"git -C {sq(repo)} fetch -q origin {base}")
+    pf = gh_json(f"repos/{gh_repo}/pulls/{num}/files?per_page=100")
+    files = if (pf == nil) { [] } else { [str_or(map_get(f, "filename"), "") for f in pf] }
+    if (length(files) == 0) { 'false' } else {
+        if (map_get(pr_tier(review_config(repo, "origin/" ++ base), files), "human") == 'true') { 'false' } else { 'true' }
+    }
 }
 
 # ---- self-checks (o#42) ------------------------------------------

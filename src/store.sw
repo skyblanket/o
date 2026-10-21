@@ -70,7 +70,7 @@ fun company_set_github(db, id, github_repo, ship) {
 # Issues parked In Review on a PR-mode company: what the review poller
 # watches for a human merge or close (and, with the merge gate on, adopts).
 fun issues_in_review(db) {
-    db_query(db, "SELECT i.id, i.company_id, c.github_repo FROM issue i JOIN company c ON c.id = i.company_id WHERE i.status = 'In Review' AND c.status = 'active' AND c.ship = 'pr' AND c.github_repo != ''", [])
+    db_query(db, "SELECT i.id, i.company_id, c.github_repo, c.repo FROM issue i JOIN company c ON c.id = i.company_id WHERE i.status = 'In Review' AND c.status = 'active' AND c.ship = 'pr' AND c.github_repo != ''", [])
 }
 
 # Issues on a PR-mode company that ran at least once but are not parked In
