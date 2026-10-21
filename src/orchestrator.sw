@@ -2375,7 +2375,7 @@ fun ci_worker(orch, run_id, issue_id, ws, branch, base, gh_repo, title, required
     # remote branch that isn't a merge and was never on O's local branch is
     # someone else's: park the issue and name it. Otherwise push with a lease
     # on the head just fetched, so nothing that lands meanwhile is lost.
-    _ff = sh(f"git -C {ws} fetch -q origin refs/heads/{branch}:refs/o-remote/{branch} 2>/dev/null")
+    _ff = sh(f"git -C {ws} update-ref -d refs/o-remote/{branch}; git -C {ws} fetch -q origin +refs/heads/{branch}:refs/o-remote/{branch} 2>/dev/null")
     remote = string_trim(elem(sh(f"git -C {ws} rev-parse -q --verify refs/o-remote/{branch}"), 1))
     # O's own: on its branch's reflog, or authored as the repo's git identity
     # (the reflog is gone once O deleted and recreated the branch). Commits
