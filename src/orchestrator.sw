@@ -1971,7 +1971,10 @@ fun flaky_key(tail) {
 fun flaky_fix(db, iid) {
     issue = Store.issue_row(db, iid)
     t = if (issue == nil) { "" } else { string_lower(str_or(map_get(issue, "title"), "") ++ " " ++ str_or(map_get(issue, "body"), "")) }
-    if (string_contains(t, "flaky") == 'true' || string_contains(t, "flake") == 'true') { 'true' } else { 'false' }
+    # about fixing a flaky test, not merely mentioning flakiness
+    flak = string_contains(t, "flak") == 'true'
+    fixy = string_contains(t, "fix") == 'true' || string_contains(t, "deflake") == 'true' || string_contains(t, "test") == 'true'
+    if (flak && fixy) { 'true' } else { 'false' }
 }
 
 fun verify_repeat_worker(orch, run_id, iid, ws, verify_cmd, n) {
@@ -2199,6 +2202,11 @@ fun handle_verify_done(db, running, retry, run_id, issue_id, verdict, tail) {
     } else {
         now = timestamp()
         company_id = map_get(info, "company_id")
+        # a flake is recorded whichever path the green run takes next
+        _fk = if (verdict == "green" && string_starts_with(tail, "FLAKY:") == 'true') {
+            _r = Store.flaky_record(db, company_id, flaky_key(tail))
+            Store.log_activity(db, company_id, "orchestrator", "verify.flaky", issue_id)
+        } else { "" }
         if (verdict == "green" && flaky_fix(db, issue_id) == 'true' && map_get(info, "proven") != 'true') {
             # one green run doesn't prove a flaky test fixed: K in a row do
             company = Store.company_row(db, company_id)
@@ -2209,10 +2217,6 @@ fun handle_verify_done(db, running, retry, run_id, issue_id, verdict, tail) {
             %{running: map_put(running, issue_id, map_put(map_put(map_put(info, "proven", 'true'), "worker_pid", vpid), "started_at", now)), retry: retry}
         } else { if (verdict == "green") {
             _a = Store.log_activity(db, company_id, "orchestrator", "verify.pass", issue_id)
-            _f = if (string_starts_with(tail, "FLAKY:") == 'true') {
-                _r = Store.flaky_record(db, company_id, flaky_key(tail))
-                Store.log_activity(db, company_id, "orchestrator", "verify.flaky", issue_id)
-            } else { "" }
             if (review_enabled() == 'true') {
                 start_review(db, running, retry, info, run_id, issue_id, now)
             } else {
