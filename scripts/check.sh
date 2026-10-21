@@ -1961,6 +1961,7 @@ for _i in $(seq 1 20); do [ -s "$TMP4/.o/digest.md" ] && break; sleep 0.5; done
 grep -q "Waiting on a person" "$TMP4/.o/digest.md" || fail "digest: no daily digest written"
 pass "digest: GET /api/waiting and ~/.o/digest.md list everything waiting on a person, oldest first"
 echo '[]' > "$GHS/issues.json"
+restart_d4 O_MERGE_GATE=1 O_AUTO_FILE=0 O_ENV_RETRY_S=2
 # inherited: base fails the same way, so the change isn't blamed
 git -C "$SEEDGH" fetch -q origin && git -C "$SEEDGH" checkout -q -B main origin/main
 echo broken > "$SEEDGH/BASE_BROKEN"; git -C "$SEEDGH" add BASE_BROKEN && git -C "$SEEDGH" commit -qm "break base" && git -C "$SEEDGH" push -q origin main
