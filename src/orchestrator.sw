@@ -2939,6 +2939,7 @@ fun do_gate(job) {
         } else {
         risks = change_risks(cfg, rv, files, str_or(map_get(job, "redo"), ""), str_or(map_get(job, "verify_cmd"), ""))
         tier0 = pr_tier(cfg, files)
+        _tn = file_write(map_get(job, "dir") ++ "/tiers.json", json_encode(pr_tier_names(cfg, files)))
         tier = if (length(risks) == 0) { tier0 } else { strict_tier(cfg, tier0) }
         rjob = map_put(job, "risks", risks)
         new_files = lines_of(elem(sh(f"git -C {sq(rv)} diff --no-renames --name-only --diff-filter=A o-base HEAD"), 1))
@@ -3585,6 +3586,90 @@ fun policy_risks(cfg) {
     if (length(on) == 0) { "(no risk detectors are on)" } else { Std.join(on, "; ") }
 }
 
+# ---- shadow mode (o#69) ------------------------------------------
+# A repo whose .o-review.json has "shadow": {"promote_after": N} starts in
+# shadow mode: the full pipeline and gate run, but O never merges a PR whose
+# tiers aren't promoted yet. It parks the PR In Review with what it would have
+# done. Each time the repo's people merge such a PR unchanged (its head is the
+# commit the gate approved), each of its tiers' streak goes up; a PR changed
+# before merging, or closed unmerged, or a later revert, resets the streak (a
+# revert also demotes). At N, the tier is promoted (shadow.promote) and O
+# merges that tier's PRs itself from then on: one tier per merge, so the
+# cheapest tiers, which merge most often, usually go first. /api/proof shows
+# each tier's progress. Files in no tier count as the tier "default".
+fun shadow_dir() { getenv("HOME") ++ "/.o/shadow" }
+
+fun shadow_needed(cfg) {
+    s = map_get(cfg, "shadow")
+    if (s == nil || s == 'false') { 0 } else {
+        n = map_get(s, "promote_after")
+        if (n == nil) { 10 } else { n }
+    }
+}
+
+fun pr_tier_names(cfg, files) {
+    tiers = cfg_list(cfg, "tiers")
+    Std.unique([(if (tier_of(tiers, f) == nil) { "default" } else { str_or(map_get(tier_of(tiers, f), "name"), "default") }) for f in files])
+}
+
+# The tiers of a gate-approved PR that are still in shadow ([] = O may merge).
+fun shadow_tiers(db, cid, repo, base, iid) {
+    cfg = review_config(repo, base)
+    need = shadow_needed(cfg)
+    p = getenv("HOME") ++ "/.o/maintainer/" ++ cid ++ "/" ++ iid ++ "/tiers.json"
+    names = if (file_exists(p) == 'true') { list_or_empty(json_decode(file_read(p))) } else { ["default"] }
+    if (need <= 0) { [] } else { [t for t in names when Store.shadow_promoted(db, cid, t) == 'false'] }
+}
+
+fun shadow_park(db, running, retry, run_id, iid, cid, gh, num, head, waiting, tiers_all, need) {
+    _m = sh("mkdir -p " ++ sq(shadow_dir()))
+    _w = file_write(shadow_dir() ++ "/" ++ iid ++ ".json", json_encode(%{sha: head, tiers: tiers_all, needed: need}))
+    progress = Std.join([t ++ " " ++ to_string(Store.shadow_streak(db, cid, t)) ++ "/" ++ to_string(need) for t in waiting], ", ")
+    _a = Store.log_activity(db, cid, "maintainer", "shadow.park", iid)
+    body = "**O would merge this** (shadow mode): the gate approved it at `" ++ string_sub(head, 0, 7) ++ "`, but O doesn't merge " ++ Std.join(waiting, ", ") ++ " changes in this repository yet. Merging it as it is counts toward O merging that kind of change itself (" ++ progress ++ " unchanged merges so far)."
+    _c = spawn(ask_worker_plain(gh, num, getenv("HOME") ++ "/.o/shadow/" ++ iid ++ ".md", body))
+    handle_ci_done(db, running, retry, run_id, iid, "in_review", "", "SHADOW: O would merge this PR (#" ++ to_string(num) ++ " at " ++ string_sub(head, 0, 7) ++ "); " ++ Std.join(waiting, ", ") ++ " is in shadow mode (" ++ progress ++ ").")
+}
+
+fun ask_worker_plain(gh_repo, num, path, body) {
+    _x = file_write(path, body)
+    gh_api(f"-X POST repos/{gh_repo}/issues/{num}/comments -F body=@{sq(path)}")
+}
+
+# A shadow PR was merged by a person (or closed): count it.
+fun shadow_settle(db, cid, iid, outcome) {
+    p = shadow_dir() ++ "/" ++ iid ++ ".json"
+    rec = if (file_exists(p) == 'true') { json_decode(file_read(p)) } else { nil }
+    if (rec == nil) { "" } else {
+        _rm = sh("rm -f " ++ sq(p))
+        mp = shadow_dir() ++ "/" ++ iid ++ ".merged"
+        mh = if (file_exists(mp) == 'true') { string_trim(file_read(mp)) } else { "" }
+        need = map_get(rec, "needed")
+        tiers = list_or_empty(map_get(rec, "tiers"))
+        if (outcome == "merged" && string_length(mh) > 0 && mh == str_or(map_get(rec, "sha"), "")) {
+            _u = [Store.shadow_set(db, cid, t, Store.shadow_streak(db, cid, t) + 1, Store.shadow_promoted_n(db, cid, t), need) for t in tiers]
+            _c = Store.log_activity(db, cid, "orchestrator", "shadow.count", iid)
+            ready = [t for t in tiers when Store.shadow_promoted(db, cid, t) == 'false' && Store.shadow_streak(db, cid, t) >= need]
+            if (length(ready) == 0) { "" } else {
+                t = hd(ready)
+                _p = Store.shadow_set(db, cid, t, Store.shadow_streak(db, cid, t), 1, need)
+                Store.log_activity(db, cid, "orchestrator", "shadow.promote", t)
+            }
+        } else {
+            _r = [Store.shadow_set(db, cid, t, 0, Store.shadow_promoted_n(db, cid, t), need) for t in tiers]
+            Store.log_activity(db, cid, "orchestrator", "shadow.reset", iid)
+        }
+    }
+}
+
+# A merge reverted after the fact: its tiers start over in shadow.
+fun shadow_demote(db, cid, iid) {
+    p = getenv("HOME") ++ "/.o/maintainer/" ++ cid ++ "/" ++ iid ++ "/tiers.json"
+    names = if (file_exists(p) == 'true') { list_or_empty(json_decode(file_read(p))) } else { [] }
+    _d = [Store.shadow_set(db, cid, t, 0, 0, Store.shadow_needed_of(db, cid, t)) for t in names when Store.shadow_known(db, cid, t) == 'true']
+    ""
+}
+
 # Post the decision with its evidence on the PR, and hand it back.
 fun gate_result(job, verdict, text, evidence, cmd_md, session, cost) {
     dir = map_get(job, "dir")
@@ -3717,9 +3802,18 @@ fun handle_gate_done(db, running, retry, run_id, issue_id, verdict, text, sessio
                 handle_ci_done(db, running, retry, run_id, issue_id, "in_review", "", f"HUMAN: the merge gate approved, but {gh_repo} is PR-only (not in O_AUTOMERGE_OWNERS): its maintainers merge.\n\n" ++ text)
             } else {
                 approved = str_or(map_get(info, "head"), "")
+                repo = str_or(map_get(company, "repo"), "")
+                base = company_base(company, repo)
+                waiting = shadow_tiers(db, company_id, repo, base, issue_id)
+                if (length(waiting) > 0) {
+                    tp = getenv("HOME") ++ "/.o/maintainer/" ++ company_id ++ "/" ++ issue_id ++ "/tiers.json"
+                    all_t = if (file_exists(tp) == 'true') { list_or_empty(json_decode(file_read(tp))) } else { waiting }
+                    shadow_park(db, running, retry, run_id, issue_id, company_id, gh_repo, num, approved, waiting, all_t, shadow_needed(review_config(repo, base)))
+                } else {
                 mpid = spawn(merge_worker(self(), run_id, issue_id, gh_repo, f"o/{issue_id}", num, approved))
                 info2 = map_put(map_put(map_put(info, "phase", 'ci'), "started_at", now), "worker_pid", mpid)
                 %{running: map_put(running, issue_id, info2), retry: map_remove(retry, issue_id)}
+                }
             }
         } else {
             if (string_starts_with(verdict, "REJECT") == 'true') {
@@ -3773,6 +3867,8 @@ fun review_poll_worker(orch, issue_id, gh_repo, adoptable0, signoff_repo) {
         ""
     } else {
         if (map_get(pr, "merged") == 'true') {
+            h = map_get(pr, "head")
+            _mh = if (h == nil || file_exists(shadow_dir() ++ "/" ++ issue_id ++ ".json") == 'false') { "" } else { file_write(shadow_dir() ++ "/" ++ issue_id ++ ".merged", str_or(map_get(h, "sha"), "")) }
             send(orch, {'pr_state', issue_id, "merged", num})
         } else { if (str_or(map_get(pr, "state"), "") == "closed") {
             send(orch, {'pr_state', issue_id, "closed", num})
@@ -4064,6 +4160,7 @@ fun handle_postmerge(db, cid, outcome, res) {
         _rv = if (merged) { Store.log_activity(db, cid, "orchestrator", "postmerge.reverted", str_or(map_get(res, "bad"), "")) } else { "" }
         if (string_length(iid) == 0 || Store.issue_row(db, iid) == nil) { "" } else {
             _e = Store.log_activity(db, cid, "orchestrator", "merge.revert", iid)
+            _sd = shadow_demote(db, cid, iid)
             _b = Store.issue_append_body(db, iid, "\n\n---\nThis change merged but broke main (O's post-merge check, " ++ sha ++ ")" ++ (if (merged) { " and was reverted" } else { "; the revert PR is open" }) ++ ". Redo it so the full check passes:\n\n" ++ string_truncate(str_or(map_get(res, "tail"), ""), 3000))
             Store.issue_set_status(db, iid, "Backlog")
         }
@@ -4275,12 +4372,14 @@ fun handle_pr_state(db, running, retry, issue_id, state, num) {
             _i = Store.issue_set_status(db, issue_id, "Done")
             _g = Store.company_mark_green(db, company_id)
             _a = Store.log_activity(db, company_id, "github", "pr.merged", issue_id)
+            _sh = shadow_settle(db, company_id, issue_id, "merged")
             _ls = learn_from_merge(db, company_id, issue_id, "")
             %{running: running, retry: map_remove(retry, issue_id)}
         } else { if (state == "closed") {
             _w = sh(f"git -C {sq(repo)} worktree remove {ws} --force")
             _i = Store.issue_set_status(db, issue_id, "Canceled")
             _a = Store.log_activity(db, company_id, "github", "pr.closed", issue_id)
+            _sh = shadow_settle(db, company_id, issue_id, "closed")
             %{running: running, retry: retry}
         } else { if (string_starts_with(state, "dirty:") == 'true') {
             # An approved PR waiting on a human now conflicts with base (other
@@ -4511,6 +4610,7 @@ fun handle_merge_done(db, running, retry, run_id, issue_id, outcome, merge_sha, 
                     _arch = archive_run(db, run_id, ws)
                     _wr = sh(f"git -C {sq(repo)} worktree remove {ws} --force")
                     _a = Store.log_activity(db, company_id, "orchestrator", "merge.revert", issue_id)
+                    _sd = shadow_demote(db, company_id, issue_id)
                     # Auto-file the regression fix, pointing at the kept branch.
                     _sf = file_revert(db, company_id, issue_id, merge_sha, branch, tail)
                     %{running: map_remove(running, issue_id), retry: map_remove(retry, issue_id)}
