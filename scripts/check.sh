@@ -2010,6 +2010,40 @@ sleep 6
 [ "$(pol_n)" = "2" ] || fail "policy: an unchanged config filed another update ($(pol_n) policy issues)"
 pass "policy: a config change regenerates docs/O-POLICY.md; an unchanged config files nothing"
 restart_d4 O_MERGE_GATE=1 O_AUTO_FILE=0 O_ENV_RETRY_S=2
+# Shadow mode (o#69): with "shadow" in .o-review.json O never merges a tier
+# it hasn't been promoted in; it parks the PR with what it would have done.
+# Two docs PRs merged unchanged by a person promote the docs tier, and O
+# merges the next docs PR itself. A shadow PR closed unmerged resets its tier.
+git -C "$SEEDGH" fetch -q origin && git -C "$SEEDGH" checkout -q -B main origin/main
+python3 -c 'import json,sys;p=sys.argv[1];d=json.load(open(p));d["shadow"]={"promote_after":2};json.dump(d,open(p,"w"),indent=1)' "$SEEDGH/.o-review.json"
+git -C "$SEEDGH" commit -qam "shadow mode" && git -C "$SEEDGH" push -q origin main
+shq() { sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='$1' AND target='$2'"; }
+for k in 1 2; do
+  ISk="$(gh_issue "[sim:docs] shadow docs $k")"; echo "o/$ISk" >> "$GHS/only_lint"
+  wait_status_at "$BASE4" "$ISk" "In Review" 180 || { grep -v '^\[orch\] tick' "$TMP4/daemon.log" | tail -20; fail "shadow: docs PR $k was not parked"; }
+  nk="$(pr_of "$ISk")"
+  for _i in $(seq 1 20); do grep -q "O would merge this" "$GHS/comments_$nk" 2>/dev/null && break; sleep 0.5; done
+  grep -q "O would merge this" "$GHS/comments_$nk" || { cat "$GHS/comments_$nk"; fail "shadow: no 'would merge' note on PR $k"; }
+  git -C "$GHS/remote.git" log --oneline main | grep "o/$ISk" >/dev/null && fail "shadow: O merged a PR in shadow mode"
+  touch "$GHS/merged_$nk"
+  wait_status_at "$BASE4" "$ISk" "Done" 60 || fail "shadow: a person's merge of PR $k was not picked up"
+  [ "$(shq shadow.count "$ISk")" = "1" ] || fail "shadow: an unchanged merge was not counted"
+done
+[ "$(shq shadow.promote docs)" = "1" ] || fail "shadow: two unchanged docs merges did not promote the docs tier"
+IS3="$(gh_issue '[sim:docs] shadow docs 3')"; echo "o/$IS3" >> "$GHS/only_lint"
+wait_status_at "$BASE4" "$IS3" "Done" 180 || fail "shadow: O did not merge a docs PR after the tier was promoted"
+git -C "$GHS/remote.git" log --oneline main | grep "o/$IS3" >/dev/null || fail "shadow: the promoted tier's PR was not merged by O"
+ISD="$(gh_issue '[sim:good] shadow default tier')"
+wait_status_at "$BASE4" "$ISD" "In Review" 180 || fail "shadow: a default-tier PR was not parked"
+touch "$GHS/closed_$(pr_of "$ISD")"
+wait_status_at "$BASE4" "$ISD" "Canceled" 60 || fail "shadow: a closed shadow PR was not picked up"
+[ "$(shq shadow.reset "$ISD")" = "1" ] || fail "shadow: a shadow PR closed unmerged did not reset its tier"
+pr="$(ocurl -s "$BASE4/api/proof")"
+[ "$(jget "$pr" '[ (s["streak"], s["needed"], s["promoted"]) for s in d["shadow"] if s["tier"] == "docs"] == [(2, 2, 1)] and [ s["streak"] for s in d["shadow"] if s["tier"] == "default"] == [0]')" = "True" ] || { echo "$pr"; fail "shadow: /api/proof does not show each tier's progress"; }
+pass "shadow: O parks PRs it would merge, two unchanged merges by a person promote the docs tier (logged), then O merges docs itself; a closed shadow PR resets its tier; /api/proof shows the progress"
+git -C "$SEEDGH" fetch -q origin && git -C "$SEEDGH" checkout -q -B main origin/main
+python3 -c 'import json,sys;p=sys.argv[1];d=json.load(open(p));d.pop("shadow");json.dump(d,open(p,"w"),indent=1)' "$SEEDGH/.o-review.json"
+git -C "$SEEDGH" commit -qam "shadow mode off" && git -C "$SEEDGH" push -q origin main
 # inherited: base fails the same way, so the change isn't blamed
 git -C "$SEEDGH" fetch -q origin && git -C "$SEEDGH" checkout -q -B main origin/main
 echo broken > "$SEEDGH/BASE_BROKEN"; git -C "$SEEDGH" add BASE_BROKEN && git -C "$SEEDGH" commit -qm "break base" && git -C "$SEEDGH" push -q origin main

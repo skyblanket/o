@@ -89,6 +89,8 @@ fun migrate(db) {
     _ix_les   = db_exec(db, "CREATE INDEX IF NOT EXISTS ix_lesson_sig ON lesson (company_id, sig)")
     # o#63: tests that failed and then passed on an identical re-run
     _flaky    = db_exec(db, "CREATE TABLE IF NOT EXISTS flaky (company_id TEXT, key TEXT, count INTEGER DEFAULT 0, last_ts INTEGER, PRIMARY KEY (company_id, key))")
+    # o#69: per tier, how many shadow PRs people merged unchanged in a row
+    _shadow   = db_exec(db, "CREATE TABLE IF NOT EXISTS shadow (company_id TEXT, tier TEXT, streak INTEGER DEFAULT 0, promoted INTEGER DEFAULT 0, needed INTEGER DEFAULT 0, updated_at INTEGER, PRIMARY KEY (company_id, tier))")
 
     # ---- persona pass -------------------------------------------
     # Simulated users who try a realistic task from the docs alone and report

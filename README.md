@@ -169,6 +169,18 @@ O edits real repositories on its own. The guard rails are the point.
   O answers each command on GitHub and applies it once. `GET /api/waiting`
   and a daily `~/.o/digest.md` list everything waiting on a person, oldest
   first.
+- **Shadow mode: a new repo earns auto-merge.** With
+  `"shadow": {"promote_after": 10}` in `.o-review.json`, O runs the full
+  pipeline and gate but never merges a PR whose tiers it hasn't been promoted
+  in. It parks the PR with a note saying it would merge it. Each time the
+  repo's people merge such a PR unchanged (its head is still the commit the
+  gate approved), each of its tiers moves one step closer.
+  - After `promote_after` such merges in a row, the tier is promoted
+    (`shadow.promote`), and from then on O merges that tier's PRs itself.
+  - A PR changed before merging, or closed unmerged, resets its tiers' count.
+  - A later revert also demotes the tier.
+  - `/api/proof` shows each tier's count, how many it needs, and whether it
+    is promoted.
 - **A public merge policy (`O_POLICY=1`).** O keeps `docs/O-POLICY.md` in
   each repo current: a plain-English account of what O may merge, generated
   from `.o-review.json` on the base branch. It covers the tiers, the hard

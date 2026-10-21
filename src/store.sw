@@ -807,6 +807,26 @@ fun count_verbs(db, verbs) {
     if (length(r) == 0) { 0 } else { map_get(hd(r), "n") }
 }
 
+fun shadow_row(db, cid, tier) {
+    r = db_query(db, "SELECT streak, promoted, needed FROM shadow WHERE company_id = ? AND tier = ?", [cid, tier])
+    if (length(r) == 0) { nil } else { hd(r) }
+}
+
+fun shadow_known(db, cid, tier) { if (shadow_row(db, cid, tier) == nil) { 'false' } else { 'true' } }
+
+fun shadow_streak(db, cid, tier) { r = shadow_row(db, cid, tier); if (r == nil) { 0 } else { map_get(r, "streak") } }
+
+fun shadow_promoted_n(db, cid, tier) { r = shadow_row(db, cid, tier); if (r == nil) { 0 } else { map_get(r, "promoted") } }
+
+fun shadow_promoted(db, cid, tier) { r = shadow_row(db, cid, tier); if (r == nil) { 'false' } else { if (map_get(r, "promoted") == 1) { 'true' } else { 'false' } } }
+
+fun shadow_needed_of(db, cid, tier) { r = shadow_row(db, cid, tier); if (r == nil) { 0 } else { map_get(r, "needed") } }
+
+fun shadow_set(db, cid, tier, streak, promoted, needed) {
+    _u = db_query(db, "INSERT INTO shadow (company_id, tier, streak, promoted, needed, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (company_id, tier) DO UPDATE SET streak = excluded.streak, promoted = excluded.promoted, needed = excluded.needed, updated_at = excluded.updated_at", [cid, tier, streak, promoted, needed, timestamp()])
+    tier
+}
+
 fun proof(db) {
     by_o = count_verbs(db, ["ci.merged", "merge.done"])
     by_human = count_verbs(db, ["pr.merged"])
@@ -831,6 +851,7 @@ fun proof(db) {
     budget = escape_budget(db, "")
     %{merged_by_o: by_o, merged_by_human: by_human, merges: merges,
       budget: map_get(budget, "state"), budget_window_merges: map_get(budget, "merges"), budget_window_escaped: map_get(budget, "escaped"),
+      shadow: db_query(db, "SELECT c.github_repo AS repo, s.tier, s.streak, s.needed, s.promoted FROM shadow s JOIN company c ON c.id = s.company_id ORDER BY c.github_repo, s.tier", []),
       resolved_issues: nres,
       first_attempt_pct: (if (nres > 0) { (100 * nfirst) / nres } else { 0 }),
       runs_per_resolved_x10: (if (nres > 0) { (10 * runs) / nres } else { 0 }),
