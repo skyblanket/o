@@ -1773,6 +1773,33 @@ sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_FC' ORD
 git -C "$GHS/remote.git" log --format=%ae "o/$IID_FC" | grep someone@example.com >/dev/null || fail "foreign commit: the person's commit was overwritten"
 pass "foreign commit: a person's commit on O's branch stops O's next push; the commit is kept and named"
 
+# Reproduce first (o#58): a bug-labelled issue gets a reproducer run that may
+# only add a failing test; O checks it fails, locks it, then the builder fixes
+# the code. Can't reproduce in two tries -> stops before any build attempt.
+# A builder that edits the locked test is rejected by the gate.
+echo '[{"number":30,"title":"[bug:repro] parser crash","body":"x","labels":[{"name":"o"},{"name":"bug"}]},{"number":31,"title":"[bug:norepro] vague crash","body":"x","labels":[{"name":"o"},{"name":"bug"}]},{"number":32,"title":"[bug:cheat] crash fixed by editing the test","body":"x","labels":[{"name":"o"},{"name":"bug"}]}]' > "$GHS/issues.json"
+restart_d4 O_REPRO=1 O_MERGE_GATE=1 O_AUTO_FILE=0
+rid() { sqlite3 "$TMP4/o.db" "SELECT id FROM issue WHERE company_id='$CIDG' AND fingerprint='gh:$1'"; }
+for _i in $(seq 1 30); do [ -n "$(rid 30)" ] && [ -n "$(rid 31)" ] && [ -n "$(rid 32)" ] && break; sleep 1; done
+IR30="$(rid 30)"; IR31="$(rid 31)"; IR32="$(rid 32)"
+[ -n "$IR30" ] && [ -n "$IR31" ] && [ -n "$IR32" ] || fail "repro: bug issues were not imported"
+rq() { sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='$1' AND target='$2'"; }
+wait_status_at "$BASE4" "$IR30" "Done" 240 || { grep -v '^\[orch\] tick' "$TMP4/daemon.log" | tail -25; fail "repro: a reproduced bug was not fixed and merged"; }
+[ "$(rq repro.ok "$IR30")" = "1" ] && [ "$(rq run.dispatch "$IR30")" = "2" ] || fail "repro: expected one reproducer run then one builder run"
+git -C "$GHS/remote.git" show "main:tests/r_$IR30.sh" >/dev/null 2>&1 && git -C "$GHS/remote.git" show "main:fix_$IR30" >/dev/null 2>&1 || fail "repro: the locked test and the fix did not both merge"
+pass "repro: a bug is reproduced by a locked failing test first, then fixed; both merge"
+wait_status_at "$BASE4" "$IR31" "Failed" 180 || fail "repro: a bug that can't be reproduced was not stopped"
+[ "$(rq repro.cannot "$IR31")" = "1" ] && [ "$(rq repro.fail "$IR31")" = "2" ] || fail "repro: expected two failed reproductions then repro.cannot"
+[ "$(rq run.dispatch "$IR31")" = "2" ] || fail "repro: a builder ran on a bug that was never reproduced"
+for _i in $(seq 1 20); do grep "could not reproduce" "$GHS/comments_31" >/dev/null 2>&1 && break; sleep 0.5; done
+grep "could not reproduce" "$GHS/comments_31" >/dev/null 2>&1 || fail "repro: no 'could not reproduce' note on the GitHub issue"
+pass "repro: a bug that can't be reproduced stops after two reproducer runs, before any build attempt, and says so on GitHub"
+wait_status_at "$BASE4" "$IR32" "Failed" 300 || fail "repro: a builder that edits the locked test was not stopped"
+sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IR32' ORDER BY started_at DESC LIMIT 1" | grep "changes a locked reproducing test" >/dev/null || fail "repro: the locked-test rule was not the reason"
+git -C "$GHS/remote.git" log --oneline main | grep "o/$IR32" >/dev/null && fail "repro: a PR that edits the locked test merged"
+pass "repro: a PR that edits the locked reproducing test is rejected by the gate"
+echo '[]' > "$GHS/issues.json"
+
 # Failure classes (o#59). main's verify.sh learns two failure modes: a box that
 # runs out of disk on the first two runs (ENV_FAIL), and a base that is itself
 # broken (BASE_BROKEN).
