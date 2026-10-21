@@ -354,7 +354,9 @@ fun build_retry_prompt(title, body, repo, protected, rebase_onto, verdict, tail)
 fun dispatch_prompt(db, iid, title, body, repo, protected, rebase_onto, attempt) {
     esc = escalation_lines(iid)
     note = if (length(esc) == 0) { "" } else { "\n\nA previous agent on this task asked for a stronger model and said: " ++ Std.last(esc) ++ "\nIts work so far is on this branch." }
-    dispatch_prompt_base(db, iid, title, body, repo, protected, rebase_onto, attempt) ++ note
+    locked = repro_locked_paths(iid)
+    lnote = if (length(locked) == 0) { "" } else { "\n\nThe bug is reproduced by a test already committed on this branch, now locked: " ++ Std.join(locked, ", ") ++ ". It fails today. Make it pass by fixing the code. Do not modify, move or delete it: a PR that changes a locked test is rejected." }
+    dispatch_prompt_base(db, iid, title, body, repo, protected, rebase_onto, attempt) ++ lnote ++ note
 }
 
 fun dispatch_prompt_base(db, iid, title, body, repo, protected, rebase_onto, attempt) {
@@ -597,6 +599,9 @@ fun tick_loop(db, dbpath, port, tick_n, running, retry) {
             tick_loop(db, dbpath, port, tick_n, running, retry)
         {'merge_done', run_id, issue_id, outcome, merge_sha, tail} ->
             r = handle_merge_done(db, running, retry, run_id, issue_id, outcome, merge_sha, tail)
+            tick_loop(db, dbpath, port, tick_n, map_get(r, "running"), map_get(r, "retry"))
+        {'repro_done', run_id, issue_id, ok, text, locked} ->
+            r = handle_repro_done(db, running, retry, run_id, issue_id, ok, text, locked)
             tick_loop(db, dbpath, port, tick_n, map_get(r, "running"), map_get(r, "retry"))
         {'plan_done', company_id, cost, taken, filed} ->
             _pd = handle_plan_done(db, company_id, cost, taken, filed)
@@ -986,7 +991,8 @@ fun dispatch_one(db, issue, iid, attempt, running, now) {
         # reads the PREVIOUS run's verify verdict (not the one we're about to
         # insert, which would sort first by started_at).
         rebase_onto = if (string_length(repo) > 0) { company_base(company, repo) } else { "main" }
-        prompt = dispatch_prompt(db, iid, title, body, repo, protected, rebase_onto, attempt)
+        repro = needs_repro(iid, attempt)
+        prompt = if (repro == 'true') { repro_prompt(title, body) } else { dispatch_prompt(db, iid, title, body, repo, protected, rebase_onto, attempt) }
         run_id = Store.run_create(db, iid, agent_id, attempt, "Running", workspace)
         _s = Store.issue_set_status(db, iid, "In Progress")
         _as = Store.issue_assign(db, iid, agent_id)
@@ -997,8 +1003,9 @@ fun dispatch_one(db, issue, iid, attempt, running, now) {
         print(f"[orch] dispatch {ident} via {runtime} ({resumed} session, attempt {attempt}, model {model})")
         sim_outcome = if (runtime == "sim") { decide_outcome(issue, attempt) } else { 'none' }
         start = worktree_start(company, repo)
-        wpid = spawn(run_worker(self(), run_id, iid, runtime, prompt, workspace, repo, session_id, sim_outcome, title, protected, start, model))
-        map_put(running, iid, %{run_id: run_id, worker_pid: wpid, started_at: now, attempt: attempt, company_id: company_id, agent_id: agent_id, phase: 'agent', workspace: workspace})
+        _rl = if (repro == 'true') { Store.log_activity(db, company_id, "orchestrator", "repro.start", iid) } else { "" }
+        wpid = spawn(run_worker(self(), run_id, iid, runtime, prompt, workspace, repo, (if (repro == 'true') { "" } else { session_id }), sim_outcome, (if (repro == 'true') { title ++ " [phase:repro]" } else { title }), protected, start, model))
+        map_put(running, iid, %{run_id: run_id, worker_pid: wpid, started_at: now, attempt: attempt, company_id: company_id, agent_id: agent_id, phase: (if (repro == 'true') { 'repro' } else { 'agent' }), workspace: workspace})
     }
 }
 
@@ -1584,7 +1591,16 @@ fun run_sim(orch, run_id, issue_id, outcome, workspace, repo, title, protected, 
 }
 
 # Which behaviour a repo-aware sim run performs, decoded from the issue title.
+# The reproducer phase and [bug:...] markers come first (o#58).
 fun sim_marker(title) {
+    if (string_contains(title, "[phase:repro]") == 'true') {
+        if (string_contains(title, "[bug:norepro]") == 'true') { "repro-pass" } else { "repro-fail" }
+    } else { if (string_contains(title, "[bug:cheat]") == 'true') { "bug-cheat" }
+    else { if (string_contains(title, "[bug:") == 'true') { "bug-fix" }
+    else { sim_marker_base(title) }}}
+}
+
+fun sim_marker_base(title) {
     if (string_contains(title, "[sim:no-commit]") == 'true') { "no-commit" }
     else { if (string_contains(title, "[sim:bad-verify]") == 'true') { "bad-verify" }
     else { if (string_contains(title, "[sim:protected]") == 'true') { "protected" }
@@ -1612,6 +1628,19 @@ fun sim_marker(title) {
 # writes ONE tracked file and commits it (add by exact path, so PROMPT.txt
 # stays untracked).
 fun sim_act(workspace, issue_id, marker, protected) {
+    if (marker == "repro-fail") {
+        # a test that needs the fix: fails until fix_<id> exists
+        sim_commit(workspace, f"tests/r_{issue_id}.sh", f"[ -f fix_{issue_id} ]")
+    } else { if (marker == "repro-pass") {
+        sim_commit(workspace, f"tests/r_{issue_id}.sh", "exit 0")
+    } else { if (marker == "bug-fix") {
+        sim_commit(workspace, f"fix_{issue_id}", "fixed")
+    } else { if (marker == "bug-cheat") {
+        sim_commit(workspace, f"tests/r_{issue_id}.sh", "exit 0")
+    } else { sim_act_base(workspace, issue_id, marker, protected) }}}}
+}
+
+fun sim_act_base(workspace, issue_id, marker, protected) {
     if (marker == "no-commit") {
         ""
     } else {
@@ -1743,6 +1772,14 @@ fun handle_done(db, running, retry, run_id, issue_id, outcome, cost, session_id)
                 spawn(needs_human_comment_worker(gh, string_sub(fp, 3, string_length(fp) - 3), issue_id, ask))
             } else { "" }
             %{running: map_remove(running, issue_id), retry: map_remove(retry, issue_id)}
+        } else { if (outcome == 'succeeded' && map_get(info, "phase") == 'repro') {
+            account_cost(db, company_id, cost)
+            company = Store.company_row(db, company_id)
+            repo = str_or(map_get(company, "repo"), "")
+            _m = Store.run_finish(db, run_id, "Reproducing", cost)
+            cpid = spawn(repro_check_worker(self(), run_id, issue_id, map_get(info, "workspace"), repo, company_base(company, repo), str_or(map_get(company, "verify_cmd"), "")))
+            info2 = map_put(map_put(map_put(info, "phase", 'repro_check'), "started_at", now), "worker_pid", cpid)
+            %{running: map_put(running, issue_id, info2), retry: retry}
         } else { if (outcome == 'succeeded') {
             # Spend is real whichever path we take, so account it immediately.
             account_cost(db, company_id, cost)
@@ -1792,7 +1829,7 @@ fun handle_done(db, running, retry, run_id, issue_id, outcome, cost, session_id)
                 retry2 = schedule_retry(retry, issue_id, attempt, now)
                 %{running: map_remove(running, issue_id), retry: retry2}
             }
-        }}
+        }}}
     }
 }
 
@@ -2341,6 +2378,7 @@ fun import_gh_issues(db, company_id, items) {
         body = str_or(map_get(it, "body"), "")
         id = if (num == nil) { nil } else { Store.issue_import_github(db, company_id, num, title, body) }
         _l = if (id == nil) { "" } else { Store.log_activity(db, company_id, "github", "github.import", f"gh:{num}") }
+        _bug = if (id != nil && Std.any(list_or_empty(map_get(it, "labels")), fn(l) { string_lower(str_or(map_get(l, "name"), "")) == "bug" }) == 'true') { repro_mark_bug(id) } else { "" }
         import_gh_issues(db, company_id, tl(items))
     }
 }
@@ -2725,7 +2763,8 @@ fun do_gate(job) {
             # An empty PR: nothing to review, so no model is paid for it.
             gate_result(job, "REJECT: the PR makes no change against " ++ base ++ " (its commits net out to nothing).", "", "", "", map_get(job, "session"), 0)
         } else {
-        broken = hard_rules(cfg, rv, files, lines, str_or(map_get(job, "title"), "") ++ "\n" ++ str_or(map_get(job, "body"), ""))
+        hr = hard_rules(cfg, rv, files, lines, str_or(map_get(job, "title"), "") ++ "\n" ++ str_or(map_get(job, "body"), ""))
+        broken = if (string_length(hr) > 0) { hr } else { locked_test_rule(rv, iid) }
         if (string_length(broken) > 0) {
             # A hard rule: no model may wave this through, so none is asked.
             gate_result(job, "REJECT: " ++ broken, "", "", "", map_get(job, "session"), 0)
@@ -2803,6 +2842,12 @@ fun hard_rules(cfg, rv, files, lines, issue) {
     } else { if (wants_test && tests_touched == 'false') {
         "hard rule: the issue asks for a test, and the PR adds or changes none. Add the test it asks for."
     } else { "" }}}}}}}}}
+}
+
+# A test the reproducer wrote and O locked must reach the merge untouched.
+fun locked_test_rule(rv, iid) {
+    changed = [hd(p) for p in repro_locked(iid) when string_trim(elem(sh("git -C " ++ sq(rv) ++ " rev-parse " ++ sq("HEAD:" ++ hd(p)) ++ " 2>/dev/null"), 1)) != Std.last(p)]
+    if (length(changed) == 0) { "" } else { "hard rule: the PR changes a locked reproducing test (" ++ Std.join(changed, ", ") ++ "). It captures the bug; fix the code so it passes instead." }
 }
 
 # A disposable, remote-less clone of the PR head merged with current base, so
@@ -3558,6 +3603,110 @@ fun no_longer_human(gh_repo, num, repo) {
     files = if (pf == nil) { [] } else { [str_or(map_get(f, "filename"), "") for f in pf] }
     if (length(files) == 0) { 'false' } else {
         if (map_get(pr_tier(review_config(repo, "origin/" ++ base), files), "human") == 'true') { 'false' } else { 'true' }
+    }
+}
+
+# ---- reproduce first (o#58, O_REPRO=1) -----------------------------
+# A bug (GitHub label `bug`) is reproduced before anyone fixes it. The first
+# run on it is a reproducer: it may only add a test that captures the bug.
+# O then checks it mechanically: tests only, and every new test fails on the
+# unfixed code. A reproduced test is locked (its blob recorded); the builder
+# is told to make it pass without touching it, and the gate rejects a PR that
+# changes it. A bug that can't be reproduced in two tries stops early, before
+# any build attempts are spent. State: ~/.o/repro/<issue>/{bug,locked,tries}.
+fun repro_dir(iid) { getenv("HOME") ++ "/.o/repro/" ++ iid }
+
+fun repro_mark_bug(iid) {
+    _m = sh("mkdir -p " ++ sq(repro_dir(iid)))
+    file_write(repro_dir(iid) ++ "/bug", "bug\n")
+}
+
+fun needs_repro(iid, attempt) {
+    if (getenv("O_REPRO") == "1" && attempt == 1 && file_exists(repro_dir(iid) ++ "/bug") == 'true' && file_exists(repro_dir(iid) ++ "/locked") == 'false' && repro_tries(iid) < 2) { 'true' } else { 'false' }
+}
+
+fun repro_tries(iid) {
+    f = repro_dir(iid) ++ "/tries"
+    if (file_exists(f) == 'true') { to_int_or(string_trim(file_read(f)), 0) } else { 0 }
+}
+
+# [path, blob] per locked test
+fun repro_locked(iid) {
+    f = repro_dir(iid) ++ "/locked"
+    if (file_exists(f) == 'true') { [string_split(l, "\t") for l in lines_of(file_read(f))] } else { [] }
+}
+
+fun repro_locked_paths(iid) { [hd(p) for p in repro_locked(iid)] }
+
+fun repro_prompt(title, body) {
+    "You are reproducing a reported bug before anyone fixes it. Do NOT fix it.\n\nWrite one or more tests, in the repository's test directories and following its existing test conventions, that FAIL today because of this bug and will pass once it is fixed. Commit only the test files (no changes to any other file). Each test should fail for the reason described, not for an unrelated one. If you cannot make a test fail for this reason, commit nothing and explain why in your final message.\n\n== Bug ==\n" ++ title ++ "\n\n" ++ body
+}
+
+# The reproducer's commit, checked: only test files changed, at least one
+# test added, and every added test fails here (the bug is still in the code).
+fun repro_check_worker(orch, run_id, iid, ws, repo, base, verify_cmd) {
+    cfg = review_config(repo, base)
+    test_dirs = ["tests/", "test/"] ++ flatten([list_or_empty(map_get(r, "paths")) for r in cfg_list(cfg, "test_runners")])
+    changed = lines_of(elem(sh(f"git -C {sq(ws)} diff --no-renames --name-only {base}...HEAD"), 1))
+    added = lines_of(elem(sh(f"git -C {sq(ws)} diff --no-renames --name-only --diff-filter=A {base}...HEAD"), 1))
+    other = [f for f in changed when starts_any_of(f, test_dirs) == 'false']
+    tests = [f for f in added when starts_any_of(f, test_dirs) == 'true']
+    if (length(other) > 0) {
+        send(orch, {'repro_done', run_id, iid, 'false', "The reproducer changed files that aren't tests (" ++ Std.join(other, ", ") ++ "); it may only add tests.", ""})
+    } else { if (length(tests) == 0) {
+        send(orch, {'repro_done', run_id, iid, 'false', "The reproducer added no test.", ""})
+    } else {
+        runs = [repro_run_test(cfg, ws, t, verify_cmd) for t in tests]
+        passing = [r for r in runs when map_get(r, "code") == 0]
+        if (length(passing) > 0) {
+            send(orch, {'repro_done', run_id, iid, 'false', "These tests pass on the unfixed code, so they don't reproduce the bug: " ++ Std.join([map_get(r, "file") for r in passing], ", "), ""})
+        } else {
+            locked = Std.join([t ++ "\t" ++ string_trim(elem(sh("git -C " ++ sq(ws) ++ " rev-parse " ++ sq("HEAD:" ++ t)), 1)) for t in tests], "\n")
+            send(orch, {'repro_done', run_id, iid, 'true', "Reproduced: " ++ Std.join(tests, ", ") ++ " fail(s) on the unfixed code.\n\n" ++ string_truncate(map_get(hd(runs), "tail"), 2000), locked})
+        }
+    }}
+}
+
+fun repro_run_test(cfg, ws, file, verify_cmd) {
+    runner = Std.find(cfg_list(cfg, "test_runners"), fn(r) { starts_any_of(file, list_or_empty(map_get(r, "paths"))) == 'true' })
+    cmd = if (runner == nil) { verify_cmd } else { string_replace(str_or(map_get(runner, "cmd"), ""), "{file}", sq(file)) }
+    logp = ws ++ "/repro.log"
+    r = shell_managed(timeout_cmd(verify_timeout_s(), cmd, ws, logp), verify_timeout_ms())
+    %{file: file, code: elem(r, 0), tail: tail_log(logp)}
+}
+
+# Sole DB writer for the reproducer's verdict.
+fun handle_repro_done(db, running, retry, run_id, iid, ok, text, locked) {
+    info = map_get(running, iid)
+    if (info == nil) { %{running: running, retry: retry} } else {
+        now = timestamp()
+        company_id = map_get(info, "company_id")
+        _v = Store.run_set_verify(db, run_id, (if (ok == 'true') { "reproduced" } else { "not_reproduced" }), text)
+        if (ok == 'true') {
+            _w = file_write(repro_dir(iid) ++ "/locked", locked ++ "\n")
+            _st = Store.run_set_state(db, run_id, "Reproduced")
+            _a = Store.log_activity(db, company_id, "orchestrator", "repro.ok", iid)
+            # the builder goes next, on the same attempt
+            %{running: map_remove(running, iid), retry: map_put(retry, iid, %{attempt: map_get(info, "attempt"), due_at: now})}
+        } else {
+            n = repro_tries(iid) + 1
+            _t = file_write(repro_dir(iid) ++ "/tries", to_string(n) ++ "\n")
+            _st = Store.run_set_state(db, run_id, "NotReproduced")
+            _a = Store.log_activity(db, company_id, "orchestrator", "repro.fail", iid)
+            if (n >= 2) {
+                _s = Store.issue_set_status(db, iid, "Failed")
+                _c = Store.log_activity(db, company_id, "orchestrator", "repro.cannot", iid)
+                co = Store.company_row(db, company_id)
+                gh = str_or(map_get(co, "github_repo"), "")
+                fp = str_or(map_get(Store.issue_row(db, iid), "fingerprint"), "")
+                _g = if (string_length(gh) > 0 && string_starts_with(fp, "gh:") == 'true') {
+                    spawn(stopped_comment_worker(gh, string_sub(fp, 3, string_length(fp) - 3), iid, "O could not reproduce this bug in 2 tries, so it did not try to fix it. Last result: " ++ text ++ "\n\nAdd steps that show the failure (a command and its output), then retry the issue."))
+                } else { "" }
+                %{running: map_remove(running, iid), retry: map_remove(retry, iid)}
+            } else {
+                %{running: map_remove(running, iid), retry: map_put(retry, iid, %{attempt: map_get(info, "attempt"), due_at: now + 2000})}
+            }
+        }
     }
 }
 
