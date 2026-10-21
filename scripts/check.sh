@@ -1783,14 +1783,15 @@ wait_status_at "$BASE4" "$IID_RK" "Done" 180 || { grep -v '^\[orch\] tick' "$TMP
 git -C "$GHS/remote.git" log --oneline main | grep "o/$IID_RK" >/dev/null || fail "re-adopt: the PR did not merge into main"
 pass "re-adopt: when the tiers stop asking for a human, a PR parked for sign-off is re-gated on current main and merged, no rebuild"
 
-# Someone else's commit on O's branch is never overwritten: after a red CI
-# round, a person pushes a fix onto the PR; O's next push parks instead.
+# Someone else's commit on O's branch is never overwritten. Deterministic:
+# with O drained, a person pushes a fix onto the issue's branch before O's
+# first push; O must park the issue instead of pushing over it.
+ocurl -s -X POST "$BASE4/api/orchestrator/drain" -H 'Content-Type: application/json' -d '{"on":true}' >/dev/null
 IID_FC="$(gh_issue '[sim:good] someone else pushes to this branch')"
-echo "o/$IID_FC" >> "$GHS/fail_ci"
-for _i in $(seq 1 90); do [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='ci.fail' AND target='$IID_FC'")" -ge 1 ] && break; sleep 1; done
-FCW="$TMP4/foreign"; rm -rf "$FCW"; git clone -q "$GHS/remote.git" "$FCW" && git -C "$FCW" checkout -q "o/$IID_FC"
+FCW="$TMP4/foreign"; rm -rf "$FCW"; git clone -q "$GHS/remote.git" "$FCW" && git -C "$FCW" checkout -q -b "o/$IID_FC" origin/main
 echo "human fix" > "$FCW/human.txt"; git -C "$FCW" add human.txt
 git -C "$FCW" -c user.email=someone@example.com -c user.name=Someone commit -q -m "a person's fix" && git -C "$FCW" push -q origin "o/$IID_FC"
+ocurl -s -X POST "$BASE4/api/orchestrator/drain" -H 'Content-Type: application/json' -d '{"on":false}' >/dev/null
 FSHA="$(git -C "$FCW" rev-parse --short=10 HEAD)"
 wait_status_at "$BASE4" "$IID_FC" "In Review" 180 || { grep -v '^\[orch\] tick' "$TMP4/daemon.log" | tail -20; fail "foreign commit: O did not stop before overwriting someone else's commit"; }
 sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_FC' ORDER BY started_at DESC LIMIT 1" | grep "someone else pushed commits" | grep "$FSHA" >/dev/null \
