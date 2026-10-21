@@ -1358,7 +1358,7 @@ sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_CIF' OR
   || fail "github: a real CI failure should be re-run once before red_ci"
 git -C "$GHS/remote.git" log --oneline main | grep "o/$IID_CIF" >/dev/null && fail "github: red-CI PR was merged"
 pass "github: failing checks -> red_ci x3 -> Failed (check names in the retry tail), never merged"
-NCIF="$(pr_of "$IID_CIF")"
+NCIF="$(grep -lx "o/$IID_CIF" "$GHS"/pr_* | head -1 | sed 's|.*/pr_||')"
 for _i in $(seq 1 20); do [ -f "$GHS/closed_$NCIF" ] && grep -q "What was tried" "$GHS/comments_$NCIF" 2>/dev/null && break; sleep 0.5; done
 [ -f "$GHS/closed_$NCIF" ] || fail "one PR per issue: O did not close the PR when it stopped"
 grep -q "3 attempts over 1 round(s)" "$GHS/comments_$NCIF" && grep -q "attempt 3: red_ci" "$GHS/comments_$NCIF" \
