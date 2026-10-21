@@ -1626,6 +1626,9 @@ cp "$SCRATCH/verify.sh" "$SCRATCHS/verify.sh"; echo "sandbox project" > "$SCRATC
 # a change carrying slow.txt makes the FIRST verify of it hang, once per suite
 # (the restart test below); later verifies, and changes cut from a main that
 # carries slow.txt, never sleep
+# isolation probe: interfaces this verify sees (its own netns has only lo),
+# and a /tmp file that must not show up on the host
+sed -i "/^exit 0\$/i grep -c ':' /proc/net/dev > '$TMP5/iso-net.txt'; : > /tmp/o-iso-probe" "$SCRATCHS/verify.sh"
 sed -i "/^exit 0\$/i if [ -f slow.txt ] \\&\\& [ ! -f '$TMP5/slept-once' ]; then : > '$TMP5/slept-once'; : > .slept; sleep 120; fi" "$SCRATCHS/verify.sh"
 echo '{ "tiers": [ { "name": "core", "paths": ["core/"], "merge": "auto", "builder": "sonnet" } ] }' > "$SCRATCHS/.o-review.json"
 git -C "$SCRATCHS" add -A; git -C "$SCRATCHS" commit -q -m "seed sandbox project"
@@ -1646,6 +1649,19 @@ echo "$p" > probes.txt
 date +%s%N > run-stamp.txt
 echo "$*" > "$SBX_ARGS"
 echo call >> "$SBX_ARGS.calls"
+cp PROMPT.txt "$SBX_ARGS.prompt.$(cat "$SBX_ARGS.calls" | wc -l)" 2>/dev/null || true
+# CRASHRUN: the first call does a few tool calls and exits 1 (a crash);
+# HANGRUN: the first call streams some usage and then hangs past the limit.
+if grep -q CRASHRUN PROMPT.txt && [ ! -f "$SBX_ARGS.crashed" ]; then
+  : > "$SBX_ARGS.crashed"
+  printf '%s\n' '{"type":"assistant","message":{"id":"m1","model":"claude-haiku","content":[{"type":"tool_use","name":"Bash","input":{"command":"make test-full"}}],"usage":{"input_tokens":10,"output_tokens":5}}}'
+  exit 1
+fi
+if grep -q HANGRUN PROMPT.txt && [ ! -f "$SBX_ARGS.hung" ]; then
+  : > "$SBX_ARGS.hung"
+  printf '%s\n' '{"type":"assistant","message":{"id":"h1","model":"claude-haiku","content":[{"type":"tool_use","name":"Bash","input":{"command":"sleep 240; tail log"}}],"usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":2000000}}}'
+  sleep 120
+fi
 if grep -q SLOWVERIFY PROMPT.txt 2>/dev/null; then echo slow > slow.txt; git add slow.txt; fi
 git add probes.txt run-stamp.txt && git commit -q -m "sandbox probes"
 printf '%s\n' '{"type":"result","total_cost_usd":0.01,"session_id":"sbx-1"}'
@@ -1725,6 +1741,40 @@ sleep 4
 ocurl -s -X POST "$BASE5/api/orchestrator/drain" -H 'Content-Type: application/json' -H "Authorization: Bearer $TOK" -d '{"on":false}' >/dev/null
 wait_status_at "$BASE5" "$IID_DR" "Done" 90 || { grep -v '^\[orch\] tick' "$TMP5/daemon.log" | tail -30; sqlite3 "$TMP5/.o/o.db" "SELECT attempt,state,verify_state,substr(verify_output,1,300) FROM run WHERE issue_id='$IID_DR' ORDER BY started_at" || true; sqlite3 "$TMP5/.o/o.db" "SELECT ts,verb FROM activity WHERE target='$IID_DR' ORDER BY ts" || true; fail "drain: dispatch did not resume after un-draining"; }
 pass "drain: POST /api/orchestrator/drain (token-guarded) stops new dispatch; un-drain resumes it"
+
+# Isolated test runs: the verify saw only loopback and wrote its /tmp privately.
+[ "$(cat "$TMP5/iso-net.txt" 2>/dev/null)" = "1" ] || fail "isolate: verify saw $(cat "$TMP5/iso-net.txt" 2>/dev/null || echo '?') interfaces, want only lo"
+[ -e /tmp/o-iso-probe ] && fail "isolate: the verify's /tmp leaked to the host"
+pass "isolate: verify runs in its own network namespace with a private /tmp (fixed ports and /tmp locks can't collide)"
+
+# Builders: told not to run the full suite; a new issue never resumes another
+# issue's session.
+grep -q "Do NOT run the project's full test suite" "$TMP5/agent-args.prompt.1" || fail "builder prompt: no full-suite rule"
+grep -q -- "--resume" "$TMP5/agent-args" && fail "session: a new issue resumed an old session ($(cat "$TMP5/agent-args"))"
+pass "builders: the prompt keeps them off the full suite; each issue starts its own session"
+
+# A crash: the retry is told how the last attempt died and what it was doing.
+IID_CR="$(jget "$(ocurl -s -X POST "$BASE5/api/companies/$CIDS/issues" -H 'Content-Type: application/json' -d '{"title":"CRASHRUN probe"}')" 'd["id"]')"
+wait_status_at "$BASE5" "$IID_CR" "Done" 90 || { grep -v '^\[orch\] tick' "$TMP5/daemon.log" | tail -20; fail "crash: the retried issue never Done"; }
+last="$(ls "$TMP5/agent-args".prompt.* | sort -t. -k3 -n | tail -1)"
+grep -q "ended with an error (exit 1)" "$last" && grep -q "Bash: make test-full" "$last" || { cat "$last"; fail "crash: the retry prompt lacks how the last attempt died"; }
+[ "$(sqlite3 "$TMP5/.o/o.db" "SELECT verify_state FROM run WHERE issue_id='$IID_CR' AND attempt=1")" = "red_agent" ] || fail "crash: the crashed run's verdict is not red_agent"
+pass "crash: the retry prompt says how the last attempt died and its last actions"
+
+# A run killed at its time limit is charged from the usage it streamed
+# (2M cache-read tokens on haiku = 20 cents), not the flat guess.
+stop_daemon "$DAEMON5_PID"
+HOME="$TMP5" O_DB="$TMP5/.o/o.db" O_PORT="$PORT5" O_NO_OPEN=1 O_SANDBOX=bwrap O_API_TOKEN="$TOK" GH_TOKEN=fake-gh-token O_STALL_TIMEOUT_S=6 \
+  O_CLAUDE_BIN="$TMP5/agent-stub" SBX_REPO="$SCRATCHS" SBX_ARGS="$TMP5/agent-args" ./bin/swarmd >>"$TMP5/daemon.log" 2>&1 &
+DAEMON5_PID=$!
+for _i in $(seq 1 30); do [ "$(ocurl -s -o /dev/null -w '%{http_code}' "$BASE5/api/health" 2>/dev/null || true)" = "200" ] && break; sleep 0.5; done
+IID_HG="$(jget "$(ocurl -s -X POST "$BASE5/api/companies/$CIDS/issues" -H 'Content-Type: application/json' -d '{"title":"HANGRUN probe"}')" 'd["id"]')"
+wait_status_at "$BASE5" "$IID_HG" "Done" 120 || { grep -v '^\[orch\] tick' "$TMP5/daemon.log" | tail -20; fail "timeout: the retried issue never Done"; }
+hc="$(sqlite3 "$TMP5/.o/o.db" "SELECT cost_cents FROM run WHERE issue_id='$IID_HG' AND attempt=1")"
+[ "$hc" = "20" ] || fail "timeout: a killed run should cost its streamed usage (20c), got '$hc'"
+last="$(ls "$TMP5/agent-args".prompt.* | sort -t. -k3 -n | tail -1)"
+grep -q "time limit" "$last" && grep -q "sleep 240" "$last" || { cat "$last"; fail "timeout: the retry prompt lacks the time-limit note"; }
+pass "timeout: a killed run costs what it streamed (not a flat \$3) and its retry is told why it stopped"
 else
   echo "SKIP: agent sandbox stage (unprivileged bwrap unavailable here)"
 fi
