@@ -1368,7 +1368,9 @@ for _i in $(seq 1 90); do [ -f "$GHS/reopened_$NCIF" ] && break; sleep 1; done
 [ -f "$GHS/reopened_$NCIF" ] || { tail -30 "$TMP4/daemon.log"; fail "one PR per issue: the next round did not reopen the closed PR"; }
 wait_status_at "$BASE4" "$IID_CIF" "Failed" 150 || fail "one PR per issue: the second round never finished"
 [ "$(grep -lx "o/$IID_CIF" "$GHS"/pr_* | wc -l)" = "1" ] || fail "one PR per issue: a second round opened a new PR"
-grep -q "6 attempts over 2 round(s)" "$GHS/comments_$NCIF" || fail "one PR per issue: the second close note lacks both rounds"
+# the close note is posted by a worker after the status flips: wait for it
+for _i in $(seq 1 20); do grep -q "6 attempts over 2 round(s)" "$GHS/comments_$NCIF" && break; sleep 0.5; done
+grep -q "6 attempts over 2 round(s)" "$GHS/comments_$NCIF" || { cat "$GHS/comments_$NCIF"; fail "one PR per issue: the second close note lacks both rounds"; }
 pass "one PR per issue: stopping closes the PR with what was tried; another round reopens the same PR"
 wait_status_at "$BASE4" "$IID_BLK" "In Review" 90 || { tail -40 "$TMP4/daemon.log"; fail "github: merge-refused issue never parked In Review"; }
 sleep 6
