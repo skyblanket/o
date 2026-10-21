@@ -564,6 +564,23 @@ fun flaky_top(db, company_id, min) {
     db_query(db, "SELECT key, count FROM flaky WHERE company_id = ? AND count >= ? ORDER BY count DESC LIMIT 5", [company_id, min])
 }
 
+# The quality budget (o#64): over the last 14 days, the share of a company's
+# merges that escaped (reverted by the post-merge check or found still broken).
+# company_id "" means every company.
+fun escape_budget(db, company_id) {
+    since = timestamp() - 14 * 86400000
+    scope = if (string_length(company_id) > 0) { " AND company_id = ?" } else { "" }
+    args = if (string_length(company_id) > 0) { [since, company_id] } else { [since] }
+    m = db_query(db, "SELECT COUNT(*) AS n FROM activity WHERE ts >= ? AND verb IN ('ci.merged', 'merge.done', 'pr.merged')" ++ scope, args)
+    e = db_query(db, "SELECT COUNT(*) AS n FROM activity WHERE ts >= ? AND verb IN ('merge.revert', 'persona.still_broken')" ++ scope, args)
+    merges = if (length(m) == 0) { 0 } else { map_get(hd(m), "n") }
+    escaped = if (length(e) == 0) { 0 } else { map_get(hd(e), "n") }
+    t = getenv("O_ESCAPE_TARGET_PCT")
+    target = if (t == nil) { 2 } else { n = to_int(t); if (n == nil) { 2 } else { n } }
+    state = if (merges < 10) { "insufficient data" } else { if (100 * escaped > target * merges) { "spent" } else { "ok" } }
+    %{merges: merges, escaped: escaped, target_pct: target, state: state}
+}
+
 fun last_run_for_issue(db, issue_id) {
     rows = db_query(db, "SELECT id, issue_id, agent_id, attempt, state, verify_state, verify_output, started_at, thread_id, failure_sig FROM run WHERE issue_id = ? ORDER BY started_at DESC LIMIT 1", [issue_id])
     if (length(rows) == 0) { nil } else { hd(rows) }
@@ -796,7 +813,9 @@ fun proof(db) {
     nfirst = if (length(first) == 0) { 0 } else { map_get(hd(first), "n") }
     nfail = if (length(failed) == 0) { 0 } else { map_get(hd(failed), "n") }
     median = if (length(cyc) == 0) { 0 } else { map_get(Std.at(cyc, length(cyc) / 2), "d") }
+    budget = escape_budget(db, "")
     %{merged_by_o: by_o, merged_by_human: by_human, merges: merges,
+      budget: map_get(budget, "state"), budget_window_merges: map_get(budget, "merges"), budget_window_escaped: map_get(budget, "escaped"),
       resolved_issues: nres,
       first_attempt_pct: (if (nres > 0) { (100 * nfirst) / nres } else { 0 }),
       runs_per_resolved_x10: (if (nres > 0) { (10 * runs) / nres } else { 0 }),
