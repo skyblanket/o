@@ -1977,8 +1977,39 @@ grep -F "O merge gate** (sonnet)" "$crm" >/dev/null && fail "risk: a risky docs 
 grep -q "test ! -f ext/broken" "$crm" || { cat "$crm"; fail "risk: a risky change did not run every tier's extra checks"; }
 grep -q "loosens a check, rule or timeout in config" "$GHS/comments_$(pr_of "$IID_RL")" || fail "risk: a loosened lint rule was not named"
 grep -q "redoes a change O merged before that was reverted" "$GHS/comments_$(pr_of "$IID_RR")" || fail "risk: a redo of a reverted change was not named"
-grep -q "Risks found" "$GHS/comments_$(pr_of "$IID_GM")" && fail "risk: a plain change was flagged"
+grep -qF "**Risks found**" "$GHS/comments_$(pr_of "$IID_GM")" && fail "risk: a plain change was flagged"
 pass "risk: a migration, a loosened config rule and a redo of a reverted change each get the strictest gate (strongest model, every tier's checks), named on the gate comment; a plain change gets none"
+# Public policy (o#66, O_POLICY=1): O generates docs/O-POLICY.md from
+# .o-review.json and lands it through its own pipeline; a config change
+# regenerates it; an unchanged config files nothing. The merged PR's record
+# names the gate's verdict and model and O's checks.
+restart_d4 O_MERGE_GATE=1 O_AUTO_FILE=0 O_ENV_RETRY_S=2 O_POLICY=1 O_POLICY_S=2
+pol_q() { sqlite3 "$TMP4/o.db" "SELECT id FROM issue WHERE company_id='$CIDG' AND fingerprint='policy' ORDER BY created_at DESC LIMIT 1"; }
+pol_n() { sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM issue WHERE company_id='$CIDG' AND fingerprint='policy'"; }
+for _i in $(seq 1 30); do IP1="$(pol_q)"; [ -n "$IP1" ] && break; sleep 1; done
+[ -n "$IP1" ] || { grep -v '^\[orch\] tick' "$TMP4/daemon.log" | tail -20; ls -la "$TMP4/.o/policy" "$TMP4"/o.db* 2>&1; sqlite3 "$TMP4/o.db" "SELECT id, status, github_repo, repo FROM company"; sqlite3 "$TMP4/o.db" "SELECT identifier, status, origin, fingerprint FROM issue ORDER BY created_at DESC LIMIT 5"; fail "policy: no policy update was filed"; }
+echo "o/$IP1" >> "$GHS/only_lint"
+wait_status_at "$BASE4" "$IP1" "Done" 180 || { grep -v '^\[orch\] tick' "$TMP4/daemon.log" | tail -20; sqlite3 "$TMP4/o.db" "SELECT attempt, verify_state, substr(verify_output, 1, 300) FROM run WHERE issue_id='$IP1'"; fail "policy: the policy update never merged"; }
+pol="$(git -C "$GHS/remote.git" show main:docs/O-POLICY.md)"
+for want in "How O maintains this repository" "**docs** (\`docs/\`, \`README.md\`)" "gate model: sonnet" "Hard rules" "What O never does" "\`sh verify.sh\`"; do
+  printf '%s' "$pol" | grep -qF "$want" || { printf '%s\n' "$pol"; fail "policy: docs/O-POLICY.md lacks: $want"; }
+done
+crec="$GHS/comments_$(pr_of "$IP1")"
+for _i in $(seq 1 20); do grep -q "O merge record" "$crec" 2>/dev/null && break; sleep 0.5; done
+grep -q "Merge gate: \`APPROVE\` by" "$crec" && grep -q "O's checks:" "$crec" && grep -q "Risks found: none" "$crec" || { cat "$crec"; fail "audit: the merge record lacks the gate's verdict, model, risks or checks"; }
+pass "policy: O generates docs/O-POLICY.md from .o-review.json and merges it through its own gate; the merge record names the gate's verdict, model, risks and checks"
+git -C "$SEEDGH" fetch -q origin && git -C "$SEEDGH" checkout -q -B main origin/main
+python3 -c 'import json,sys;p=sys.argv[1];d=json.load(open(p));d["tiers"].append({"name":"web","paths":["web/"],"merge":"auto"});json.dump(d,open(p,"w"),indent=1)' "$SEEDGH/.o-review.json"
+git -C "$SEEDGH" commit -qam "add a web tier" && git -C "$SEEDGH" push -q origin main
+for _i in $(seq 1 60); do IP2="$(pol_q)"; [ -n "$IP2" ] && [ "$IP2" != "$IP1" ] && break; sleep 1; done
+[ -n "$IP2" ] && [ "$IP2" != "$IP1" ] || fail "policy: a config change did not regenerate the policy"
+echo "o/$IP2" >> "$GHS/only_lint"
+wait_status_at "$BASE4" "$IP2" "Done" 180 || fail "policy: the regenerated policy never merged"
+git -C "$GHS/remote.git" show main:docs/O-POLICY.md | grep -qF "**web**" || fail "policy: the regenerated policy lacks the new tier"
+sleep 6
+[ "$(pol_n)" = "2" ] || fail "policy: an unchanged config filed another update ($(pol_n) policy issues)"
+pass "policy: a config change regenerates docs/O-POLICY.md; an unchanged config files nothing"
+restart_d4 O_MERGE_GATE=1 O_AUTO_FILE=0 O_ENV_RETRY_S=2
 # inherited: base fails the same way, so the change isn't blamed
 git -C "$SEEDGH" fetch -q origin && git -C "$SEEDGH" checkout -q -B main origin/main
 echo broken > "$SEEDGH/BASE_BROKEN"; git -C "$SEEDGH" add BASE_BROKEN && git -C "$SEEDGH" commit -qm "break base" && git -C "$SEEDGH" push -q origin main

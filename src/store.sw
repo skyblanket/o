@@ -283,6 +283,15 @@ fun self_file_cap() {
 # Count of OPEN (non-terminal) issues in a company carrying this exact
 # fingerprint. The dedup key for auto-filing: a caller that got nil back
 # from issue_create_auto uses this to tell "duped" (>0) from "capped" (0).
+fun issue_set_fingerprint(db, id, fingerprint) {
+    _u = db_query(db, "UPDATE issue SET fingerprint = ? WHERE id = ?", [fingerprint, id])
+    id
+}
+
+fun issues_with_fp(db, company_id, fingerprint) {
+    db_query(db, "SELECT id FROM issue WHERE company_id = ? AND fingerprint = ? AND status NOT IN ('Done', 'Canceled', 'Failed', 'Reverted')", [company_id, fingerprint])
+}
+
 fun issue_open_fp_count(db, company_id, fingerprint) {
     rows = db_query(db, "SELECT COUNT(*) AS n FROM issue WHERE company_id = ? AND fingerprint = ? AND status NOT IN ('Done', 'Canceled', 'Failed', 'Reverted')", [company_id, fingerprint])
     if (length(rows) == 0) { 0 } else { map_get(hd(rows), "n") }

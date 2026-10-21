@@ -639,6 +639,7 @@ fun do_tick(db, dbpath, port, tick_n, running, retry) {
     _pm = if (quiet) { "" } else { maybe_postmerge(db, now) }
     _pl = if (quiet) { "" } else { maybe_plan(db, now) }
     _dg = maybe_digest(db, now)
+    _po = if (quiet) { "" } else { maybe_policy(db, now) }
     swept = sweep_stalls(db, map_keys(running), running, retry, now)
     sr = map_get(swept, "running")
     sq = map_get(swept, "retry")
@@ -1101,7 +1102,9 @@ fun escalation_in(text) {
 }
 
 fun run_worker(orch, run_id, issue_id, runtime, prompt, workspace, repo, session_id, sim_outcome, title, protected, start, model) {
-    if (runtime == "sim") {
+    if (string_length(repo) > 0 && file_exists(policy_src(issue_id)) == 'true') {
+        run_policy(orch, run_id, issue_id, workspace, repo, start)
+    } else { if (runtime == "sim") {
         # the sim agent ignores its prompt; keep it so tests can read it
         _pd = sh("mkdir -p " ++ sq(getenv("HOME") ++ "/.o/prompts"))
         _pw = file_write(getenv("HOME") ++ "/.o/prompts/" ++ run_id ++ ".txt", prompt)
@@ -1112,7 +1115,7 @@ fun run_worker(orch, run_id, issue_id, runtime, prompt, workspace, repo, session
         } else {
             run_claude_code(orch, run_id, issue_id, prompt, workspace, repo, session_id, start, model)
         }
-    }
+    }}
 }
 
 # claude-code runtime — a real headless `claude -p` run in the
@@ -2021,6 +2024,20 @@ fun norm_line(l) {
 # The merge record O leaves on every PR it merges (o#66): what merged, what
 # it took, and what went wrong on the way. The gate's own comment above it
 # carries the checks and the verdict.
+# The merge gate's part of the record, from the last review of this issue.
+fun audit_gate(db, issue_id) {
+    iss = Store.issue_row(db, issue_id)
+    p = getenv("HOME") ++ "/.o/maintainer/" ++ (if (iss == nil) { "" } else { map_get(iss, "company_id") }) ++ "/" ++ issue_id ++ "/gate.json"
+    g = if (file_exists(p) == 'true') { json_decode(file_read(p)) } else { nil }
+    if (g == nil) { "- Merge gate: not run\n" } else {
+        risks = list_or_empty(map_get(g, "risks"))
+        checks = list_or_empty(map_get(g, "checks"))
+        "- Merge gate: `" ++ string_truncate(str_or(map_get(g, "verdict"), ""), 120) ++ "` by " ++ str_or(map_get(g, "model"), "") ++ " (its full review and the commands it ran are in the gate comment above)\n" ++
+        "- Risks found: " ++ (if (length(risks) == 0) { "none" } else { Std.join([to_string(r) for r in risks], "; ") }) ++ "\n" ++
+        (if (length(checks) == 0) { "- O's checks: none configured\n" } else { "- O's checks:\n" ++ Std.join(["  " ++ to_string(c) for c in checks], "\n") ++ "\n" })
+    }
+}
+
 fun audit_text(db, issue_id, sha) {
     runs = Store.run_history(db, issue_id)
     fails = [r for r in runs when string_starts_with(str_or(map_get(r, "verify_state"), ""), "red") == 'true']
@@ -2030,7 +2047,8 @@ fun audit_text(db, issue_id, sha) {
     "- Builder runs: " ++ to_string(Store.run_count_for_issue(db, issue_id)) ++ " over " ++ to_string(rounds) ++ " round(s); reproduced first: " ++ (if (Store.count_target_verb(db, issue_id, "repro.ok") > 0) { "yes" } else { "no" }) ++ "\n" ++
     "- Failures on the way: " ++ (if (length(fails) == 0) { "none" } else { Std.join(["`" ++ str_or(map_get(r, "verify_state"), "") ++ "`: " ++ first_line(str_or(map_get(r, "verify_output"), "")) for r in Std.take(fails, 5)], "; ") }) ++ "\n" ++
     "- Environment re-runs: " ++ to_string(Store.count_target_verb(db, issue_id, "verify.env")) ++ "; failures inherited from base: " ++ to_string(Store.count_target_verb(db, issue_id, "verify.inherited")) ++ "\n" ++
-    "- Cost: $" ++ to_string(Store.issue_cost(db, issue_id) / 100.0) ++ "\n\n" ++
+    "- Cost: $" ++ to_string(Store.issue_cost(db, issue_id) / 100.0) ++ "\n" ++
+    audit_gate(db, issue_id) ++ "\n" ++
     "If this merge breaks `main`, O's post-merge check bisects to it and reverts it."
 }
 
@@ -2950,7 +2968,7 @@ fun do_gate(job) {
 #     plus .o-review.json "locked_paths")
 #   - at most "max_change_lines" (default 1500) lines added + deleted, and
 #     at most "max_change_files" files when the repo sets it
-#   - no unfinished code outside tests (TODO, FIXME, unimplemented!,
+#   - no unfinished code outside tests and prose (TODO, FIXME, unimplemented!,
 #     NotImplementedError)
 #   - no secrets in added lines (cloud keys, private keys, tokens)
 #   - no submodule changes
@@ -2969,7 +2987,9 @@ fun hard_rules(cfg, rv, files, lines, issue) {
     flim = map_get(cfg, "max_change_files")
     max_files = if (flim == nil) { 0 } else { flim }
     excl = Std.join([sq(":(exclude)" ++ d) for d in Std.unique(test_dirs)], " ")
-    added = f"git -C {sq(rv)} diff --no-renames -U0 o-base HEAD -- . {excl} | grep -E '^[+][^+]'"
+    # prose may name these words; only code counts
+    prose = Std.join([sq(":(exclude,glob)**/*." ++ e) for e in ["md", "rst", "txt"]], " ")
+    added = f"git -C {sq(rv)} diff --no-renames -U0 o-base HEAD -- . {excl} {prose} | grep -E '^[+][^+]'"
     stubs = lines_of(elem(sh(added ++ " | grep -E 'TODO|FIXME|unimplemented!|NotImplementedError' | head -3"), 1))
     all_added = f"git -C {sq(rv)} diff --no-renames -U0 o-base HEAD | grep -E '^[+][^+]'"
     secrets = lines_of(elem(sh(all_added ++ " | grep -E 'AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|gh[pousr]_[A-Za-z0-9]{36}|xox[baprs]-[A-Za-z0-9-]{10,}|sk-[A-Za-z0-9]{32,}' | head -3"), 1))
@@ -3451,11 +3471,127 @@ fun risks_md(risks) {
     if (length(risks) == 0) { "" } else { "**Risks found** (this PR gets the strictest gate: the strongest model and every tier's checks):\n" ++ Std.join(["- " ++ r for r in risks], "\n") ++ "\n\n" }
 }
 
+# ---- public merge policy (o#66, O_POLICY=1) ------------------------
+# O keeps docs/O-POLICY.md in each repo current: a plain-English account of
+# what O may merge, generated from the base branch's .o-review.json. Every
+# O_POLICY_S (default an hour) O regenerates it; when the repo's copy differs,
+# O files an issue (fingerprint "policy") whose run writes exactly that file,
+# so the update goes through verify, CI and the merge gate like any change.
+fun policy_src(iid) { getenv("HOME") ++ "/.o/policy/issue-" ++ iid ++ ".md" }
+
+fun maybe_policy(db, now) {
+    every = env_int("O_POLICY_S", 3600) * 1000
+    f = getenv("HOME") ++ "/.o/policy/started"
+    last = if (file_exists(f) == 'true') { to_int_or(string_trim(file_read(f)), 0) } else { 0 }
+    if (getenv("O_POLICY") != "1" || every <= 0 || now - last < every) { "" } else {
+        _m = sh("mkdir -p " ++ sq(getenv("HOME") ++ "/.o/policy"))
+        _w = file_write(f, to_string(now))
+        policy_each(db, [c for c in Store.companies_with_github(db)])
+    }
+}
+
+fun policy_each(db, cos) {
+    if (length(cos) == 0) { "" } else {
+        cid = map_get(hd(cos), "id")
+        co = Store.company_row(db, cid)
+        repo = str_or(map_get(co, "repo"), "")
+        _p = if (string_length(repo) == 0) { "" } else {
+            base = company_base(co, repo)
+            _f = sh(f"git -C {sq(repo)} fetch -q origin")
+            want = policy_md(review_config(repo, base), co)
+            have = elem(sh(f"git -C {sq(repo)} show {sq(base ++ ":docs/O-POLICY.md")}"), 1)
+            if (string_trim(have) == string_trim(want)) { "" } else {
+                open = Store.issues_with_fp(db, cid, "policy")
+                if (length(open) > 0) {
+                    # a policy update is already queued: it writes the newest text
+                    file_write(policy_src(map_get(hd(open), "id")), want)
+                } else {
+                    # not the self-file cap's to throttle: one open update at most
+                    id = Store.issue_create_with_origin(db, cid, "Update docs/O-POLICY.md", "O regenerated its merge policy from .o-review.json on " ++ base ++ " and the repository's copy differs. This change writes docs/O-POLICY.md exactly as generated.", "low", "policy")
+                    if (id == nil) { "" } else {
+                        _fp = Store.issue_set_fingerprint(db, id, "policy")
+                        _w = file_write(policy_src(id), want)
+                        Store.log_activity(db, cid, "orchestrator", "policy.update", id)
+                    }
+                }
+            }
+        }
+        policy_each(db, tl(cos))
+    }
+}
+
+# The policy run: no agent, O writes the generated file and commits it.
+fun run_policy(orch, run_id, issue_id, workspace, repo, start) {
+    _wt = prepare_worktree(repo, workspace, issue_id, start)
+    _d = sh(f"mkdir -p {sq(workspace)}/docs")
+    _c = sh(f"cp {sq(policy_src(issue_id))} {sq(workspace)}/docs/O-POLICY.md && cd {sq(workspace)} && git add docs/O-POLICY.md && git commit -q -m 'Update docs/O-POLICY.md (generated by O from .o-review.json)'")
+    send(orch, {'run_done', run_id, issue_id, 'succeeded', 0, ""})
+}
+
+fun policy_md(cfg, company) {
+    tiers = cfg_list(cfg, "tiers")
+    req = cfg_list(cfg, "required_checks")
+    dflt = if (cfg_str(cfg, "default_merge") == "human") { "need a person's sign-off" } else { "follow the default rules above" }
+    maxl = if (map_get(cfg, "max_change_lines") == nil) { 1500 } else { map_get(cfg, "max_change_lines") }
+    maxf = map_get(cfg, "max_change_files")
+    locked = cfg_list(cfg, "locked_paths")
+    "# How O maintains this repository\n\n" ++
+    "_Generated by O from `.o-review.json` on the base branch. Don't edit it by hand: O regenerates it when the config changes._\n\n" ++
+    "O is an autonomous maintainer. It builds changes on its own branches (`o/<issue>`), opens a pull request for each, and merges only what passes every step below. Each merged PR carries an **O merge record** comment: the commit merged, the gate's verdict and model, the checks and their results, attempts, failures on the way, and cost.\n\n" ++
+    "## Before anything merges\n\n" ++
+    "1. **Verify.** The repository's verify command passes on the change (" ++ (if (string_length(str_or(map_get(company, "verify_cmd"), "")) > 0) { "`" ++ str_or(map_get(company, "verify_cmd"), "") ++ "`" } else { "none set" }) ++ "). A failure that also happens on the base branch, or in the environment, is not blamed on the change.\n" ++
+    "2. **CI.** The pull request's required checks pass on the change merged with the current base" ++ (if (length(req) > 0) { ": " ++ Std.join(["`" ++ to_string(r) ++ "`" for r in req], ", ") } else { "" }) ++ ".\n" ++
+    "3. **O's own checks.** Build: " ++ policy_cmd(cfg_str(cfg, "build")) ++ "; suite: " ++ policy_cmd(cfg_str(cfg, "suite")) ++ ". Every new test must fail without the change.\n" ++
+    "4. **The merge gate.** A fresh reviewer model builds and runs the change and must answer every acceptance criterion in the issue with evidence O can check (a file:line that exists, or a command it ran). A rejection goes back to the builder with its findings.\n\n" ++
+    "## Risk tiers\n\n" ++
+    (if (length(tiers) == 0) { "No tiers are configured: every change gets the default gate.\n" } else { Std.join([policy_tier(t) for t in tiers], "\n") ++ "\n" }) ++
+    "\nFiles in no tier " ++ dflt ++ ".\n\n" ++
+    "## Risks that get the strictest gate\n\n" ++
+    "Whatever its paths, a change gets the strongest model and every tier's extra checks when it " ++ policy_risks(cfg) ++ ". The gate comment names the risks it found.\n\n" ++
+    "## Hard rules\n\nNo reviewer can wave these through. A PR is rejected when it:\n\n" ++
+    "- deletes or weakens tests (fewer assertions, added skip markers), or edits a test that reproduces a bug O is fixing;\n" ++
+    "- touches `.github/`, `.o-review.json`" ++ (if (length(locked) > 0) { ", or " ++ Std.join(["`" ++ to_string(l) ++ "`" for l in locked], ", ") } else { "" }) ++ ";\n" ++
+    "- changes more than " ++ to_string(maxl) ++ " lines" ++ (if (maxf == nil) { "" } else { " or " ++ to_string(maxf) ++ " files" }) ++ ";\n" ++
+    "- adds unfinished code outside tests and docs (`TODO`, `FIXME`, `unimplemented!`, `NotImplementedError`), something that looks like a secret, or a submodule change;\n" ++
+    "- was asked for a test and adds none.\n\n" ++
+    "## After a merge\n\n" ++
+    "O re-runs the verify command on the base branch. If a merge broke it, O bisects to the merge that did and opens a revert, then files the fix. When too many recent merges escape this way, O only takes fixes until the rate recovers.\n\n" ++
+    "## When O needs a person\n\n" ++
+    "O asks one question on the issue or PR (evidence, suspected cause, what it would do, a recommended reply) and labels it `needs-human`. The repository's owner, members and collaborators reply with `/o retry`, `/o answer <text>`, `/o approve <sha>` (bound to that commit) or `/o stop`.\n\n" ++
+    "## What O never does\n\n" ++
+    "- push to the base branch directly, or over someone else's commits on its branches;\n" ++
+    "- merge without a passing gate, or change the gate's own configuration;\n" ++
+    "- touch secrets, CI settings or infrastructure outside the repository;\n" ++
+    "- give its builders a GitHub token: only O pushes, after the checks above.\n"
+}
+
+fun policy_cmd(c) { if (string_length(c) > 0) { "`" ++ c ++ "`" } else { "none set" } }
+
+fun policy_tier(t) {
+    nm = str_or(map_get(t, "name"), "?")
+    paths = Std.join(["`" ++ to_string(p) ++ "`" for p in list_or_empty(map_get(t, "paths"))], ", ")
+    human = str_or(map_get(t, "merge"), "auto") == "human"
+    extra = list_or_empty(map_get(t, "extra"))
+    reqc = map_get(t, "required_checks")
+    "- **" ++ nm ++ "** (" ++ paths ++ "): " ++ (if (human) { "needs a person's sign-off before it merges" } else { "O merges it when every step passes" }) ++
+        (if (reqc == nil) { "" } else { "; required checks: " ++ Std.join(["`" ++ to_string(r) ++ "`" for r in list_or_empty(reqc)], ", ") }) ++
+        (if (length(extra) == 0) { "" } else { "; extra checks: " ++ Std.join(["`" ++ to_string(e) ++ "`" for e in extra], ", ") }) ++
+        (if (string_length(str_or(map_get(t, "gate_model"), "")) > 0) { "; gate model: " ++ str_or(map_get(t, "gate_model"), "") } else { "" }) ++ "."
+}
+
+fun policy_risks(cfg) {
+    all = [["migration", "touches a database or schema migration"], ["dependency", "adds or upgrades dependencies"], ["security", "touches auth, crypto or secrets handling"], ["agent_steering", "changes files that steer agents (CLAUDE.md, AGENTS.md, prompts) or the build, suite or verify scripts"], ["loosened_config", "loosens a check, rule or timeout in config"], ["redo", "redoes a change that was reverted"]]
+    on = [Std.nth(r, 1) for r in all when risk_on(cfg, hd(r), 'true') == 'true'] ++ (if (risk_on(cfg, "uncovered", 'false') == 'true') { ["touches files no tier covers"] } else { [] })
+    if (length(on) == 0) { "(no risk detectors are on)" } else { Std.join(on, "; ") }
+}
+
 # Post the decision with its evidence on the PR, and hand it back.
 fun gate_result(job, verdict, text, evidence, cmd_md, session, cost) {
     dir = map_get(job, "dir")
     body = "**O merge gate** (" ++ str_or(map_get(job, "model"), merge_model()) ++ ")\n\n**Decision:** `" ++ verdict ++ "`\n\n" ++ risks_md(list_or_empty(map_get(job, "risks"))) ++ "<details><summary>O's own checks</summary>\n\n" ++ (if (string_length(evidence) > 0) { evidence } else { "_(none configured; add .o-review.json)_\n" }) ++ "\n</details>\n\n<details><summary>Commands the maintainer ran</summary>\n\n" ++ (if (string_length(cmd_md) > 0) { cmd_md } else { "_(model not consulted)_\n" }) ++ "\n</details>\n\n" ++ text
     _c = file_write(f"{dir}/COMMENT.md", body)
+    checks = [l for l in lines_of(evidence) when string_contains(l, "→ exit") == 'true']
+    _g = file_write(f"{dir}/gate.json", json_encode(%{verdict: verdict, model: str_or(map_get(job, "model"), merge_model()), risks: list_or_empty(map_get(job, "risks")), checks: Std.take(checks, 12)}))
     _p = sh(f"{gh_bin()} api -X POST repos/{map_get(job, "gh_repo")}/issues/{map_get(job, "num")}/comments -F body=@{sq(dir)}/COMMENT.md")
     %{verdict: verdict, text: (if (string_length(evidence) > 0) { "O's checks:\n" ++ evidence ++ "\n" } else { "" }) ++ text, session: session, cost: cost}
 }
