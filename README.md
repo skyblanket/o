@@ -492,6 +492,10 @@ curl http://localhost:4100/api/activity       # activity log
   its runs are metered at a flat per-run estimate (`O_SWARM_FLAT_CENTS`) rather
   than true token cost.
 
+## Track record
+
+O is in its **tuning** phase: it is still changing, and its numbers so far are not results. [docs/MEASUREMENT.md](docs/MEASUREMENT.md) sets the bar for ending tuning and how the frozen measurement run will be counted. `GET /api/proof` serves the raw counts from O's activity log.
+
 ## Built on swarmrt
 
 O is written in the `sw` language and runs on the swarmrt runtime —

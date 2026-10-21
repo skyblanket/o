@@ -1150,6 +1150,10 @@ case "$in" in
     exit 0 ;;
 esac
 case "$in" in
+  *"You are the planning pass"*)
+    echo "$in" > "$GHS/plan_prompt"
+    printf '%s' '{"type":"result","result":"TAKE #20: a real bug users hit\nTAKE #21: labelled human, must be skipped\nTAKE #99: not an open issue\nFILE: [sim:good] planner found a gap :: steps and what done looks like\nDONE","total_cost_usd":0.05}'
+    exit 0 ;;
   *"[review:bare]"*) printf '%s' '{"type":"result","result":"Reviewed statically.\n\n**APPROVE**\n\nThe change covers the issue.","total_cost_usd":0.01}' ;;
   *"[review:reject]"*) printf '%s' '{"type":"result","result":"Looked at it.\nVERDICT: REJECT: stub reviewer says the change is wrong","total_cost_usd":0.01}' ;;
   *) printf '%s' '{"type":"result","result":"Looked at it.\nVERDICT: APPROVE","total_cost_usd":0.01}' ;;
@@ -1172,7 +1176,7 @@ method=GET; path=""; head=""; bodyf=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -X) method="$2"; shift ;;
-    -f|-F) case "$2" in head=*) head="${2#head=}" ;; body=@*) bodyf="${2#body=@}" ;; state=*) newstate="${2#state=}" ;; esac; shift ;;
+    -f|-F) case "$2" in head=*) head="${2#head=}" ;; body=@*) bodyf="${2#body=@}" ;; state=*) newstate="${2#state=}" ;; title=*) ititle="${2#title=}" ;; esac; shift ;;
     *) path="$1" ;;
   esac
   shift
@@ -1180,7 +1184,18 @@ done
 listed() { [ -f "$GHS/$1" ] && grep -qx "$2" "$GHS/$1"; }
 num_for() { grep -lx "$1" "$GHS"/pr_* 2>/dev/null | head -1 | sed 's|.*/pr_||'; }
 case "$method $path" in
-  "GET repos/acme/widgets/issues?"*) cat "$GHS/issues.json" ;;
+  "GET repos/acme/widgets/issues?"*)
+    # labels=X keeps issues carrying X; an issue with no "labels" key counts as
+    # labelled (the older stages' fixtures)
+    case "$path" in *labels=*) lb="${path#*labels=}"; lb="${lb%%&*}" ;; *) lb="" ;; esac
+    LB="$lb" python3 -c 'import json,os,sys;lb=os.environ["LB"];d=json.load(open(sys.argv[1]));print(json.dumps([i for i in d if not lb or "labels" not in i or lb in [l["name"] for l in i["labels"]]]))' "$GHS/issues.json" ;;
+  "POST repos/acme/widgets/issues/"*/labels)
+    n="${path#repos/acme/widgets/issues/}"; n="${n%/labels}"; touch "$GHS/labeled_$n"
+    N="$n" python3 -c 'import json,os,sys;p=sys.argv[1];d=json.load(open(p));[i.setdefault("labels",[]).append({"name":"o"}) for i in d if str(i["number"])==os.environ["N"]];json.dump(d,open(p,"w"))' "$GHS/issues.json"; echo '[]' ;;
+  "POST repos/acme/widgets/issues")
+    n=$(( 2000 + $(ls "$GHS" | grep -c '^created_') )); echo "$ititle" > "$GHS/created_$n"
+    N="$n" T="$ititle" B="$(cat "$bodyf")" python3 -c 'import json,os,sys;p=sys.argv[1];d=json.load(open(p));d.append({"number":int(os.environ["N"]),"title":os.environ["T"],"body":os.environ["B"],"labels":[{"name":"o"}]});json.dump(d,open(p,"w"))' "$GHS/issues.json"
+    echo "{\"number\":$n}" ;;
   "GET repos/acme/widgets/pulls?head="*)
     b="${path#*head=acme:}"; b="${b%%&*}"; n="$(num_for "$b")"
     ma=""; [ -n "$n" ] && [ -f "$GHS/merged_$n" ] && ma=',"merged_at":"2026-01-01T00:00:00Z"'
@@ -1690,6 +1705,25 @@ git -C "$GHS/remote.git" show main:docs/later.md >/dev/null 2>&1 || fail "post-m
 [ "$(sqlite3 "$TMP4/o.db" "SELECT status FROM issue WHERE id='iss_pmtest'")" = "Backlog" ] || fail "post-merge: the culprit's issue not sent back to Backlog"
 sqlite3 "$TMP4/o.db" "SELECT body FROM issue WHERE id='iss_pmtest'" | grep -q "broke main" || fail "post-merge: the failure was not added to the issue"
 pass "post-merge: a merge that breaks main is bisected (not the later one), reverted via a merged PR, its issue sent back; a step red on base doesn't count"
+
+# Planning pass: O picks its own work. Of three unlabelled-by-O issues it takes
+# #20, never #21 (labelled human) or #99 (not open), files one new issue, and
+# says so on GitHub; the regular poll then imports what it took and filed.
+echo '[{"number":20,"title":"[sim:good] unlabelled bug","body":"x","labels":[]},{"number":21,"title":"needs a decision","body":"x","labels":[{"name":"human"}]},{"number":22,"title":"[sim:good] other","body":"x","labels":[]}]' > "$GHS/issues.json"
+restart_d4 O_PLAN=1 O_AUTO_FILE=0
+for _i in $(seq 1 60); do [ "$(pmq plan.done)" = "1" ] && break; sleep 1; done
+[ "$(pmq plan.done)" = "1" ] || { grep -v '^\[orch\] tick' "$TMP4/daemon.log" | tail -20; fail "plan: the planning pass never finished"; }
+grep -q "#22 \[sim:good\] other" "$GHS/plan_prompt" && ! grep -q "needs a decision" "$GHS/plan_prompt" || fail "plan: the prompt should list untaken issues and leave out human-labelled ones"
+[ -f "$GHS/labeled_20" ] && [ ! -f "$GHS/labeled_21" ] && [ ! -f "$GHS/labeled_99" ] && [ ! -f "$GHS/labeled_22" ] || { ls "$GHS" | grep labeled; fail "plan: took the wrong issues (want only #20)"; }
+grep -q "O is taking this on" "$GHS/comments_20" && grep -q "a real bug users hit" "$GHS/comments_20" || fail "plan: no reason posted on the taken issue"
+[ "$(cat "$GHS/created_2000" 2>/dev/null)" = "[sim:good] planner found a gap" ] || fail "plan: the new issue was not filed"
+[ "$(pmq plan.take)" = "1" ] && [ "$(pmq plan.file)" = "1" ] || fail "plan: plan.take/plan.file not logged once each"
+for fp in gh:20 gh:2000; do
+  for _i in $(seq 1 30); do [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM issue WHERE company_id='$CIDG' AND fingerprint='$fp'")" = "1" ] && break; sleep 1; done
+  [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM issue WHERE company_id='$CIDG' AND fingerprint='$fp'")" = "1" ] || fail "plan: $fp was not imported after the planner labelled it"
+done
+[ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM issue WHERE company_id='$CIDG' AND fingerprint='gh:22'")" = "0" ] || fail "plan: an issue the planner did not take was imported"
+pass "plan: O takes the issue it chose (not human-labelled or unknown ones), says why on GitHub, files a new one; the poll imports both"
 
 # ============================================================
 # Agent sandbox — 5th daemon, O_SANDBOX=bwrap + O_API_TOKEN
