@@ -633,6 +633,24 @@ pass "flaky: fail-then-pass verify ships on the first run (verify.flaky logged, 
 wait_status "$IREAL" "Done" 120 || { tail -30 "$TMP/daemon.log"; fail "real failure: issue never recovered on retry"; }
 grep "dispatch REL-1 .*attempt 2, model haiku" "$TMP/daemon.log" >/dev/null || { grep "dispatch REL-1" "$TMP/daemon.log"; fail "real failure: the retry should stay on haiku"; }
 pass "same model: a real test failure retries on haiku with the verdict, no climb"
+# Known-fix memory (o#60): REL-1 failed ("planned failure") and then merged,
+# so the next issue that fails the same way gets REL-1 as a hint on its retry.
+echo 0 > "$TMP/cnt_rel"
+IREAL2="$(jget "$(ocurl -s -X POST "$BASE/api/companies/$CREAL/issues" -H 'Content-Type: application/json' -d '{"title":"[sim:good] fails the same way"}')" 'd["id"]')"
+wait_status "$IREAL2" "Done" 120 || fail "memory: the second real failure never recovered"
+R2="$(sqlite3 "$TMP/o.db" "SELECT id FROM run WHERE issue_id='$IREAL2' AND attempt=2 ORDER BY started_at LIMIT 1")"
+grep "This failure has been seen before" "$TMP/.o/prompts/$R2.txt" 2>/dev/null | head -1 >/dev/null && grep "REL-1" "$TMP/.o/prompts/$R2.txt" >/dev/null \
+  || { cat "$TMP/.o/prompts/$R2.txt" 2>/dev/null | tail -8; fail "memory: the retry of a known failure carries no hint from the issue that fixed it"; }
+pass "memory: a retry that fails like an earlier, fixed issue gets that fix as a hint"
+# Same failure twice in a row (o#59): the third attempt climbs a rung.
+CREP="$(mkco_v 'Repeat Co' REP "sh $TMP/vcount.sh $TMP/cnt_rep 4")"
+ocurl -s -X POST "$BASE/api/companies/$CREP/agents" -H 'Content-Type: application/json' -d '{"name":"Sim","runtime":"sim"}' >/dev/null
+IREP="$(jget "$(ocurl -s -X POST "$BASE/api/companies/$CREP/issues" -H 'Content-Type: application/json' -d '{"title":"[sim:good] fails the same way twice"}')" 'd["id"]')"
+wait_status "$IREP" "Done" 180 || { tail -30 "$TMP/daemon.log"; fail "repeat: the issue never recovered"; }
+[ "$(sqlite3 "$TMP/o.db" "SELECT COUNT(*) FROM activity WHERE verb='fail.repeat' AND target='$IREP'")" = "1" ] || fail "repeat: fail.repeat not logged once"
+grep "dispatch REP-1 .*attempt 2, model haiku" "$TMP/daemon.log" >/dev/null && grep "dispatch REP-1 .*attempt 3, model sonnet" "$TMP/daemon.log" >/dev/null \
+  || { grep "dispatch REP-1" "$TMP/daemon.log"; fail "repeat: the same failure twice should move attempt 3 up a rung"; }
+pass "repeat: the same failure on two attempts in a row moves the next attempt up a rung"
 wait_status "$IESC" "Done" 120 || { tail -30 "$TMP/daemon.log"; fail "escalate: issue never finished after escalating"; }
 EID="$(sqlite3 "$TMP/o.db" "SELECT identifier FROM issue WHERE id='$IESC'")"
 grep "dispatch $EID .*attempt 1, model haiku" "$TMP/daemon.log" >/dev/null && grep "dispatch $EID .*attempt 2, model sonnet" "$TMP/daemon.log" >/dev/null \
