@@ -1241,7 +1241,7 @@ chmod +x "$TMP4/gh-stub"
 # CI settle wait. GHS is the stub's state dir.
 GHS="$TMP4/ghs"; mkdir -p "$GHS"; echo '[]' > "$GHS/issues.json"
 HOME="$TMP4" O_DB="$TMP4/o.db" O_PORT="$PORT4" O_NO_OPEN=1 O_REVIEW=1 O_CLAUDE_BIN="$TMP4/claude-stub" \
-  O_GH_BIN="$TMP4/gh-stub" GHS="$GHS" O_GH_POLL_S=2 O_CI_POLL_S=1 O_CI_SETTLE_S=0 \
+  O_GH_BIN="$TMP4/gh-stub" GHS="$GHS" O_GH_POLL_S=2 O_CI_POLL_S=1 O_CI_SETTLE_S=0 O_POSTMERGE_S=0 \
   ./bin/swarmd >"$TMP4/daemon.log" 2>&1 &
 DAEMON4_PID=$!
 up4=""
@@ -1378,7 +1378,7 @@ pass "github: merge refused by branch policy -> parked In Review, not re-dispatc
 # park In Review with nothing merged into the remote.
 stop_daemon "$DAEMON4_PID"
 HOME="$TMP4" O_DB="$TMP4/o.db" O_PORT="$PORT4" O_NO_OPEN=1 O_REVIEW=1 O_CLAUDE_BIN="$TMP4/claude-stub" \
-  O_GH_BIN="$TMP4/gh-stub" GHS="$GHS" O_GH_POLL_S=2 O_CI_POLL_S=1 O_CI_SETTLE_S=0 O_PR_AUTOMERGE=0 \
+  O_GH_BIN="$TMP4/gh-stub" GHS="$GHS" O_GH_POLL_S=2 O_CI_POLL_S=1 O_CI_SETTLE_S=0 O_PR_AUTOMERGE=0 O_POSTMERGE_S=0 \
   ./bin/swarmd >>"$TMP4/daemon.log" 2>&1 &
 DAEMON4_PID=$!
 for _i in $(seq 1 30); do
@@ -1400,7 +1400,7 @@ pass "pr-only: O_PR_AUTOMERGE=0 leaves a green PR open, issue In Review, nothing
 restart_d4() {  # extra env assignments as args
   stop_daemon "$DAEMON4_PID"
   env HOME="$TMP4" O_DB="$TMP4/o.db" O_PORT="$PORT4" O_NO_OPEN=1 O_REVIEW=1 O_CLAUDE_BIN="$TMP4/claude-stub" \
-    O_GH_BIN="$TMP4/gh-stub" GHS="$GHS" O_GH_POLL_S=2 O_CI_POLL_S=1 O_CI_SETTLE_S=0 "$@" \
+    O_GH_BIN="$TMP4/gh-stub" GHS="$GHS" O_GH_POLL_S=2 O_CI_POLL_S=1 O_CI_SETTLE_S=0 O_POSTMERGE_S=0 "$@" \
     ./bin/swarmd >>"$TMP4/daemon.log" 2>&1 &
   DAEMON4_PID=$!
   for _i in $(seq 1 30); do
@@ -1646,6 +1646,36 @@ sleep 4
 ncap="$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='budget.capped'")"
 [ "$ncap" = "1" ] || fail "budget: expected budget.capped logged once, got $ncap"
 pass "budget: the global daily cap logs budget.capped once, not every tick"
+
+# Post-merge check: main is checked as a whole after merges. A merge that
+# breaks a step that passed before is bisected and reverted through a PR O
+# merges, and its issue goes back to Backlog (merge.revert). A step that was
+# already red on main (broken-on-base-too) doesn't count as a break.
+restart_d4 O_POSTMERGE_S=2 O_POSTMERGE_TIMEOUT_S=60 O_AUTO_FILE=0
+ocurl -s -X POST "$BASE4/api/orchestrator/drain" -H 'Content-Type: application/json' -d '{"on":true}' >/dev/null
+pmq() { sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='$1'"; }
+for _i in $(seq 1 60); do [ "$(pmq postmerge.baseline)" = "1" ] && break; sleep 1; done
+[ "$(pmq postmerge.baseline)" = "1" ] || { grep -v '^\[orch\] tick' "$TMP4/daemon.log" | tail -20; fail "post-merge: no baseline recorded"; }
+grep -q "already red on main, not counted as a break: test -f broken-on-base-too" "$TMP4/daemon.log" || fail "post-merge: the step red on base was not reported as already red"
+# Two merges land: the first breaks a passing step, the second is harmless.
+now_ms="$(($(date +%s) * 1000))"
+sqlite3 "$TMP4/o.db" "INSERT INTO issue (id, company_id, identifier, title, body, status, priority, sort_order, created_at, updated_at, origin) VALUES ('iss_pmtest', '$CIDG', 'GH-PM', 'adds ext/broken', '', 'Done', 'medium', 900, $now_ms, $now_ms, 'operator')"
+git -C "$SEEDGH" fetch -q origin && git -C "$SEEDGH" checkout -q -B main origin/main
+git -C "$SEEDGH" checkout -q -b o/iss_pmtest; mkdir -p "$SEEDGH/ext"; echo x > "$SEEDGH/ext/broken"
+git -C "$SEEDGH" add -A; git -C "$SEEDGH" commit -q -m "break ext"
+git -C "$SEEDGH" checkout -q main; git -C "$SEEDGH" merge -q --no-ff -m "Merge pull request #950 from acme/o/iss_pmtest" o/iss_pmtest
+git -C "$SEEDGH" checkout -q -b later; mkdir -p "$SEEDGH/docs"; echo y > "$SEEDGH/docs/later.md"
+git -C "$SEEDGH" add -A; git -C "$SEEDGH" commit -q -m "docs"
+git -C "$SEEDGH" checkout -q main; git -C "$SEEDGH" merge -q --no-ff -m "Merge pull request #951 from acme/docs-later" later
+git -C "$SEEDGH" push -q origin main
+for _i in $(seq 1 120); do [ "$(pmq postmerge.reverted)" = "1" ] && break; sleep 1; done
+[ "$(pmq postmerge.reverted)" = "1" ] || { grep -v '^\[orch\] tick' "$TMP4/daemon.log" | tail -30; fail "post-merge: the breaking merge was not reverted"; }
+git -C "$GHS/remote.git" show main:ext/broken >/dev/null 2>&1 && fail "post-merge: ext/broken still on main after the revert"
+git -C "$GHS/remote.git" show main:docs/later.md >/dev/null 2>&1 || fail "post-merge: the harmless later merge was reverted too"
+[ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='merge.revert' AND target='iss_pmtest'")" = "1" ] || fail "post-merge: the culprit's issue not marked merge.revert"
+[ "$(sqlite3 "$TMP4/o.db" "SELECT status FROM issue WHERE id='iss_pmtest'")" = "Backlog" ] || fail "post-merge: the culprit's issue not sent back to Backlog"
+sqlite3 "$TMP4/o.db" "SELECT body FROM issue WHERE id='iss_pmtest'" | grep -q "broke main" || fail "post-merge: the failure was not added to the issue"
+pass "post-merge: a merge that breaks main is bisected (not the later one), reverted via a merged PR, its issue sent back; a step red on base doesn't count"
 
 # ============================================================
 # Agent sandbox — 5th daemon, O_SANDBOX=bwrap + O_API_TOKEN
