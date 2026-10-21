@@ -575,7 +575,9 @@ sc="$(ocurl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/issues/$IID_GOO
 rr="$(ocurl -s -X POST "$BASE/api/issues/$IID_BAD/retry" -H 'Content-Type: application/json' -d '{"model":"sonnet"}')"
 echo "$rr" | grep -q "An earlier round of this issue failed (red_tests)" || { echo "$rr"; fail "retry: the last failure was not added to the issue"; }
 [ "$(sqlite3 "$TMP/o.db" "SELECT COUNT(*) FROM activity WHERE verb='issue.retry' AND target='$IID_BAD'")" = "1" ] || fail "retry: issue.retry not logged"
-grep -q "^ESCALATE: the operator asked for another round on sonnet" "$TMP/.o/escalations/$IID_BAD" 2>/dev/null || fail "retry: model=sonnet did not start it a rung up"
+# at least one rung up: from the operator's ask, or already from the same
+# failure repeating on the first round (fail.repeat)
+[ "$(grep -c '^ESCALATE:' "$TMP/.o/escalations/$IID_BAD" 2>/dev/null || echo 0)" -ge 1 ] || fail "retry: model=sonnet did not start it a rung up"
 wait_status "$IID_BAD" "Failed" 120 || fail "retry: the retried issue never ran its new round"
 [ "$(sqlite3 "$TMP/o.db" "SELECT MAX(attempt) FROM run WHERE issue_id='$IID_BAD' AND started_at > (SELECT ts FROM activity WHERE verb='issue.retry' AND target='$IID_BAD')")" -ge 1 ] || fail "retry: no new attempts after the retry"
 pass "retry: POST /api/issues/:id/retry requeues a Failed issue with its last failure and a stronger model; a Done one is refused"
@@ -633,6 +635,24 @@ pass "flaky: fail-then-pass verify ships on the first run (verify.flaky logged, 
 wait_status "$IREAL" "Done" 120 || { tail -30 "$TMP/daemon.log"; fail "real failure: issue never recovered on retry"; }
 grep "dispatch REL-1 .*attempt 2, model haiku" "$TMP/daemon.log" >/dev/null || { grep "dispatch REL-1" "$TMP/daemon.log"; fail "real failure: the retry should stay on haiku"; }
 pass "same model: a real test failure retries on haiku with the verdict, no climb"
+# Known-fix memory (o#60): REL-1 failed ("planned failure") and then merged,
+# so the next issue that fails the same way gets REL-1 as a hint on its retry.
+echo 0 > "$TMP/cnt_rel"
+IREAL2="$(jget "$(ocurl -s -X POST "$BASE/api/companies/$CREAL/issues" -H 'Content-Type: application/json' -d '{"title":"[sim:good] fails the same way"}')" 'd["id"]')"
+wait_status "$IREAL2" "Done" 120 || fail "memory: the second real failure never recovered"
+R2="$(sqlite3 "$TMP/o.db" "SELECT id FROM run WHERE issue_id='$IREAL2' AND attempt=2 ORDER BY started_at LIMIT 1")"
+grep "This failure has been seen before" "$TMP/.o/prompts/$R2.txt" 2>/dev/null | head -1 >/dev/null && grep "REL-1" "$TMP/.o/prompts/$R2.txt" >/dev/null \
+  || { cat "$TMP/.o/prompts/$R2.txt" 2>/dev/null | tail -8; fail "memory: the retry of a known failure carries no hint from the issue that fixed it"; }
+pass "memory: a retry that fails like an earlier, fixed issue gets that fix as a hint"
+# Same failure twice in a row (o#59): the third attempt climbs a rung.
+CREP="$(mkco_v 'Repeat Co' REP "sh $TMP/vcount.sh $TMP/cnt_rep 4")"
+ocurl -s -X POST "$BASE/api/companies/$CREP/agents" -H 'Content-Type: application/json' -d '{"name":"Sim","runtime":"sim"}' >/dev/null
+IREP="$(jget "$(ocurl -s -X POST "$BASE/api/companies/$CREP/issues" -H 'Content-Type: application/json' -d '{"title":"[sim:good] fails the same way twice"}')" 'd["id"]')"
+wait_status "$IREP" "Done" 180 || { tail -30 "$TMP/daemon.log"; fail "repeat: the issue never recovered"; }
+[ "$(sqlite3 "$TMP/o.db" "SELECT COUNT(*) FROM activity WHERE verb='fail.repeat' AND target='$IREP'")" = "1" ] || fail "repeat: fail.repeat not logged once"
+grep "dispatch REP-1 .*attempt 2, model haiku" "$TMP/daemon.log" >/dev/null && grep "dispatch REP-1 .*attempt 3, model sonnet" "$TMP/daemon.log" >/dev/null \
+  || { grep "dispatch REP-1" "$TMP/daemon.log"; fail "repeat: the same failure twice should move attempt 3 up a rung"; }
+pass "repeat: the same failure on two attempts in a row moves the next attempt up a rung"
 wait_status "$IESC" "Done" 120 || { tail -30 "$TMP/daemon.log"; fail "escalate: issue never finished after escalating"; }
 EID="$(sqlite3 "$TMP/o.db" "SELECT identifier FROM issue WHERE id='$IESC'")"
 grep "dispatch $EID .*attempt 1, model haiku" "$TMP/daemon.log" >/dev/null && grep "dispatch $EID .*attempt 2, model sonnet" "$TMP/daemon.log" >/dev/null \
@@ -1368,6 +1388,11 @@ sleep 4  # more polls: #7 is still "open" on the stub and must not be re-importe
 [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM issue WHERE company_id='$CIDG' AND fingerprint='gh:7'")" = "1" ] || fail "github: issue #7 imported more than once"
 [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM issue WHERE company_id='$CIDG' AND fingerprint='gh:8'")" = "0" ] || fail "github: a pull request (#8) was imported as an issue"
 pass "github: #7 imported once, shipped as a PR (Closes #7), merged on green checks"
+N7="$(grep -lx "o/$IID_GH" "$GHS"/pr_* | head -1 | sed 's|.*/pr_||')"
+for _i in $(seq 1 20); do grep "O merge record" "$GHS/comments_$N7" >/dev/null 2>&1 && break; sleep 0.5; done
+grep "O merge record" "$GHS/comments_$N7" >/dev/null 2>&1 && grep "Merged commit" "$GHS/comments_$N7" >/dev/null && grep "Builder runs: 1" "$GHS/comments_$N7" >/dev/null \
+  || { cat "$GHS/comments_$N7" 2>/dev/null; fail "audit: the merged PR carries no merge record"; }
+pass "audit: every PR O merges gets a merge record (commit, runs, failures on the way, cost)"
 wait_status_at "$BASE4" "$IID_CIF" "Failed" 150 || { tail -40 "$TMP4/daemon.log"; fail "github: red-CI issue never Failed"; }
 vs="$(sqlite3 "$TMP4/o.db" "SELECT verify_state FROM run WHERE issue_id='$IID_CIF' ORDER BY started_at DESC LIMIT 1")"
 [ "$vs" = "red_ci" ] || fail "github: expected red_ci, got '$vs'"
@@ -1758,14 +1783,15 @@ wait_status_at "$BASE4" "$IID_RK" "Done" 180 || { grep -v '^\[orch\] tick' "$TMP
 git -C "$GHS/remote.git" log --oneline main | grep "o/$IID_RK" >/dev/null || fail "re-adopt: the PR did not merge into main"
 pass "re-adopt: when the tiers stop asking for a human, a PR parked for sign-off is re-gated on current main and merged, no rebuild"
 
-# Someone else's commit on O's branch is never overwritten: after a red CI
-# round, a person pushes a fix onto the PR; O's next push parks instead.
+# Someone else's commit on O's branch is never overwritten. Deterministic:
+# with O drained, a person pushes a fix onto the issue's branch before O's
+# first push; O must park the issue instead of pushing over it.
+ocurl -s -X POST "$BASE4/api/orchestrator/drain" -H 'Content-Type: application/json' -d '{"on":true}' >/dev/null
 IID_FC="$(gh_issue '[sim:good] someone else pushes to this branch')"
-echo "o/$IID_FC" >> "$GHS/fail_ci"
-for _i in $(seq 1 90); do [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='ci.fail' AND target='$IID_FC'")" -ge 1 ] && break; sleep 1; done
-FCW="$TMP4/foreign"; rm -rf "$FCW"; git clone -q "$GHS/remote.git" "$FCW" && git -C "$FCW" checkout -q "o/$IID_FC"
+FCW="$TMP4/foreign"; rm -rf "$FCW"; git clone -q "$GHS/remote.git" "$FCW" && git -C "$FCW" checkout -q -b "o/$IID_FC" origin/main
 echo "human fix" > "$FCW/human.txt"; git -C "$FCW" add human.txt
 git -C "$FCW" -c user.email=someone@example.com -c user.name=Someone commit -q -m "a person's fix" && git -C "$FCW" push -q origin "o/$IID_FC"
+ocurl -s -X POST "$BASE4/api/orchestrator/drain" -H 'Content-Type: application/json' -d '{"on":false}' >/dev/null
 FSHA="$(git -C "$FCW" rev-parse --short=10 HEAD)"
 wait_status_at "$BASE4" "$IID_FC" "In Review" 180 || { grep -v '^\[orch\] tick' "$TMP4/daemon.log" | tail -20; fail "foreign commit: O did not stop before overwriting someone else's commit"; }
 sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IID_FC' ORDER BY started_at DESC LIMIT 1" | grep "someone else pushed commits" | grep "$FSHA" >/dev/null \

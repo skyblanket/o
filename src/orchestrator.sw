@@ -370,7 +370,7 @@ fun dispatch_prompt_base(db, iid, title, body, repo, protected, rebase_onto, att
             # the attempt died before verify: say how, not "failed verification"
             build_prompt(title, body, repo, protected) ++ "\n\n" ++ vout
         } else { if (is_retry_verdict(vstate) == 'true') {
-            build_retry_prompt(title, body, repo, protected, rebase_onto, vstate, vout)
+            build_retry_prompt(title, body, repo, protected, rebase_onto, vstate, vout) ++ lesson_hints(db, iid, str_or(map_get(lastrun, "failure_sig"), ""))
         } else {
             build_prompt(title, body, repo, protected)
         }}
@@ -1098,6 +1098,9 @@ fun escalation_in(text) {
 
 fun run_worker(orch, run_id, issue_id, runtime, prompt, workspace, repo, session_id, sim_outcome, title, protected, start, model) {
     if (runtime == "sim") {
+        # the sim agent ignores its prompt; keep it so tests can read it
+        _pd = sh("mkdir -p " ++ sq(getenv("HOME") ++ "/.o/prompts"))
+        _pw = file_write(getenv("HOME") ++ "/.o/prompts/" ++ run_id ++ ".txt", prompt)
         run_sim(orch, run_id, issue_id, sim_outcome, workspace, repo, title, protected, start)
     } else {
         if (runtime == "swarm-code") {
@@ -1933,9 +1936,10 @@ fun classify_red(ws, repo, base, verify_cmd, tail) {
     if (env_failure(tail) == 'true') {
         %{verdict: "red_env", tail: "ENVIRONMENT: the verify failed for reasons outside the change (" ++ env_failure_why(tail) ++ "); it runs again without spending an attempt.\n\n" ++ tail}
     } else {
-        bt = base_verify_tail(ws, repo, base, verify_cmd)
+        # base is only run when the change's failures name something to compare
         mine = fail_lines(tail)
-        if (string_length(bt) > 0 && length(mine) > 0 && Std.all(mine, fn(l) { Std.any(fail_lines(bt), fn(b) { b == l }) }) == 'true') {
+        bt = if (length(mine) == 0) { "" } else { base_verify_tail(ws, repo, base, verify_cmd) }
+        if (string_length(bt) > 0 && Std.all(mine, fn(l) { Std.any(fail_lines(bt), fn(b) { b == l }) }) == 'true') {
             %{verdict: "red_inherited", tail: "INHERITED: " ++ base ++ " fails this verify too, with every failure this change shows; main was already broken.\n\nOn the change:\n" ++ tail ++ "\n\nOn " ++ base ++ ":\n" ++ bt}
         } else {
             %{verdict: "red_tests", tail: tail}
@@ -1952,6 +1956,67 @@ fun env_failure(tail) { if (string_length(env_failure_why(tail)) > 0) { 'true' }
 fun env_failure_why(tail) {
     hits = [p for p in env_patterns() when string_contains(tail, p) == 'true']
     if (length(hits) == 0) { "" } else { hd(hits) }
+}
+
+# A failure's signature: its verdict plus the first line that names the
+# failure (or the first line), normalised like fail_lines. Same signature =
+# same failure, across attempts and issues.
+fun failure_sig(verdict, tail) {
+    named = fail_lines(tail) ++ [norm_line(l) for l in Std.take(lines_of(tail), 40) when string_contains(l, "REJECT") == 'true']
+    first = if (length(named) > 0) { hd(named) } else { if (length(lines_of(tail)) == 0) { "" } else { norm_line(hd(lines_of(tail))) } }
+    verdict ++ "|" ++ string_truncate(first, 160)
+}
+
+fun norm_line(l) {
+    string_trim(elem(sh("printf %s " ++ sq(l) ++ " | sed -E 's#/tmp/[^ ]*#/tmp/X#g; s/0x[0-9a-fA-F]+/0x#/g; s/[0-9]+/#/g'"), 1))
+}
+
+# The merge record O leaves on every PR it merges (o#66): what merged, what
+# it took, and what went wrong on the way. The gate's own comment above it
+# carries the checks and the verdict.
+fun audit_text(db, issue_id, sha) {
+    runs = Store.run_history(db, issue_id)
+    fails = [r for r in runs when string_starts_with(str_or(map_get(r, "verify_state"), ""), "red") == 'true']
+    rounds = 1 + Store.retry_count(db, issue_id)
+    "**O merge record**\n\n" ++
+    "- Merged commit: `" ++ sha ++ "`\n" ++
+    "- Builder runs: " ++ to_string(Store.run_count_for_issue(db, issue_id)) ++ " over " ++ to_string(rounds) ++ " round(s); reproduced first: " ++ (if (Store.count_target_verb(db, issue_id, "repro.ok") > 0) { "yes" } else { "no" }) ++ "\n" ++
+    "- Failures on the way: " ++ (if (length(fails) == 0) { "none" } else { Std.join(["`" ++ str_or(map_get(r, "verify_state"), "") ++ "`: " ++ first_line(str_or(map_get(r, "verify_output"), "")) for r in Std.take(fails, 5)], "; ") }) ++ "\n" ++
+    "- Environment re-runs: " ++ to_string(Store.count_target_verb(db, issue_id, "verify.env")) ++ "; failures inherited from base: " ++ to_string(Store.count_target_verb(db, issue_id, "verify.inherited")) ++ "\n" ++
+    "- Cost: $" ++ to_string(Store.issue_cost(db, issue_id) / 100.0) ++ "\n\n" ++
+    "If this merge breaks `main`, O's post-merge check bisects to it and reverts it."
+}
+
+fun audit_comment_worker(gh_repo, issue_id, text) {
+    if (string_length(gh_repo) == 0) { "" } else {
+        owner = hd(string_split(gh_repo, "/"))
+        prs = gh_json(sq(f"repos/{gh_repo}/pulls?head={owner}:o/{issue_id}&state=all"))
+        num = if (prs == nil) { nil } else { merged_pr(prs) }
+        if (num == nil) { "" } else {
+            f = getenv("HOME") ++ "/.o/audit-" ++ issue_id ++ ".md"
+            _w = file_write(f, text)
+            gh_api(f"-X POST repos/{gh_repo}/issues/{num}/comments -F body=@{sq(f)}")
+        }
+    }
+}
+
+fun learn_from_merge(db, company_id, issue_id, sha) {
+    issue = Store.issue_row(db, issue_id)
+    ident = if (issue == nil) { issue_id } else { str_or(map_get(issue, "identifier"), issue_id) }
+    title = if (issue == nil) { "" } else { str_or(map_get(issue, "title"), "") }
+    where = if (string_length(sha) > 0) { "; see `git show " ++ string_sub(sha, 0, 10) ++ "`" } else { "" }
+    Store.record_lessons(db, company_id, issue_id, ident ++ " (" ++ string_truncate(title, 80) ++ ") hit it and was fixed" ++ where)
+}
+
+# Hints for a retry from issues that failed the same way and then merged
+# (o#60). The builder and the planner see these; the gate never does.
+fun lesson_hints(db, iid, sig) {
+    issue = Store.issue_row(db, iid)
+    cid = if (issue == nil) { "" } else { str_or(map_get(issue, "company_id"), "") }
+    ls = if (string_length(sig) == 0) { [] } else { Store.lessons_for(db, cid, sig, iid) }
+    if (length(ls) == 0) { "" } else {
+        "\n\nThis failure has been seen before and fixed. A hint, not a recipe; check it applies:\n" ++ Std.join(["- " ++ str_or(map_get(l, "note"), "") for l in ls], "\n")
+    }
 }
 
 # The lines that name failures, normalised so the same failure matches across
@@ -2183,6 +2248,14 @@ fun close_pr_worker(gh_repo, issue_id, tried, reason) {
 fun verify_red(db, running, retry, info, run_id, issue_id, verdict, tail, now) {
     company_id = map_get(info, "company_id")
     _v = Store.run_set_verify(db, run_id, verdict, tail)
+    sig = failure_sig(verdict, tail)
+    _sg = Store.run_set_sig(db, run_id, sig)
+    # The same failure twice in a row: the same model won't see it differently,
+    # so the next attempt climbs one rung (once per signature).
+    _rp = if (sig == Store.prev_sig(db, issue_id, run_id) && string_contains(Std.join(escalation_lines(issue_id), "\n"), sig) == 'false') {
+        _e = record_escalation(issue_id, "ESCALATE: the same failure repeated (" ++ sig ++ "); a stronger model takes the next attempt.")
+        Store.log_activity(db, company_id, "orchestrator", "fail.repeat", issue_id)
+    } else { "" }
     _st = Store.run_set_state(db, run_id, "VerifyFailed")
     _a = Store.log_activity(db, company_id, "orchestrator", "verify.fail", issue_id)
     attempt = map_get(info, "attempt")
@@ -2650,6 +2723,9 @@ fun handle_ci_done(db, running, retry, run_id, issue_id, outcome, sha, tail) {
             _is = Store.issue_set_status(db, issue_id, "Done")
             _g = Store.company_mark_green(db, company_id)
             _a = Store.log_activity(db, company_id, "orchestrator", "ci.merged", issue_id)
+            _ls = learn_from_merge(db, company_id, issue_id, sha)
+            co = Store.company_row(db, company_id)
+            _au = spawn(audit_comment_worker(str_or(map_get(co, "github_repo"), ""), issue_id, audit_text(db, issue_id, sha)))
             %{running: map_remove(running, issue_id), retry: map_remove(retry, issue_id)}
         } else { if (outcome == "in_review") {
             _v = Store.run_set_verify(db, run_id, "in_review", tail)
@@ -3339,7 +3415,8 @@ fun plan_each(db, rows, now, every) {
             _m = sh(f"mkdir -p {sq(plan_dir(cid))}")
             _w = file_write(f, to_string(now))
             co = Store.company_row(db, cid)
-            ctx = "== What O has queued or in flight ==\n" ++ fmt_issues(Store.open_issue_titles(db, cid)) ++ "\n== What failed lately ==\n" ++ fmt_fails(Std.take(Store.failed_runs_for(db, cid), 8))
+            rec = Store.recurring_sigs(db, cid)
+            ctx = "== What O has queued or in flight ==\n" ++ fmt_issues(Store.open_issue_titles(db, cid)) ++ "\n== What failed lately ==\n" ++ fmt_fails(Std.take(Store.failed_runs_for(db, cid), 8)) ++ (if (length(rec) == 0) { "" } else { "\n== Failures recurring across 3+ issues (a root cause may deserve its own issue) ==\n" ++ Std.join(["- " ++ str_or(map_get(r, "sig"), "") ++ " (" ++ to_string(map_get(r, "n")) ++ " issues)" for r in rec], "\n") ++ "\n" })
             spawn(plan_worker(self(), cid, map_get(c, "github_repo"), str_or(map_get(co, "repo"), ""), ctx))
         }
         plan_each(db, tl(rows), now, every)
@@ -3799,6 +3876,7 @@ fun handle_pr_state(db, running, retry, issue_id, state, num) {
             _i = Store.issue_set_status(db, issue_id, "Done")
             _g = Store.company_mark_green(db, company_id)
             _a = Store.log_activity(db, company_id, "github", "pr.merged", issue_id)
+            _ls = learn_from_merge(db, company_id, issue_id, "")
             %{running: running, retry: map_remove(retry, issue_id)}
         } else { if (state == "closed") {
             _w = sh(f"git -C {sq(repo)} worktree remove {ws} --force")
@@ -4000,6 +4078,7 @@ fun handle_merge_done(db, running, retry, run_id, issue_id, outcome, merge_sha, 
             _is = Store.issue_set_status(db, issue_id, "Done")
             _g = Store.company_mark_green(db, company_id)
             _a = Store.log_activity(db, company_id, "orchestrator", "merge.done", issue_id)
+            _ls = learn_from_merge(db, company_id, issue_id, merge_sha)
             _flaky = if (tail == "flaky") { Store.log_activity(db, company_id, "orchestrator", "merge.flaky", issue_id) } else { "" }
             %{running: map_remove(running, issue_id), retry: map_remove(retry, issue_id)}
         } else {
