@@ -378,6 +378,14 @@ fun route_company(db, conn, method, p, body) {
           if (string_ends_with(rest, "/persona_reports") == 'true') {
             persona_report(db, conn, method, string_sub(rest, 0, string_length(rest) - 16), body)
           } else {
+          if (string_ends_with(rest, "/errors") == 'true') {
+            ecid = string_sub(rest, 0, string_length(rest) - 7)
+            data = if (string_length(body) > 0) { json_decode(body) } else { nil }
+            if (method != 'POST') { respond(conn, 405, err_json("method not allowed")) }
+            else { if (Store.company_row(db, ecid) == nil) { respond(conn, 404, err_json("company not found")) }
+            else { if (data == nil) { respond(conn, 400, err_json("expected a JSON error event")) }
+            else { respond(conn, 200, json_encode(Orchestrator.ingest_error(db, ecid, data))) }}}
+          } else {
             if (method == 'GET') {
                 row = Store.company_row(db, rest)
                 if (row == nil) {
@@ -392,7 +400,7 @@ fun route_company(db, conn, method, p, body) {
                     respond(conn, 405, err_json("method not allowed"))
                 }
             }
-          }}}
+          }}}}
         }
       }
     }

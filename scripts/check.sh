@@ -2044,6 +2044,25 @@ pass "shadow: O parks PRs it would merge, two unchanged merges by a person promo
 git -C "$SEEDGH" fetch -q origin && git -C "$SEEDGH" checkout -q -B main origin/main
 python3 -c 'import json,sys;p=sys.argv[1];d=json.load(open(p));d.pop("shadow");json.dump(d,open(p,"w"),indent=1)' "$SEEDGH/.o-review.json"
 git -C "$SEEDGH" commit -qam "shadow mode off" && git -C "$SEEDGH" push -q origin main
+# Production errors (o#70): a tracker's webhook files one issue per error
+# (deduplicated by its id or fingerprint), severity is computed from rate,
+# users and release, and an error in a file O's merge changed is linked to it.
+post_err() { ocurl -s -X POST "$BASE4/api/companies/$CIDG/errors" -H 'Content-Type: application/json' -d "$1"; }
+ecount() { sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM issue WHERE fingerprint='$1'"; }
+eprio() { sqlite3 "$TMP4/o.db" "SELECT priority FROM issue WHERE id='$1'"; }
+r1="$(post_err "{\"fingerprint\":\"boom-1\",\"title\":\"KeyError: user\",\"message\":\"in render\",\"stack\":[{\"file\":\"/app/docs/d_$IS3.md\",\"line\":1}],\"count\":1,\"users\":2}")"
+E1="$(jget "$r1" 'd["issue_id"]')"
+[ "$(jget "$r1" 'd["created"]')" = "1" ] && [ "$(jget "$r1" 'd["suspected_escape"]["issue_id"]')" = "$IS3" ] || { echo "$r1"; fail "errors: an error in a file O's merge changed was not linked to that merge"; }
+sqlite3 "$TMP4/o.db" "SELECT body FROM issue WHERE id='$E1'" | grep -q "Suspected escape" || fail "errors: the suspected escape is not in the issue"
+[ "$(eprio "$E1")" = "medium" ] || fail "errors: a suspected escape with 2 users should be medium, got $(eprio "$E1")"
+[ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='error.escape_of' AND target='$IS3'")" = "1" ] || fail "errors: the merge's issue does not record the escape"
+r2="$(post_err '{"fingerprint":"boom-1","title":"KeyError: user","count":5,"users":80}')"
+[ "$(jget "$r2" 'd["issue_id"]')" = "$E1" ] && [ "$(jget "$r2" 'd["created"]')" = "0" ] && [ "$(ecount err:boom-1)" = "1" ] || { echo "$r2"; fail "errors: a new event on a known error filed another issue"; }
+[ "$(eprio "$E1")" = "high" ] || fail "errors: 80 users did not raise the issue to high"
+SE='{"action":"created","data":{"issue":{"id":"4711","title":"TypeError: x is undefined","culprit":"app/views.py in get","count":"500","userCount":120}}}'
+s1="$(post_err "$SE")"; s2="$(post_err "$SE")"
+[ "$(jget "$s1" 'd["created"]')" = "1" ] && [ "$(jget "$s1" 'd["severity"]')" = "high" ] && [ "$(jget "$s2" 'd["created"]')" = "0" ] && [ "$(ecount err:sentry:4711)" = "1" ] || { echo "$s1 $s2"; fail "errors: a Sentry-shaped payload was not taken in once at high severity"; }
+pass "errors: a tracker's webhook (generic or Sentry-shaped) files one issue per error; repeats update counts and raise severity (computed from rate, users and release); an error in a file O's merge changed is linked to that merge as a suspected escape"
 # inherited: base fails the same way, so the change isn't blamed
 git -C "$SEEDGH" fetch -q origin && git -C "$SEEDGH" checkout -q -B main origin/main
 echo broken > "$SEEDGH/BASE_BROKEN"; git -C "$SEEDGH" add BASE_BROKEN && git -C "$SEEDGH" commit -qm "break base" && git -C "$SEEDGH" push -q origin main

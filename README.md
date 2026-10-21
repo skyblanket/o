@@ -169,6 +169,19 @@ O edits real repositories on its own. The guard rails are the point.
   O answers each command on GitHub and applies it once. `GET /api/waiting`
   and a daily `~/.o/digest.md` list everything waiting on a person, oldest
   first.
+- **Production errors become issues.** `POST /api/companies/:id/errors`
+  takes an error tracker's webhook, either generic JSON
+  (`fingerprint`, `title`, `message`, `stack: [{file, line}]`, `count`,
+  `users`, `new_in_release`) or Sentry-shaped (`data.issue` or `data.event`).
+  - **One issue per error.** Errors are deduplicated by the tracker's id or
+    fingerprint: a new event on a known error updates its counts and can raise
+    its priority, but never files another issue.
+  - **O sets the severity**, from the error rate, the users affected and
+    whether the error is new in this release.
+  - **Suspected escapes.** An error whose stack names a file one of O's merges
+    changed in the last 14 days is flagged as a suspected escape and linked to
+    that merge.
+  - **Auth.** With `O_API_TOKEN` set, the tracker sends it as a Bearer token.
 - **Shadow mode: a new repo earns auto-merge.** With
   `"shadow": {"promote_after": 10}` in `.o-review.json`, O runs the full
   pipeline and gate but never merges a PR whose tiers it hasn't been promoted

@@ -807,6 +807,26 @@ fun count_verbs(db, verbs) {
     if (length(r) == 0) { 0 } else { map_get(hd(r), "n") }
 }
 
+fun error_row(db, cid, key) {
+    r = db_query(db, "SELECT issue_id, count, users, fresh, escaped, first_ts FROM errors WHERE company_id = ? AND key = ?", [cid, key])
+    if (length(r) == 0) { nil } else { hd(r) }
+}
+
+fun error_create(db, cid, key, iid, count, users, fresh, escape, now) {
+    _u = db_query(db, "INSERT INTO errors (company_id, key, issue_id, count, users, fresh, escaped, first_ts, last_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", [cid, key, iid, count, users, fresh, escape, now, now])
+    key
+}
+
+fun error_update(db, cid, key, count, users, now) {
+    _u = db_query(db, "UPDATE errors SET count = ?, users = ?, last_ts = ? WHERE company_id = ? AND key = ?", [count, users, now, cid, key])
+    key
+}
+
+# O's merges since a time, newest first: the run that merged and its issue.
+fun recent_o_merges(db, cid, since) {
+    db_query(db, "SELECT r.issue_id, r.merge_sha, i.identifier FROM run r JOIN issue i ON i.id = r.issue_id WHERE i.company_id = ? AND r.merge_sha != '' AND r.started_at >= ? ORDER BY r.started_at DESC LIMIT 40", [cid, since])
+}
+
 fun shadow_row(db, cid, tier) {
     r = db_query(db, "SELECT streak, promoted, needed FROM shadow WHERE company_id = ? AND tier = ?", [cid, tier])
     if (length(r) == 0) { nil } else { hd(r) }
