@@ -594,7 +594,8 @@ pass "rounds: after O_MAX_ROUNDS (3) a retry needs {\"force\": true}"
 pr="$(ocurl -s "$BASE/api/proof")"
 [ "$(jget "$pr" 'd["merged_by_o"] >= 1 and d["merges"] == d["merged_by_o"] + d["merged_by_human"] and d["caught_before_merge"] >= 1 and d["human_touches"] >= 1')" = "True" ] || { echo "$pr"; fail "proof: /api/proof does not add up"; }
 [ "$(jget "$pr" '0 < d["resolved_issues"] <= d["merges"] and 0 <= d["first_attempt_pct"] <= 100 and 0 < d["merge_rate_pct"] <= 100 and d["runs_per_resolved_x10"] >= 10 and d["median_cycle_minutes"] >= 0')" = "True" ] || { echo "$pr"; fail "proof: first-attempt, merge-rate, runs-per-resolved or cycle-time figures are off"; }
-pass "proof: GET /api/proof reports merges by O vs humans, escaped defects, human touches, catches, first-attempt success, merge rate, runs per resolved issue and cycle time"
+[ "$(jget "$pr" 'd["budget"] in ("ok", "spent", "insufficient data") and d["budget_window_merges"] >= 1')" = "True" ] || { echo "$pr"; fail "proof: no quality budget in /api/proof"; }
+pass "proof: GET /api/proof reports merges by O vs humans, escaped defects, human touches, catches, first-attempt success, merge rate, runs per resolved issue, cycle time and the quality budget"
 
 # activity records a pass, a fail, and a completed merge
 body="$(ocurl -s "$BASE/api/activity")"
@@ -1770,8 +1771,13 @@ pass "post-merge: a merge that breaks main is bisected (not the later one), reve
 # #20, never #21 (labelled human) or #99 (not open), files one new issue, and
 # says so on GitHub; the regular poll then imports what it took and filed.
 echo '[{"number":20,"title":"[sim:good] unlabelled bug","body":"x","labels":[]},{"number":21,"title":"needs a decision","body":"x","labels":[{"name":"human"}]},{"number":22,"title":"[sim:good] other","body":"x","labels":[]}]' > "$GHS/issues.json"
+# a spent quality budget: 2 escapes in the last 12 merges, over the 2% target
+nowms="$(($(date +%s) * 1000))"
+for k in $(seq 1 10); do sqlite3 "$TMP4/o.db" "INSERT INTO activity (id, company_id, actor, verb, target, payload, ts) VALUES ('act_bm_$k', '$CIDG', 'orchestrator', 'ci.merged', 'x', '', $nowms)"; done
+for k in 1 2; do sqlite3 "$TMP4/o.db" "INSERT INTO activity (id, company_id, actor, verb, target, payload, ts) VALUES ('act_be_$k', '$CIDG', 'orchestrator', 'merge.revert', 'x', '', $nowms)"; done
 restart_d4 O_PLAN=1 O_AUTO_FILE=0
 for _i in $(seq 1 60); do [ "$(pmq plan.done)" = "1" ] && break; sleep 1; done
+grep -q "QUALITY BUDGET SPENT" "$GHS/plan_prompt" || fail "budget: a spent quality budget did not reach the planner"
 [ "$(pmq plan.done)" = "1" ] || { grep -v '^\[orch\] tick' "$TMP4/daemon.log" | tail -20; fail "plan: the planning pass never finished"; }
 grep -q "#22 \[sim:good\] other" "$GHS/plan_prompt" && ! grep -q "needs a decision" "$GHS/plan_prompt" || fail "plan: the prompt should list untaken issues and leave out human-labelled ones"
 [ -f "$GHS/labeled_20" ] && [ ! -f "$GHS/labeled_21" ] && [ ! -f "$GHS/labeled_99" ] && [ ! -f "$GHS/labeled_22" ] || { ls "$GHS" | grep labeled; fail "plan: took the wrong issues (want only #20)"; }

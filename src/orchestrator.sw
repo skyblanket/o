@@ -3463,9 +3463,10 @@ fun plan_each(db, rows, now, every) {
             _m = sh(f"mkdir -p {sq(plan_dir(cid))}")
             _w = file_write(f, to_string(now))
             co = Store.company_row(db, cid)
+            bud = Store.escape_budget(db, cid)
             rec = Store.recurring_sigs(db, cid)
             fl = Store.flaky_top(db, cid, 3)
-            ctx = "== What O has queued or in flight ==\n" ++ fmt_issues(Store.open_issue_titles(db, cid)) ++ "\n== What failed lately ==\n" ++ fmt_fails(Std.take(Store.failed_runs_for(db, cid), 8)) ++ (if (length(rec) == 0) { "" } else { "\n== Failures recurring across 3+ issues (a root cause may deserve its own issue) ==\n" ++ Std.join(["- " ++ str_or(map_get(r, "sig"), "") ++ " (" ++ to_string(map_get(r, "n")) ++ " issues)" for r in rec], "\n") ++ "\n" }) ++ (if (length(fl) == 0) { "" } else { "\n== Tests that flaked 3+ times (a deflake issue may be worth filing) ==\n" ++ Std.join(["- " ++ str_or(map_get(f, "key"), "") ++ " (" ++ to_string(map_get(f, "count")) ++ " flakes)" for f in fl], "\n") ++ "\n" })
+            ctx = (if (map_get(bud, "state") == "spent") { "== QUALITY BUDGET SPENT ==\n" ++ to_string(map_get(bud, "escaped")) ++ " of the last " ++ to_string(map_get(bud, "merges")) ++ " merges (14 days) escaped, over the " ++ to_string(map_get(bud, "target_pct")) ++ "% budget. Until it recovers, take ONLY regressions, reverted changes and bugs; no new features or improvements, and file nothing that isn't a fix.\n\n" } else { "" }) ++ "== What O has queued or in flight ==\n" ++ fmt_issues(Store.open_issue_titles(db, cid)) ++ "\n== What failed lately ==\n" ++ fmt_fails(Std.take(Store.failed_runs_for(db, cid), 8)) ++ (if (length(rec) == 0) { "" } else { "\n== Failures recurring across 3+ issues (a root cause may deserve its own issue) ==\n" ++ Std.join(["- " ++ str_or(map_get(r, "sig"), "") ++ " (" ++ to_string(map_get(r, "n")) ++ " issues)" for r in rec], "\n") ++ "\n" }) ++ (if (length(fl) == 0) { "" } else { "\n== Tests that flaked 3+ times (a deflake issue may be worth filing) ==\n" ++ Std.join(["- " ++ str_or(map_get(f, "key"), "") ++ " (" ++ to_string(map_get(f, "count")) ++ " flakes)" for f in fl], "\n") ++ "\n" })
             spawn(plan_worker(self(), cid, map_get(c, "github_repo"), str_or(map_get(co, "repo"), ""), ctx))
         }
         plan_each(db, tl(rows), now, every)
