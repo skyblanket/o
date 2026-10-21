@@ -1227,6 +1227,9 @@ case "$method $path" in
       && git -c user.email=gh@x -c user.name=gh merge -q --no-edit origin/main && git push -q origin "$b" && touch "$GHS/updated_$n"
     echo '{"message":"Updating pull request branch."}' ;;
   "DELETE repos/acme/widgets/git/refs/heads/"*) git -C "$GHS/remote.git" branch -q -D "${path#repos/acme/widgets/git/refs/heads/}" ;;
+  "GET repos/acme/widgets/pulls/"*/files*)
+    n="${path#repos/acme/widgets/pulls/}"; n="${n%%/files*}"; b="$(cat "$GHS/pr_$n")"
+    git -C "$GHS/remote.git" diff --name-only "main...$b" | python3 -c 'import json,sys;print(json.dumps([{"filename":l.strip()} for l in sys.stdin if l.strip()]))' ;;
   "GET repos/acme/widgets/pulls/"*)
     n="${path#repos/acme/widgets/pulls/}"; b="$(cat "$GHS/pr_$n")"
     sha="$(git -C "$GHS/remote.git" rev-parse "refs/heads/$b" 2>/dev/null)"; echo "$b" > "$GHS/sha_$sha"
