@@ -591,7 +591,8 @@ pass "rounds: after O_MAX_ROUNDS (3) a retry needs {\"force\": true}"
 # Proof: the all-time track record, from the activity log.
 pr="$(ocurl -s "$BASE/api/proof")"
 [ "$(jget "$pr" 'd["merged_by_o"] >= 1 and d["merges"] == d["merged_by_o"] + d["merged_by_human"] and d["caught_before_merge"] >= 1 and d["human_touches"] >= 1')" = "True" ] || { echo "$pr"; fail "proof: /api/proof does not add up"; }
-pass "proof: GET /api/proof reports merges by O vs humans, escaped defects, human touches and catches"
+[ "$(jget "$pr" '0 < d["resolved_issues"] <= d["merges"] and 0 <= d["first_attempt_pct"] <= 100 and 0 < d["merge_rate_pct"] <= 100 and d["runs_per_resolved_x10"] >= 10 and d["median_cycle_minutes"] >= 0')" = "True" ] || { echo "$pr"; fail "proof: first-attempt, merge-rate, runs-per-resolved or cycle-time figures are off"; }
+pass "proof: GET /api/proof reports merges by O vs humans, escaped defects, human touches, catches, first-attempt success, merge rate, runs per resolved issue and cycle time"
 
 # activity records a pass, a fail, and a completed merge
 body="$(ocurl -s "$BASE/api/activity")"
@@ -1226,6 +1227,9 @@ case "$method $path" in
       && git -c user.email=gh@x -c user.name=gh merge -q --no-edit origin/main && git push -q origin "$b" && touch "$GHS/updated_$n"
     echo '{"message":"Updating pull request branch."}' ;;
   "DELETE repos/acme/widgets/git/refs/heads/"*) git -C "$GHS/remote.git" branch -q -D "${path#repos/acme/widgets/git/refs/heads/}" ;;
+  "GET repos/acme/widgets/pulls/"*/files*)
+    n="${path#repos/acme/widgets/pulls/}"; n="${n%%/files*}"; b="$(cat "$GHS/pr_$n")"
+    git -C "$GHS/remote.git" diff --name-only "main...$b" | python3 -c 'import json,sys;print(json.dumps([{"filename":l.strip()} for l in sys.stdin if l.strip()]))' ;;
   "GET repos/acme/widgets/pulls/"*)
     n="${path#repos/acme/widgets/pulls/}"; b="$(cat "$GHS/pr_$n")"
     sha="$(git -C "$GHS/remote.git" rev-parse "refs/heads/$b" 2>/dev/null)"; echo "$b" > "$GHS/sha_$sha"
@@ -1539,14 +1543,15 @@ pass "gate2: modified test passing on base -> note, not REJECT; tier check faili
 IID_HD="$(gh_issue '[sim:del-test] drop a test')"
 IID_HC="$(gh_issue '[sim:ci-edit] touch CI')"
 IID_HH="$(gh_issue '[sim:huge] one giant change')"
-for pair in "$IID_HD:deletes test files (tests/existing.sh)" "$IID_HC:changes CI or the gate's own config (.github/workflows/ci.yml)" "$IID_HH:changes 1600 lines, over the limit of 1500"; do
+IID_HS="$(gh_issue '[sim:skip-test] skip the flaky test')"
+for pair in "$IID_HD:deletes test files (tests/existing.sh)" "$IID_HC:changes CI or the gate's own config (.github/workflows/ci.yml)" "$IID_HH:changes 1600 lines, over the limit of 1500" "$IID_HS:weakens tests (1 added skip markers)"; do
   i="${pair%%:*}"; why="${pair#*:}"
   wait_status_at "$BASE4" "$i" "Failed" 200 || { tail -30 "$TMP4/daemon.log"; fail "hard rules: $i was not stopped ($why)"; }
   sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$i' ORDER BY started_at DESC LIMIT 1" | grep -qF "hard rule: the PR $why" \
     || { sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$i' ORDER BY started_at DESC LIMIT 1"; fail "hard rules: reason missing ($why)"; }
-  git -C "$GHS/remote.git" log --oneline main | grep -q "o/$i" && fail "hard rules: $i was merged"
+  git -C "$GHS/remote.git" log --oneline main | grep "o/$i" >/dev/null && fail "hard rules: $i was merged"
 done
-pass "hard rules: a deleted test, a CI/gate-config change and an oversized PR are rejected before any model runs"
+pass "hard rules: a deleted test, a skipped test, a CI/gate-config change and an oversized PR are rejected before any model runs"
 
 # Gate cache: a check's result is kept by content (tree + command). XC1's merge
 # is refused (main doesn't move), so XC2 is gated on the same base and its
@@ -1724,6 +1729,22 @@ for fp in gh:20 gh:2000; do
 done
 [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM issue WHERE company_id='$CIDG' AND fingerprint='gh:22'")" = "0" ] || fail "plan: an issue the planner did not take was imported"
 pass "plan: O takes the issue it chose (not human-labelled or unknown ones), says why on GitHub, files a new one; the poll imports both"
+
+# Tiers changed: a PR parked for a human's sign-off whose files no longer map
+# to a human tier is re-adopted. CI and the gate run again on current main,
+# and it merges without a rebuild.
+[ "$(sqlite3 "$TMP4/o.db" "SELECT status FROM issue WHERE id='$IID_RK'")" = "In Review" ] || fail "re-adopt: setup: $IID_RK should still be parked for sign-off"
+ndisp_rk="$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='run.dispatch' AND target='$IID_RK'")"
+git -C "$SEEDGH" fetch -q origin && git -C "$SEEDGH" checkout -q -B main origin/main
+sed -i 's|"paths": \["risky/"\], "merge": "human"|"paths": ["risky/"], "merge": "auto"|' "$SEEDGH/.o-review.json"
+grep -q '"paths": \["risky/"\], "merge": "auto"' "$SEEDGH/.o-review.json" || fail "re-adopt: setup: the tier flip did not apply"
+git -C "$SEEDGH" commit -qam "risky tier merges on O's decision" && git -C "$SEEDGH" push -q origin main
+restart_d4 O_MERGE_GATE=1 O_AUTO_FILE=0
+wait_status_at "$BASE4" "$IID_RK" "Done" 180 || { grep -v '^\[orch\] tick' "$TMP4/daemon.log" | tail -20; fail "re-adopt: a sign-off PR was not re-gated and merged after its tier became auto"; }
+[ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='pr.adopted' AND target='$IID_RK'")" -ge 1 ] || fail "re-adopt: no pr.adopted logged"
+[ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='run.dispatch' AND target='$IID_RK'")" = "$ndisp_rk" ] || fail "re-adopt: the builder ran again (it should reuse the approved PR)"
+git -C "$GHS/remote.git" log --oneline main | grep "o/$IID_RK" >/dev/null || fail "re-adopt: the PR did not merge into main"
+pass "re-adopt: when the tiers stop asking for a human, a PR parked for sign-off is re-gated on current main and merged, no rebuild"
 
 # ============================================================
 # Agent sandbox — 5th daemon, O_SANDBOX=bwrap + O_API_TOKEN

@@ -580,8 +580,8 @@ fun tick_loop(db, dbpath, port, tick_n, running, retry) {
         {'review_done', run_id, issue_id, approved, reason, cost} ->
             r = handle_review_done(db, running, retry, run_id, issue_id, approved, reason, cost)
             tick_loop(db, dbpath, port, tick_n, map_get(r, "running"), map_get(r, "retry"))
-        {'ci_green', run_id, issue_id, num} ->
-            r = handle_ci_green(db, running, retry, run_id, issue_id, num)
+        {'ci_green', run_id, issue_id, num, head} ->
+            r = handle_ci_green(db, running, retry, run_id, issue_id, num, head)
             tick_loop(db, dbpath, port, tick_n, map_get(r, "running"), map_get(r, "retry"))
         {'gate_done', run_id, issue_id, verdict, text, session, cost} ->
             r = handle_gate_done(db, running, retry, run_id, issue_id, verdict, text, session, cost)
@@ -1597,7 +1597,8 @@ fun sim_marker(title) {
     else { if (string_contains(title, "[sim:del-test]") == 'true') { "del-test" }
     else { if (string_contains(title, "[sim:ci-edit]") == 'true') { "ci-edit" }
     else { if (string_contains(title, "[sim:huge]") == 'true') { "huge" }
-    else { "good" }}}}}}}}}}}}}}}}
+    else { if (string_contains(title, "[sim:skip-test]") == 'true') { "skip-test" }
+    else { "good" }}}}}}}}}}}}}}}}}
 }
 
 # Carry out the marker's action in the worktree. Every case except no-commit
@@ -1645,6 +1646,8 @@ fun sim_act(workspace, issue_id, marker, protected) {
                     sh(f"cd {workspace} && git rm -q tests/existing.sh && git commit -q -m sim-del-test")
                 } else { if (marker == "ci-edit") {
                     sim_commit(workspace, ".github/workflows/ci.yml", "on: push")
+                } else { if (marker == "skip-test") {
+                    sim_commit(workspace, f"tests/w_{issue_id}.sh", "skip(\"flaky on CI\")\nexit 0")
                 } else { if (marker == "huge") {
                     sh(f"cd {workspace} && seq 1 1600 > big_{issue_id}.txt && git add big_{issue_id}.txt && git commit -q -m sim-huge")
                 } else { if (marker == "net-empty") {
@@ -1653,7 +1656,7 @@ fun sim_act(workspace, issue_id, marker, protected) {
                     sh(f"cd {workspace} && git rm -q sim_{issue_id}.txt && git commit -q -m sim-undo")
                 } else {
                     sim_commit(workspace, f"sim_{issue_id}.txt", "ok")
-                }}}}}}}}}}}}
+                }}}}}}}}}}}}}
                 }
             }
         }
@@ -2355,9 +2358,9 @@ fun ci_poll(orch, run_id, issue_id, gh_repo, branch, num, base, required, pushed
             send(orch, {'ci_done', run_id, issue_id, "in_review", "", "CI green on PR #" ++ to_string(num) ++ "; O_PR_AUTOMERGE=0, so it waits for a human to merge."})
         } else { if (merge_gate_enabled() == 'true') {
             # the maintainer decides; this CI worker's job is done
-            send(orch, {'ci_green', run_id, issue_id, num})
+            send(orch, {'ci_green', run_id, issue_id, num, sha})
         } else {
-            ci_merge(orch, run_id, issue_id, gh_repo, branch, num)
+            ci_merge(orch, run_id, issue_id, gh_repo, branch, num, sha)
         }}
     } else {
         _s = sleep(env_int("O_CI_POLL_S", 30) * 1000)
@@ -2431,17 +2434,23 @@ fun pr_checks(gh_repo, sha) {
     }
 }
 
-fun ci_merge(orch, run_id, issue_id, gh_repo, branch, num) {
-    m = gh_api(f"-X PUT repos/{gh_repo}/pulls/{num}/merge -f merge_method=merge")
+# Merge exactly the commit that was checked (`sha`, the PR head CI or the gate
+# saw): GitHub refuses if the branch moved since, and the PR goes back through
+# CI and the gate instead of merging commits nobody reviewed.
+fun ci_merge(orch, run_id, issue_id, gh_repo, branch, num, sha) {
+    pin = if (string_length(sha) > 0) { " -f sha=" ++ sha } else { "" }
+    m = gh_api(f"-X PUT repos/{gh_repo}/pulls/{num}/merge -f merge_method=merge{pin}")
     d = if (elem(m, 0) == 0) { json_decode(elem(m, 1)) } else { nil }
     if (d != nil && map_get(d, "merged") == 'true') {
         _del = gh_api(f"-X DELETE repos/{gh_repo}/git/refs/heads/{branch}")
         send(orch, {'ci_done', run_id, issue_id, "merged", str_or(map_get(d, "sha"), ""), ""})
+    } else { if (string_contains(elem(m, 1), "Head branch was modified") == 'true') {
+        send(orch, {'ci_done', run_id, issue_id, "in_review", "", "CI green on PR #" ++ to_string(num) ++ " (its head moved after it was checked, so CI and the gate run again before it merges)"})
     } else {
         # Green, but GitHub won't merge it for us (required reviews, merge
         # queue, ...): park it for a human instead of burning attempts.
         send(orch, {'ci_done', run_id, issue_id, "in_review", "", string_trim(elem(m, 1))})
-    }
+    }}
 }
 
 fun list_or_empty(v) {
@@ -2548,7 +2557,7 @@ fun merge_model() {
     if (v == nil) { "claude-opus-5-5" } else { v }
 }
 
-fun handle_ci_green(db, running, retry, run_id, issue_id, num) {
+fun handle_ci_green(db, running, retry, run_id, issue_id, num, head) {
     info = map_get(running, issue_id)
     if (info == nil) {
         %{running: running, retry: retry}
@@ -2569,7 +2578,8 @@ fun handle_ci_green(db, running, retry, run_id, issue_id, num) {
         _a = Store.log_activity(db, company_id, "orchestrator", "gate.start", issue_id)
         gpid = spawn(gate_worker(self(), job))
         info2 = map_put(map_put(map_put(info, "phase", 'gate'), "started_at", now), "worker_pid", gpid)
-        %{running: map_put(running, issue_id, map_put(info2, "pr", num)), retry: map_remove(retry, issue_id)}
+        # head: the PR commit CI passed; the merge is pinned to it
+        %{running: map_put(running, issue_id, map_put(map_put(info2, "pr", num), "head", head)), retry: map_remove(retry, issue_id)}
     }
 }
 
@@ -2627,6 +2637,8 @@ fun do_gate(job) {
 # PR passes, else why not. The config comes from the base branch, so a PR
 # can't relax them.
 #   - no deleted test files (test_runners paths, tests/, test/)
+#   - no weakened tests: across test files, no net loss of assertion lines
+#     (assert*/expect*) and no added skip markers
 #   - no changes to CI or the gate's own config (.github/, .o-review.json,
 #     plus .o-review.json "locked_paths")
 #   - at most "max_change_lines" (default 1500) lines added + deleted
@@ -2634,16 +2646,22 @@ fun hard_rules(cfg, rv, files, lines) {
     test_dirs = ["tests/", "test/"] ++ flatten([list_or_empty(map_get(r, "paths")) for r in cfg_list(cfg, "test_runners")])
     gone = lines_of(elem(sh(f"git -C {sq(rv)} diff --no-renames --name-only --diff-filter=D o-base HEAD"), 1))
     gone_tests = [f for f in gone when starts_any_of(f, test_dirs) == 'true']
+    tpaths = Std.join([sq(d) for d in Std.unique(test_dirs)], " ")
+    tdiff = f"git -C {sq(rv)} diff --no-renames -U0 o-base HEAD -- {tpaths}"
+    lost = to_int_or(string_trim(elem(sh(tdiff ++ " | grep -E '^-[^-]' | grep -ciE 'assert|expect'"), 1)), 0) - to_int_or(string_trim(elem(sh(tdiff ++ " | grep -E '^[+][^+]' | grep -ciE 'assert|expect'"), 1)), 0)
+    skips = to_int_or(string_trim(elem(sh(tdiff ++ " | grep -E '^[+][^+]' | grep -cE 'skip[(]|SKIP|@skip|mark[.]skip|[.]Skip[(]|xit[(]|#if 0'"), 1)), 0)
     locked = [f for f in files when starts_any_of(f, [".github/", ".o-review.json"] ++ cfg_list(cfg, "locked_paths")) == 'true']
     lim = map_get(cfg, "max_change_lines")
     max_lines = if (lim == nil) { 1500 } else { lim }
     if (length(gone_tests) > 0) {
         "hard rule: the PR deletes test files (" ++ Std.join(gone_tests, ", ") ++ "). Tests are never deleted to get a change through; fix the code, or change the test in place and say why."
+    } else { if (lost > 0 || skips > 0) {
+        "hard rule: the PR weakens tests (" ++ (if (lost > 0) { to_string(lost) ++ " fewer assertion lines" } else { "" }) ++ (if (lost > 0 && skips > 0) { ", " } else { "" }) ++ (if (skips > 0) { to_string(skips) ++ " added skip markers" } else { "" }) ++ "). Make the code pass the tests; don't loosen them."
     } else { if (length(locked) > 0) {
         "hard rule: the PR changes CI or the gate's own config (" ++ Std.join(locked, ", ") ++ "), which decide whether changes are safe; those stay out of O's reach."
     } else { if (lines > max_lines) {
         "hard rule: the PR changes " ++ to_string(lines) ++ " lines, over the limit of " ++ to_string(max_lines) ++ " (max_change_lines). Split it into smaller PRs that each stand on their own."
-    } else { "" }}}
+    } else { "" }}}}
 }
 
 # A disposable, remote-less clone of the PR head merged with current base, so
@@ -3013,8 +3031,8 @@ fun escalate_reason(files, lines) {
     }
 }
 
-fun merge_worker(orch, run_id, issue_id, gh_repo, branch, num) {
-    ci_merge(orch, run_id, issue_id, gh_repo, branch, num)
+fun merge_worker(orch, run_id, issue_id, gh_repo, branch, num, sha) {
+    ci_merge(orch, run_id, issue_id, gh_repo, branch, num, sha)
 }
 
 fun handle_gate_done(db, running, retry, run_id, issue_id, verdict, text, session, cost) {
@@ -3038,7 +3056,8 @@ fun handle_gate_done(db, running, retry, run_id, issue_id, verdict, text, sessio
                 # maintainers merge.
                 handle_ci_done(db, running, retry, run_id, issue_id, "in_review", "", f"HUMAN: the merge gate approved, but {gh_repo} is PR-only (not in O_AUTOMERGE_OWNERS): its maintainers merge.\n\n" ++ text)
             } else {
-                mpid = spawn(merge_worker(self(), run_id, issue_id, gh_repo, f"o/{issue_id}", num))
+                approved = str_or(map_get(info, "head"), "")
+                mpid = spawn(merge_worker(self(), run_id, issue_id, gh_repo, f"o/{issue_id}", num, approved))
                 info2 = map_put(map_put(map_put(info, "phase", 'ci'), "started_at", now), "worker_pid", mpid)
                 %{running: map_put(running, issue_id, info2), retry: map_remove(retry, issue_id)}
             }
@@ -3063,6 +3082,10 @@ fun handle_gate_done(db, running, retry, run_id, issue_id, verdict, text, sessio
 #   closed unmerged    -> Canceled (pr.closed)
 #   still open, parked by PR-only mode, and the merge gate is now on
 #                      -> adopted: handed to the maintainer (pr.adopted)
+#   still open, parked for a human's sign-off, and the repo's tiers no longer
+#                      ask for one for its files (.o-review.json on base)
+#                      -> adopted the same way: CI and the gate run again on
+#                         current base before anything merges
 # Gate escalations and refused merges are never re-adopted: they wait for a
 # human, and the poller only notices when that human merges or closes.
 fun review_poll_each(db, rows) {
@@ -3074,16 +3097,18 @@ fun review_poll_each(db, rows) {
         last = Store.last_run_for_issue(db, iid)
         parked = if (last == nil) { "" } else { str_or(map_get(last, "verify_output"), "") }
         adoptable = if (merge_gate_enabled() == 'true' && string_starts_with(parked, "CI green on PR") == 'true') { 'true' } else { 'false' }
-        _s = spawn(review_poll_worker(self(), iid, map_get(r, "github_repo"), adoptable))
+        signoff = if (merge_gate_enabled() == 'true' && string_starts_with(parked, "HUMAN:") == 'true') { str_or(map_get(r, "repo"), "") } else { "" }
+        _s = spawn(review_poll_worker(self(), iid, map_get(r, "github_repo"), adoptable, signoff))
         review_poll_each(db, tl(rows))
     }
 }
 
-fun review_poll_worker(orch, issue_id, gh_repo, adoptable) {
+fun review_poll_worker(orch, issue_id, gh_repo, adoptable0, signoff_repo) {
     owner = hd(string_split(gh_repo, "/"))
     prs = gh_json(sq(f"repos/{gh_repo}/pulls?head={owner}:o/{issue_id}&state=all"))
     num = if (prs == nil) { nil } else { if (length(prs) == 0) { nil } else { map_get(hd(prs), "number") } }
     pr = if (num == nil) { nil } else { gh_json(f"repos/{gh_repo}/pulls/{num}") }
+    adoptable = if (adoptable0 == 'true' || (pr != nil && string_length(signoff_repo) > 0 && no_longer_human(gh_repo, num, signoff_repo) == 'true')) { 'true' } else { 'false' }
     if (pr == nil) {
         ""
     } else {
@@ -3380,6 +3405,18 @@ fun handle_postmerge(db, cid, outcome, res) {
             Store.issue_set_status(db, iid, "Backlog")
         }
     } else { "" }}}
+}
+
+# A PR parked for a human's sign-off whose files no longer map to a human tier
+# under the base branch's current .o-review.json (the tiers changed).
+fun no_longer_human(gh_repo, num, repo) {
+    base = detect_base(repo)
+    _f = sh(f"git -C {sq(repo)} fetch -q origin {base}")
+    pf = gh_json(f"repos/{gh_repo}/pulls/{num}/files?per_page=100")
+    files = if (pf == nil) { [] } else { [str_or(map_get(f, "filename"), "") for f in pf] }
+    if (length(files) == 0) { 'false' } else {
+        if (map_get(pr_tier(review_config(repo, "origin/" ++ base), files), "human") == 'true') { 'false' } else { 'true' }
+    }
 }
 
 # ---- self-checks (o#42) ------------------------------------------
