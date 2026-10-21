@@ -3670,6 +3670,120 @@ fun shadow_demote(db, cid, iid) {
     ""
 }
 
+# ---- production errors (o#70) -------------------------------------
+# POST /api/companies/:id/errors takes an error tracker's webhook: a generic
+# JSON event or a Sentry-shaped one (data.issue or data.event). Errors are
+# deduplicated by the tracker's id or fingerprint: a new event on a known
+# error updates its counts (and raises its issue's priority if it got worse),
+# never files another issue. Severity is O's call, from the error rate, users
+# affected and whether it is new in this release. An error whose stack names a
+# file one of O's merges changed in the last 14 days is a suspected escape,
+# linked to that merge. Error issues dispatch like any other, by priority.
+fun err_str(v) { if (v == nil) { "" } else { string_trim(to_string(v)) } }
+
+fun err_int(v, d) { if (v == nil) { d } else { to_int_or(err_str(v), d) } }
+
+fun err_frames_sentry(ev) {
+    ex = map_get(ev, "exception")
+    vals = if (ex == nil) { [] } else { list_or_empty(map_get(ex, "values")) }
+    fr = flatten([list_or_empty(map_get(map_get_or(v, "stacktrace"), "frames")) for v in vals])
+    [%{file: err_str(if (map_get(f, "filename") == nil) { map_get(f, "abs_path") } else { map_get(f, "filename") }), line: err_int(map_get(f, "lineno"), 0)} for f in fr]
+}
+
+fun map_get_or(m, k) { v = if (m == nil) { nil } else { map_get(m, k) }; if (v == nil) { %{} } else { v } }
+
+# One shape for every source: key, title, detail, files, count, users, fresh.
+fun err_norm(d) {
+    sd = map_get(d, "data")
+    si = if (sd == nil) { nil } else { map_get(sd, "issue") }
+    se = if (sd == nil) { nil } else { map_get(sd, "event") }
+    if (si != nil) {
+        culprit = err_str(map_get(si, "culprit"))
+        fr = err_str(map_get(map_get_or(si, "firstRelease"), "version"))
+        lr = err_str(map_get(map_get_or(si, "lastRelease"), "version"))
+        %{key: "sentry:" ++ err_str(map_get(si, "id")), title: err_str(map_get(si, "title")), detail: culprit, files: [%{file: hd(string_split(culprit, " ")), line: 0}], count: err_int(map_get(si, "count"), 1), users: err_int(map_get(si, "userCount"), 0), fresh: (if (string_length(fr) > 0 && fr == lr) { 'true' } else { 'false' }), total: 1}
+    } else { if (se != nil) {
+        gid = err_str(if (map_get(se, "issue_id") == nil) { map_get(se, "groupID") } else { map_get(se, "issue_id") })
+        k = if (string_length(gid) > 0) { gid } else { Std.join([err_str(x) for x in list_or_empty(map_get(se, "fingerprint"))], "|") }
+        %{key: "sentry:" ++ k, title: err_str(map_get(se, "title")), detail: err_str(map_get(se, "culprit")), files: err_frames_sentry(se), count: 1, users: 1, fresh: 'false', total: 0}
+    } else {
+        fp = err_str(if (map_get(d, "fingerprint") == nil) { map_get(d, "id") } else { map_get(d, "fingerprint") })
+        st = map_get(d, "stack")
+        frames = if (st == nil) { [] } else { [%{file: err_str(map_get(f, "file")), line: err_int(map_get(f, "line"), 0)} for f in list_or_empty(st)] }
+        nr = map_get(d, "new_in_release")
+        %{key: (if (string_length(fp) > 0) { fp } else { "title:" ++ err_str(map_get(d, "title")) }), title: err_str(map_get(d, "title")), detail: err_str(map_get(d, "message")), files: frames, count: err_int(map_get(d, "count"), 1), users: err_int(map_get(d, "users"), 0), fresh: (if (nr == 'true') { 'true' } else { 'false' }), total: 0}
+    }}
+}
+
+# Severity from the numbers, never the reporter's say-so.
+fun err_severity(count, users, fresh, first_ts, now, escape) {
+    hours = max2(1, (now - first_ts) / 3600000)
+    rate = count / hours
+    if (users >= 50 || rate >= 30 || (fresh == 'true' && users >= 5)) { "high" }
+    else { if (users >= 5 || rate >= 3 || fresh == 'true' || escape == 'true') { "medium" } else { "low" } }
+}
+
+fun prio_rank(p) { if (p == "high") { 0 } else { if (p == "medium") { 1 } else { 2 } } }
+
+# O's merges in the last 14 days that changed one of these files.
+fun err_escape(db, cid, repo, files) {
+    names = [string_trim(map_get(f, "file")) for f in files when string_length(string_trim(map_get(f, "file"))) > 0]
+    if (length(names) == 0 || string_length(repo) == 0) { nil } else {
+        _f = sh(f"git -C {sq(repo)} fetch -q origin")
+        ms = Store.recent_o_merges(db, cid, timestamp() - 14 * 86400000)
+        hits = flatten([err_merge_hit(repo, m, names) for m in ms])
+        if (length(hits) == 0) { nil } else { hd(hits) }
+    }
+}
+
+fun err_merge_hit(repo, m, names) {
+    sha = str_or(map_get(m, "merge_sha"), "")
+    changed = lines_of(elem(sh(f"git -C {sq(repo)} diff --name-only {sq(sha ++ "^1")} {sq(sha)}"), 1))
+    hit = [n for n in names when Std.any(changed, fn(c) { string_length(c) > 0 && (n == c || string_ends_with(n, "/" ++ c) == 'true') }) == 'true']
+    if (length(hit) == 0) { [] } else { [%{file: hd(hit), sha: sha, issue_id: map_get(m, "issue_id"), identifier: str_or(map_get(m, "identifier"), "")}] }
+}
+
+fun ingest_error(db, cid, d) {
+    e = err_norm(d)
+    key = map_get(e, "key")
+    now = timestamp()
+    old = Store.error_row(db, cid, key)
+    co = Store.company_row(db, cid)
+    if (old != nil) {
+        count = if (map_get(e, "total") == 1) { max2(map_get(old, "count"), map_get(e, "count")) } else { map_get(old, "count") + map_get(e, "count") }
+        users = max2(map_get(old, "users"), map_get(e, "users"))
+        fresh = if (map_get(old, "fresh") == 1 || map_get(e, "fresh") == 'true') { 'true' } else { 'false' }
+        sev = err_severity(count, users, fresh, map_get(old, "first_ts"), now, (if (map_get(old, "escaped") == 1) { 'true' } else { 'false' }))
+        iid = map_get(old, "issue_id")
+        _u = Store.error_update(db, cid, key, count, users, now)
+        iss = Store.issue_row(db, iid)
+        st = if (iss == nil) { "" } else { str_or(map_get(iss, "status"), "") }
+        cur = if (iss == nil) { "low" } else { str_or(map_get(iss, "priority"), "low") }
+        _p = if (iss != nil && prio_rank(sev) < prio_rank(cur) && st != "Done" && st != "Canceled") { Store.issue_update(db, iid, st, sev, map_get(iss, "assignee_agent_id")) } else { "" }
+        _a = Store.log_activity(db, cid, "errors", "error.event", iid)
+        %{issue_id: iid, created: 0, severity: sev, count: count, users: users}
+    } else {
+        esc = err_escape(db, cid, str_or(map_get(co, "repo"), ""), map_get(e, "files"))
+        sev = err_severity(map_get(e, "count"), map_get(e, "users"), map_get(e, "fresh"), now, now, (if (esc == nil) { 'false' } else { 'true' }))
+        frames = Std.join(["- " ++ map_get(f, "file") ++ (if (map_get(f, "line") > 0) { ":" ++ to_string(map_get(f, "line")) } else { "" }) for f in Std.take(map_get(e, "files"), 10)], "\n")
+        body = "A production error, reported by the error tracker (" ++ key ++ ").\n\n" ++ map_get(e, "title") ++ "\n" ++ map_get(e, "detail") ++ "\n\nStack:\n" ++ (if (string_length(frames) > 0) { frames } else { "(none sent)" }) ++
+            "\n\nSeen " ++ to_string(map_get(e, "count")) ++ " time(s), " ++ to_string(map_get(e, "users")) ++ " user(s)" ++ (if (map_get(e, "fresh") == 'true') { ", new in this release" } else { "" }) ++ ". Severity " ++ sev ++ " (O's call from rate, users and release)." ++
+            (if (esc == nil) { "" } else { "\n\n**Suspected escape:** " ++ map_get(esc, "file") ++ " was changed by O's merge `" ++ string_sub(map_get(esc, "sha"), 0, 7) ++ "` for " ++ map_get(esc, "identifier") ++ ". Start there, and add a test that would have caught it." }) ++
+            "\n\nFix the cause and add a test that reproduces this error."
+        iid = Store.issue_create_with_origin(db, cid, "Production error: " ++ string_truncate(map_get(e, "title"), 120), body, sev, "error")
+        if (iid == nil) { %{error: "company not found"} } else {
+            _fp = Store.issue_set_fingerprint(db, iid, "err:" ++ key)
+            _r = Store.error_create(db, cid, key, iid, map_get(e, "count"), map_get(e, "users"), (if (map_get(e, "fresh") == 'true') { 1 } else { 0 }), (if (esc == nil) { 0 } else { 1 }), now)
+            _a = Store.log_activity(db, cid, "errors", "error.new", iid)
+            _x = if (esc == nil) { "" } else {
+                _x1 = Store.log_activity(db, cid, "errors", "error.suspected_escape", iid)
+                Store.log_activity(db, cid, "errors", "error.escape_of", map_get(esc, "issue_id"))
+            }
+            %{issue_id: iid, created: 1, severity: sev, suspected_escape: (if (esc == nil) { nil } else { %{merge: map_get(esc, "sha"), issue_id: map_get(esc, "issue_id"), file: map_get(esc, "file")} })}
+        }
+    }
+}
+
 # Post the decision with its evidence on the PR, and hand it back.
 fun gate_result(job, verdict, text, evidence, cmd_md, session, cost) {
     dir = map_get(job, "dir")
