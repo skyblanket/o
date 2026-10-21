@@ -2084,6 +2084,30 @@ wait_status_at "$BASE4" "$ILD" "Done" 180 || fail "adapt: the docs issue never m
 [ "$(sqlite3 "$TMP4/o.db" "SELECT model FROM run WHERE issue_id='$ILD' AND attempt=1")" = "haiku" ] || fail "adapt: a docs issue (haiku passing there) did not start on haiku"
 pass "adapt: where haiku passed verify in 0 of 3+ runs on a tier, new work on that tier starts on sonnet (logged with the numbers); other tiers still start on haiku"
 restart_d4 O_MERGE_GATE=1 O_AUTO_FILE=0 O_ENV_RETRY_S=2
+# Upgrade (scripts/upgrade.sh): drain, wait until nothing is in flight, swap
+# the binary, restart, undrain. A run held in CI is waited for, not killed.
+IUP="$(gh_issue '[sim:good] in flight during an upgrade')"
+echo "o/$IUP" >> "$GHS/hold_ci"
+wait_status_at "$BASE4" "$IUP" "Verifying" 120 || fail "upgrade: the held run never reached CI"
+printf '%s\n' "env HOME='$TMP4' O_DB='$TMP4/o.db' O_PORT='$PORT4' O_NO_OPEN=1 O_REVIEW=1 O_CLAUDE_BIN='$TMP4/claude-stub' O_GH_BIN='$TMP4/gh-stub' GHS='$GHS' O_GH_POLL_S=2 O_CI_POLL_S=1 O_CI_SETTLE_S=0 O_POSTMERGE_S=0 O_MERGE_GATE=1 O_AUTO_FILE=0 O_ENV_RETRY_S=2 ./bin/swarmd >>'$TMP4/daemon.log' 2>&1 &" "echo \$! > '$TMP4/up.pid'" > "$TMP4/start-d4.sh"
+cp ./bin/swarmd "$TMP4/swarmd.new"
+orph0="$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='recovery.orphans_killed'")"
+( O_DB="$TMP4/o.db" O_PORT="$PORT4" O_BIN="$PWD/bin/swarmd" O_START="sh $TMP4/start-d4.sh" O_UPGRADE_WAIT_S=120 sh scripts/upgrade.sh "$TMP4/swarmd.new" > "$TMP4/upgrade.log" 2>&1; echo "rc=$?" >> "$TMP4/upgrade.log" ) &
+UPGRADER=$!
+sleep 8
+kill -0 "$DAEMON4_PID" 2>/dev/null || { cat "$TMP4/upgrade.log"; fail "upgrade: the daemon was stopped while a run was in flight"; }
+[ -f "$TMP4/o.db.drain" ] || fail "upgrade: drain was not on while waiting"
+sed -i "\|o/$IUP|d" "$GHS/hold_ci"
+wait "$UPGRADER" || true
+grep -q "rc=0" "$TMP4/upgrade.log" || { cat "$TMP4/upgrade.log"; fail "upgrade: scripts/upgrade.sh did not finish cleanly"; }
+DAEMON4_PID="$(cat "$TMP4/up.pid")"
+[ "$(sqlite3 "$TMP4/o.db" "SELECT status FROM issue WHERE id='$IUP'")" = "Done" ] || fail "upgrade: the in-flight run did not finish before the swap"
+[ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='recovery.orphans_killed'")" = "$orph0" ] || fail "upgrade: the new daemon had orphans to kill"
+[ -f "$TMP4/o.db.drain" ] && fail "upgrade: drain was left on"
+[ "$(ocurl -s -o /dev/null -w '%{http_code}' "$BASE4/api/health")" = "200" ] || fail "upgrade: the new daemon is not answering"
+rm -f ./bin/swarmd.prev
+pass "upgrade: scripts/upgrade.sh drains, waits for the run in flight (it finishes, nothing orphaned), swaps the binary, restarts and undrains"
+restart_d4 O_MERGE_GATE=1 O_AUTO_FILE=0 O_ENV_RETRY_S=2
 # inherited: base fails the same way, so the change isn't blamed
 git -C "$SEEDGH" fetch -q origin && git -C "$SEEDGH" checkout -q -B main origin/main
 echo broken > "$SEEDGH/BASE_BROKEN"; git -C "$SEEDGH" add BASE_BROKEN && git -C "$SEEDGH" commit -qm "break base" && git -C "$SEEDGH" push -q origin main
