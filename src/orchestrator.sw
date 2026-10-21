@@ -1628,7 +1628,9 @@ fun sim_marker_base(title) {
     else { if (string_contains(title, "[sim:stub]") == 'true') { "stub" }
     else { if (string_contains(title, "[sim:secret]") == 'true') { "secret" }
     else { if (string_contains(title, "[sim:env]") == 'true') { "env" }
-    else { "good" }}}}}}}}}}}}}}}}}}}}
+    else { if (string_contains(title, "[sim:migrate-docs]") == 'true') { "migrate-docs" }
+    else { if (string_contains(title, "[sim:loosen]") == 'true') { "loosen" }
+    else { "good" }}}}}}}}}}}}}}}}}}}}}}
 }
 
 # Carry out the marker's action in the worktree. Every case except no-commit
@@ -1675,6 +1677,11 @@ fun sim_act_base(workspace, issue_id, marker, protected) {
                 } else { if (marker == "docs") {
                     _d = sh(f"mkdir -p {workspace}/docs")
                     sh(f"cd {workspace} && echo docs > docs/d_{issue_id}.md && git add docs/d_{issue_id}.md && git commit -q -m sim-docs")
+                } else { if (marker == "migrate-docs") {
+                    _d = sh(f"mkdir -p {workspace}/docs")
+                    sh(f"cd {workspace} && echo 'ALTER TABLE t ADD c INT;' > docs/migrate_{issue_id}.md && git add docs/migrate_{issue_id}.md && git commit -q -m sim-migrate-docs")
+                } else { if (marker == "loosen") {
+                    sim_commit(workspace, f"lint_{issue_id}.json", "{ \"rules\": { \"no-unused\": \"off\" } }")
                 } else { if (marker == "risky") {
                     sim_commit(workspace, f"risky/r_{issue_id}.txt", "runtime change")
                 } else { if (marker == "unskip-test") {
@@ -1705,7 +1712,7 @@ fun sim_act_base(workspace, issue_id, marker, protected) {
                     sh(f"cd {workspace} && git rm -q sim_{issue_id}.txt && git commit -q -m sim-undo")
                 } else {
                     sim_commit(workspace, f"sim_{issue_id}.txt", "ok")
-                }}}}}}}}}}}}}}}}
+                }}}}}}}}}}}}}}}}}}
                 }
             }
         }
@@ -2844,6 +2851,13 @@ fun merge_model() {
     if (v == nil) { "claude-opus-5-5" } else { v }
 }
 
+# A redo: the issue fixes a change O reverted (or that didn't hold), or this
+# issue's own earlier merge was reverted.
+fun redo_change(db, iid, issue) {
+    fp = if (issue == nil) { "" } else { str_or(map_get(issue, "fingerprint"), "") }
+    if (string_starts_with(fp, "revert:") == 'true' || string_starts_with(fp, "persona-regress:") == 'true' || Store.count_target_verb(db, iid, "merge.revert") > 0) { 'true' } else { 'false' }
+}
+
 fun handle_ci_green(db, running, retry, run_id, issue_id, num, head) {
     info = map_get(running, issue_id)
     if (info == nil) {
@@ -2860,6 +2874,8 @@ fun handle_ci_green(db, running, retry, run_id, issue_id, num, head) {
                 ws: map_get(info, "workspace"), base: company_base(company, repo),
                 title: if (issue == nil) { issue_id } else { str_or(map_get(issue, "title"), issue_id) },
                 body: if (issue == nil) { "" } else { str_or(map_get(issue, "body"), "") },
+                verify_cmd: str_or(map_get(company, "verify_cmd"), ""),
+                redo: (if (redo_change(db, issue_id, issue) == 'true') { "1" } else { "" }),
                 session: "", dir: f"{home}/.o/maintainer/{company_id}/{issue_id}",
                 notes: f"{home}/.o/maintainer/{company_id}/NOTES.md"}
         _a = Store.log_activity(db, company_id, "orchestrator", "gate.start", issue_id)
@@ -2903,7 +2919,10 @@ fun do_gate(job) {
             # A hard rule: no model may wave this through, so none is asked.
             gate_result(job, "REJECT: " ++ broken, "", "", "", map_get(job, "session"), 0)
         } else {
-        tier = pr_tier(cfg, files)
+        risks = change_risks(cfg, rv, files, str_or(map_get(job, "redo"), ""), str_or(map_get(job, "verify_cmd"), ""))
+        tier0 = pr_tier(cfg, files)
+        tier = if (length(risks) == 0) { tier0 } else { strict_tier(cfg, tier0) }
+        rjob = map_put(job, "risks", risks)
         new_files = lines_of(elem(sh(f"git -C {sq(rv)} diff --no-renames --name-only --diff-filter=A o-base HEAD"), 1))
         steps = mechanical_steps(cfg, rv, f"{dir}/pr-base", added, new_files, tier, tree_of(rv, "HEAD"), tree_of(rv, "o-base"))
         ev = run_steps(steps, dir, 1, "", "")
@@ -2911,9 +2930,9 @@ fun do_gate(job) {
         failed = map_get(ev, "failed")
         if (string_length(failed) > 0) {
             # O's own checks already found a blocking problem: no model needed.
-            gate_result(job, "REJECT: " ++ failed, "", evidence, "", map_get(job, "session"), 0)
+            gate_result(rjob, "REJECT: " ++ failed, "", evidence, "", map_get(job, "session"), 0)
         } else {
-            gate_model_review(map_put(job, "model", map_get(tier, "gate_model")), cfg, rv, files, lines, numstat, tier, evidence)
+            gate_model_review(map_put(rjob, "model", map_get(tier, "gate_model")), cfg, rv, files, lines, numstat, tier, risks_md(risks) ++ evidence)
         }
         }
         }
@@ -3339,10 +3358,103 @@ fun file_line_ok(w, rv) {
     }
 }
 
+# ---- risk by what a change does (o#67) ----------------------------
+# Tiers map paths to risk; some risks live in what a change does. Each one
+# found raises the PR to the strictest gate (O_MERGE_MODEL, plus every tier's
+# extra commands) and is named on the gate comment. Per repo, .o-review.json
+# "risks" turns one off ("migration": false), replaces its path patterns
+# ("security": ["auth/", "keys/"]), or turns on "uncovered" (files no tier
+# covers; off by default, since most repos tier only some paths).
+#   migration        database or schema migrations
+#   dependency       manifests and lockfiles (new or upgraded dependencies)
+#   security         auth, crypto, secrets handling
+#   agent_steering   CLAUDE.md, AGENTS.md, prompts, the build/suite/verify scripts
+#   loosened_config  a config change that disables, skips or ignores a check,
+#                    or touches a timeout
+#   uncovered        files no tier covers (opt-in)
+#   redo             redoing a change O merged before that was reverted
+fun default_risk_paths(name) {
+    if (name == "migration") { ["migrations/", "migrate", "schema.", ".sql", "alembic/"] }
+    else { if (name == "dependency") { ["package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "requirements", "pyproject.toml", "poetry.lock", "setup.py", "cargo.toml", "cargo.lock", "go.mod", "go.sum", "gemfile", "pom.xml", "build.gradle", "composer.json", "mix.exs"] }
+    else { if (name == "security") { ["auth", "crypto", "secret", "password", "credential", "oauth", "jwt", "tls", "ssl"] }
+    else { if (name == "agent_steering") { ["claude.md", "agents.md", "gemini.md", ".cursorrules", ".claude/", "prompt", "copilot-instructions"] }
+    else { [] } } } }
+}
+
+fun risk_cfg(cfg, name) {
+    r = map_get(cfg, "risks")
+    if (r == nil) { nil } else { map_get(r, name) }
+}
+
+fun risk_on(cfg, name, dflt) {
+    v = risk_cfg(cfg, name)
+    if (v == nil) { dflt } else { if (v == 'false') { 'false' } else { 'true' } }
+}
+
+fun risk_paths(cfg, name) {
+    v = risk_cfg(cfg, name)
+    if (v == nil || v == 'true' || v == 'false') { default_risk_paths(name) } else { [string_lower(to_string(x)) for x in list_or_empty(v)] }
+}
+
+fun path_risk(cfg, name, label, files) {
+    if (risk_on(cfg, name, 'true') == 'false') { [] } else {
+        pats = risk_paths(cfg, name)
+        hit = [f for f in files when Std.any(pats, fn(p) { string_contains(string_lower(f), p) == 'true' })]
+        if (length(hit) == 0) { [] } else { [label ++ ": " ++ Std.join(Std.take(hit, 5), ", ")] }
+    }
+}
+
+fun change_risks(cfg, rv, files, redo, verify_cmd) {
+    tiers = cfg_list(cfg, "tiers")
+    cmds = cfg_str(cfg, "build") ++ " " ++ cfg_str(cfg, "suite") ++ " " ++ verify_cmd
+    scripts = if (risk_on(cfg, "agent_steering", 'true') == 'false') { [] } else { [f for f in files when string_length(f) >= 4 && string_contains(cmds, f) == 'true'] }
+    steer = path_risk(cfg, "agent_steering", "changes files that steer agents", files) ++ (if (length(scripts) == 0) { [] } else { ["changes the build, suite or verify script: " ++ Std.join(scripts, ", ")] })
+    uncovered = if (length(tiers) > 0 && risk_on(cfg, "uncovered", 'false') == 'true') { [f for f in files when tier_of(tiers, f) == nil] } else { [] }
+    loose = if (risk_on(cfg, "loosened_config", 'true') == 'true') { loosened_lines(rv, files) } else { [] }
+    path_risk(cfg, "migration", "database or schema migration", files)
+        ++ path_risk(cfg, "dependency", "new or upgraded dependencies", files)
+        ++ path_risk(cfg, "security", "auth, crypto or secrets handling", files)
+        ++ steer
+        ++ (if (length(loose) == 0) { [] } else { ["loosens a check, rule or timeout in config: " ++ Std.join(Std.take(loose, 3), " | ")] })
+        ++ (if (length(uncovered) == 0) { [] } else { ["files no tier covers: " ++ Std.join(Std.take(uncovered, 5), ", ")] })
+        ++ (if (redo == "1" && risk_on(cfg, "redo", 'true') == 'true') { ["redoes a change O merged before that was reverted (or that didn't hold)"] } else { [] })
+}
+
+fun config_file(f) {
+    low = string_lower(f)
+    lock = string_ends_with(low, ".lock") == 'true' || string_ends_with(low, "lock.json") == 'true' || string_ends_with(low, "lock.yaml") == 'true'
+    conf = Std.any([".json", ".yml", ".yaml", ".toml", ".ini", ".cfg", ".conf", "rc"], fn(e) { string_ends_with(low, e) == 'true' })
+    if (conf == 'true' && lock == 'false' && low != ".o-review.json") { 'true' } else { 'false' }
+}
+
+# Added config lines that switch a check off, skip it, ignore its result or
+# touch a timeout; removed lines that made something strict or required.
+fun loosened_lines(rv, files) {
+    cf = [f for f in files when config_file(f) == 'true']
+    if (length(cf) == 0) { [] } else {
+        d = elem(sh(f"git -C {sq(rv)} diff --no-renames -U0 o-base HEAD -- " ++ Std.join([sq(f) for f in cf], " ")), 1)
+        ls = [string_trim(l) for l in string_split(d, "\n") when string_starts_with(l, "+++") == 'false' && string_starts_with(l, "---") == 'false']
+        adds = ["+ " ++ string_trim(string_sub(l, 1, string_length(l) - 1)) for l in ls when string_starts_with(l, "+") == 'true' && Std.any(["disable", "\"off\"", "'off'", ": off", "= off", "ignore", "skip", "allow_failure", "allow-failure", "continue-on-error", "no-verify", "timeout", "|| true", "max-warnings"], fn(k) { string_contains(string_lower(l), k) == 'true' })]
+        dels = ["- " ++ string_trim(string_sub(l, 1, string_length(l) - 1)) for l in ls when string_starts_with(l, "-") == 'true' && Std.any(["strict", "required", "\"error\"", "'error'", "fail-on", "fail_on"], fn(k) { string_contains(string_lower(l), k) == 'true' })]
+        [string_truncate(x, 120) for x in adds ++ dels]
+    }
+}
+
+# The strictest gate: the strongest model, every tier's extra commands.
+fun strict_tier(cfg, tier) {
+    every = Std.unique(flatten([list_or_empty(map_get(t, "extra")) for t in cfg_list(cfg, "tiers")]))
+    nm = map_get(tier, "names")
+    map_put(map_put(map_put(tier, "gate_model", merge_model()), "extra", Std.unique(map_get(tier, "extra") ++ every)), "names", (if (string_length(nm) > 0) { nm ++ ", " } else { "" }) ++ "strictest (risks found)")
+}
+
+fun risks_md(risks) {
+    if (length(risks) == 0) { "" } else { "**Risks found** (this PR gets the strictest gate: the strongest model and every tier's checks):\n" ++ Std.join(["- " ++ r for r in risks], "\n") ++ "\n\n" }
+}
+
 # Post the decision with its evidence on the PR, and hand it back.
 fun gate_result(job, verdict, text, evidence, cmd_md, session, cost) {
     dir = map_get(job, "dir")
-    body = "**O merge gate** (" ++ str_or(map_get(job, "model"), merge_model()) ++ ")\n\n**Decision:** `" ++ verdict ++ "`\n\n<details><summary>O's own checks</summary>\n\n" ++ (if (string_length(evidence) > 0) { evidence } else { "_(none configured; add .o-review.json)_\n" }) ++ "\n</details>\n\n<details><summary>Commands the maintainer ran</summary>\n\n" ++ (if (string_length(cmd_md) > 0) { cmd_md } else { "_(model not consulted)_\n" }) ++ "\n</details>\n\n" ++ text
+    body = "**O merge gate** (" ++ str_or(map_get(job, "model"), merge_model()) ++ ")\n\n**Decision:** `" ++ verdict ++ "`\n\n" ++ risks_md(list_or_empty(map_get(job, "risks"))) ++ "<details><summary>O's own checks</summary>\n\n" ++ (if (string_length(evidence) > 0) { evidence } else { "_(none configured; add .o-review.json)_\n" }) ++ "\n</details>\n\n<details><summary>Commands the maintainer ran</summary>\n\n" ++ (if (string_length(cmd_md) > 0) { cmd_md } else { "_(model not consulted)_\n" }) ++ "\n</details>\n\n" ++ text
     _c = file_write(f"{dir}/COMMENT.md", body)
     _p = sh(f"{gh_bin()} api -X POST repos/{map_get(job, "gh_repo")}/issues/{map_get(job, "num")}/comments -F body=@{sq(dir)}/COMMENT.md")
     %{verdict: verdict, text: (if (string_length(evidence) > 0) { "O's checks:\n" ++ evidence ++ "\n" } else { "" }) ++ text, session: session, cost: cost}
