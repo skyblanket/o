@@ -108,6 +108,17 @@ cleanup() {
 trap cleanup EXIT
 
 pass() { echo "PASS: $1"; }
+# Push the seed checkout's main to the fake remote. O may be merging into the
+# same main at that moment, so a rejected push (non-fast-forward, or a ref lock
+# held by the other push) is rebased and retried.
+seed_push() {
+  local _t
+  for _t in 1 2 3 4 5 6; do
+    git -C "$SEEDGH" push -q origin main 2>/dev/null && return 0
+    sleep 1; git -C "$SEEDGH" pull -q --rebase origin main || true
+  done
+  git -C "$SEEDGH" push -q origin main
+}
 fail() { echo "FAIL: $1"; exit 1; }
 
 # curl with a hard wall-clock cap so a wedged connection can never hang the
@@ -400,7 +411,7 @@ cat > "$SEEDGH/.o-review.json" <<'JSON'
              { "name": "ext", "paths": ["ext/"], "merge": "auto", "extra": ["test ! -f ext/broken", "test -f broken-on-base-too"] } ] }
 JSON
 mkdir -p "$SEEDGH/tests"; echo 'exit 0' > "$SEEDGH/tests/existing.sh"
-git -C "$SEEDGH" add -A; git -C "$SEEDGH" commit -q -m "seed gh project"; git -C "$SEEDGH" push -q origin main
+git -C "$SEEDGH" add -A; git -C "$SEEDGH" commit -q -m "seed gh project"; seed_push
 GHREPO="$TMP4/ghclone"
 git clone -q "$GHS/remote.git" "$GHREPO"
 git -C "$GHREPO" config user.email "o@example.com"; git -C "$GHREPO" config user.name "O Test"
@@ -794,7 +805,7 @@ git -C "$SEEDGH" checkout -q main; git -C "$SEEDGH" merge -q --no-ff -m "Merge p
 git -C "$SEEDGH" checkout -q -b later; mkdir -p "$SEEDGH/docs"; echo y > "$SEEDGH/docs/later.md"
 git -C "$SEEDGH" add -A; git -C "$SEEDGH" commit -q -m "docs"
 git -C "$SEEDGH" checkout -q main; git -C "$SEEDGH" merge -q --no-ff -m "Merge pull request #951 from acme/docs-later" later
-git -C "$SEEDGH" push -q origin main
+seed_push
 for _i in $(seq 1 120); do [ "$(pmq postmerge.reverted)" = "1" ] && break; sleep 1; done
 [ "$(pmq postmerge.reverted)" = "1" ] || { grep -v '^\[orch\] tick' "$TMP4/daemon.log" | tail -30; fail "post-merge: the breaking merge was not reverted"; }
 git -C "$GHS/remote.git" show main:ext/broken >/dev/null 2>&1 && fail "post-merge: ext/broken still on main after the revert"
@@ -837,7 +848,7 @@ ndisp_rk="$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='run.
 git -C "$SEEDGH" fetch -q origin && git -C "$SEEDGH" checkout -q -B main origin/main
 sed -i 's|"paths": \["risky/"\], "merge": "human"|"paths": ["risky/"], "merge": "auto"|' "$SEEDGH/.o-review.json"
 grep -q '"paths": \["risky/"\], "merge": "auto"' "$SEEDGH/.o-review.json" || fail "re-adopt: setup: the tier flip did not apply"
-git -C "$SEEDGH" commit -qam "risky tier merges on O's decision" && git -C "$SEEDGH" push -q origin main
+git -C "$SEEDGH" commit -qam "risky tier merges on O's decision" && seed_push
 restart_d4 O_MERGE_GATE=1 O_AUTO_FILE=0
 wait_status_at "$BASE4" "$IID_RK" "Done" 180 || { grep -v '^\[orch\] tick' "$TMP4/daemon.log" | tail -20; fail "re-adopt: a sign-off PR was not re-gated and merged after its tier became auto"; }
 [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='pr.adopted' AND target='$IID_RK'")" -ge 1 ] || fail "re-adopt: no pr.adopted logged"
@@ -900,7 +911,7 @@ if [ -f BASE_BROKEN ]; then echo "FAIL: base is broken (test_widget)"; exit 1; f
 if [ -f BREAK_VERIFY ]; then echo "BREAK_VERIFY present"; exit 1; fi
 exit 0
 SH
-git -C "$SEEDGH" commit -qam "verify.sh: env and base-broken modes" && git -C "$SEEDGH" push -q origin main
+git -C "$SEEDGH" commit -qam "verify.sh: env and base-broken modes" && seed_push
 restart_d4 O_MERGE_GATE=1 O_AUTO_FILE=0 O_ENV_RETRY_S=2
 # environment: re-verified on the same attempt, no builder re-run
 IID_EV="$(gh_issue '[sim:env] the box runs out of disk')"
@@ -1024,7 +1035,7 @@ grep -q "Merge gate: \`APPROVE\` by" "$crec" && grep -q "O's checks:" "$crec" &&
 pass "policy: O generates docs/O-POLICY.md from .o-review.json and merges it through its own gate; the merge record names the gate's verdict, model, risks and checks"
 git -C "$SEEDGH" fetch -q origin && git -C "$SEEDGH" checkout -q -B main origin/main
 python3 -c 'import json,sys;p=sys.argv[1];d=json.load(open(p));d["tiers"].append({"name":"web","paths":["web/"],"merge":"auto"});json.dump(d,open(p,"w"),indent=1)' "$SEEDGH/.o-review.json"
-git -C "$SEEDGH" commit -qam "add a web tier" && git -C "$SEEDGH" push -q origin main
+git -C "$SEEDGH" commit -qam "add a web tier" && seed_push
 for _i in $(seq 1 60); do IP2="$(pol_q)"; [ -n "$IP2" ] && [ "$IP2" != "$IP1" ] && break; sleep 1; done
 [ -n "$IP2" ] && [ "$IP2" != "$IP1" ] || fail "policy: a config change did not regenerate the policy"
 echo "o/$IP2" >> "$GHS/only_lint"
@@ -1040,7 +1051,7 @@ restart_d4 O_MERGE_GATE=1 O_AUTO_FILE=0 O_ENV_RETRY_S=2
 # merges the next docs PR itself. A shadow PR closed unmerged resets its tier.
 git -C "$SEEDGH" fetch -q origin && git -C "$SEEDGH" checkout -q -B main origin/main
 python3 -c 'import json,sys;p=sys.argv[1];d=json.load(open(p));d["shadow"]={"promote_after":2};json.dump(d,open(p,"w"),indent=1)' "$SEEDGH/.o-review.json"
-git -C "$SEEDGH" commit -qam "shadow mode" && git -C "$SEEDGH" push -q origin main
+git -C "$SEEDGH" commit -qam "shadow mode" && seed_push
 shq() { sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='$1' AND target='$2'"; }
 for k in 1 2; do
   ISk="$(gh_issue "[sim:docs] shadow docs $k")"; echo "o/$ISk" >> "$GHS/only_lint"
@@ -1067,7 +1078,7 @@ pr="$(ocurl -s "$BASE4/api/proof")"
 pass "shadow: O parks PRs it would merge, two unchanged merges by a person promote the docs tier (logged), then O merges docs itself; a closed shadow PR resets its tier; /api/proof shows the progress"
 git -C "$SEEDGH" fetch -q origin && git -C "$SEEDGH" checkout -q -B main origin/main
 python3 -c 'import json,sys;p=sys.argv[1];d=json.load(open(p));d.pop("shadow");json.dump(d,open(p,"w"),indent=1)' "$SEEDGH/.o-review.json"
-git -C "$SEEDGH" commit -qam "shadow mode off" && git -C "$SEEDGH" push -q origin main
+git -C "$SEEDGH" commit -qam "shadow mode off" && seed_push
 # Production errors (o#70): a tracker's webhook files one issue per error
 # (deduplicated by its id or fingerprint), severity is computed from rate,
 # users and release, and an error in a file O's merge changed is linked to it.
@@ -1092,7 +1103,7 @@ pass "errors: a tracker's webhook (generic or Sentry-shaped) files one issue per
 # rung, and the choice is logged with its numbers.
 git -C "$SEEDGH" fetch -q origin && git -C "$SEEDGH" checkout -q -B main origin/main
 python3 -c 'import json,sys;p=sys.argv[1];d=json.load(open(p));d["tiers"].append({"name":"lab","paths":["lab/"],"merge":"auto"});json.dump(d,open(p,"w"),indent=1)' "$SEEDGH/.o-review.json"
-git -C "$SEEDGH" commit -qam "lab tier" && git -C "$SEEDGH" push -q origin main
+git -C "$SEEDGH" commit -qam "lab tier" && seed_push
 restart_d4 O_MERGE_GATE=1 O_AUTO_FILE=0 O_ENV_RETRY_S=2 O_ADAPT=1
 for k in 1 2; do IL="$(gh_issue "[sim:bad-verify] lab/ change $k")"; wait_status_at "$BASE4" "$IL" "Failed" 300 || fail "adapt: a failing lab/ issue never stopped"; done
 ILG="$(gh_issue '[sim:good] lab/ change that works')"
@@ -1141,7 +1152,7 @@ pass "flaky gate: a PR's new test must pass 5 runs in a row (the last under load
 # names the smuggling and thread-migration bugs, and other PRs skip it.
 git -C "$SEEDGH" fetch -q origin && git -C "$SEEDGH" checkout -q -B main origin/main
 python3 -c 'import json,sys;p=sys.argv[1];d=json.load(open(p));d["tiers"].append({"name":"net","paths":["net/"],"merge":"auto","focus":["network","concurrency"]});json.dump(d,open(p,"w"),indent=1)' "$SEEDGH/.o-review.json"
-git -C "$SEEDGH" commit -qam "net tier with a focused review" && git -C "$SEEDGH" push -q origin main
+git -C "$SEEDGH" commit -qam "net tier with a focused review" && seed_push
 fc0="$({ cat "$GHS/focus_calls" 2>/dev/null || true; } | wc -l)"
 IFG="$(gh_issue '[sim:good] plain change, no focus')"
 wait_status_at "$BASE4" "$IFG" "Done" 180 || fail "focus: a plain change never merged"
@@ -1187,7 +1198,7 @@ gr="$(ocurl -s -X POST "$BASE4/api/companies/$CIDG/gate/rotate" -H 'Content-Type
 pass "ui: the board (PR, CI, gate, why waiting), spend by role with cost per merge, an issue's activity and the gate's config are served; rotate clears the maintainer session"
 # inherited: base fails the same way, so the change isn't blamed
 git -C "$SEEDGH" fetch -q origin && git -C "$SEEDGH" checkout -q -B main origin/main
-echo broken > "$SEEDGH/BASE_BROKEN"; git -C "$SEEDGH" add BASE_BROKEN && git -C "$SEEDGH" commit -qm "break base" && git -C "$SEEDGH" push -q origin main
+echo broken > "$SEEDGH/BASE_BROKEN"; git -C "$SEEDGH" add BASE_BROKEN && git -C "$SEEDGH" commit -qm "break base" && seed_push
 IID_IH="$(gh_issue '[sim:good] change on a broken main')"
 wait_status_at "$BASE4" "$IID_IH" "Done" 240 || { grep -v '^\[orch\] tick' "$TMP4/daemon.log" | tail -20; fail "inherited: a change on a broken main was blamed for main's failure"; }
 [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='verify.inherited' AND target='$IID_IH'")" -ge 1 ] || fail "inherited: verify.inherited not logged"
