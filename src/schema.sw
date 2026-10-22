@@ -94,6 +94,8 @@ fun migrate(db) {
     # o#63: tests that failed and then passed on an identical re-run
     _flaky    = db_exec(db, "CREATE TABLE IF NOT EXISTS flaky (company_id TEXT, key TEXT, count INTEGER DEFAULT 0, last_ts INTEGER, PRIMARY KEY (company_id, key))")
     # o#7: every cost by kind (agent, reviewer, gate, planner, reflect, persona)
+    _mnote    = db_exec(db, "CREATE TABLE IF NOT EXISTS maintainer_note (company_id TEXT, notes TEXT, ts INTEGER)")
+    _ix_mnote = db_exec(db, "CREATE INDEX IF NOT EXISTS ix_mnote ON maintainer_note (company_id, ts)")
     _idem     = db_exec(db, "CREATE TABLE IF NOT EXISTS idem (k TEXT PRIMARY KEY, status INTEGER, body TEXT, ts INTEGER)")
     _spend    = db_exec(db, "CREATE TABLE IF NOT EXISTS spend (company_id TEXT, kind TEXT, cents REAL, issue_id TEXT, ts INTEGER)")
     _ix_spend = db_exec(db, "CREATE INDEX IF NOT EXISTS ix_spend_ts ON spend (company_id, ts)")

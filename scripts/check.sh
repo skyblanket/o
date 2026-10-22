@@ -1204,6 +1204,16 @@ wait_status_at "$BASE4" "$IID_IH" "Done" 240 || { grep -v '^\[orch\] tick' "$TMP
 [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='verify.inherited' AND target='$IID_IH'")" -ge 1 ] || fail "inherited: verify.inherited not logged"
 [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='verify.fail' AND target='$IID_IH'")" = "0" ] || fail "inherited: main's failure was counted against the change"
 pass "inherited: a verify that fails the same way on base goes on to CI and the gate instead of back to the builder"
+# o#12: the notes live in the control plane too. Wipe them from disk, restart,
+# and the next review is still primed with them.
+ocurl -s "$BASE4/api/companies/$CIDG/maintainer" | grep -q "lesson from an earlier review" || fail "maintainer: GET /maintainer does not return the shared notes"
+rm -rf "$TMP4/.o/maintainer/$CIDG"; rm -f "$GHS/gate_notes_seen"
+restart_d4 O_MERGE_GATE=1 O_AUTO_FILE=0 O_ENV_RETRY_S=2
+IID_NR="$(gh_issue '[sim:good] reviewed after the notes were wiped')"
+wait_status_at "$BASE4" "$IID_NR" "Done" 240 || { tail -30 "$TMP4/daemon.log"; fail "maintainer: the review after a wipe did not merge"; }
+[ -s "$GHS/gate_notes_seen" ] || fail "maintainer: notes wiped from disk were not restored into the next review's prompt"
+[ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='maintainer.notes_restored'")" -ge 1 ] || fail "maintainer: no maintainer.notes_restored logged"
+pass "maintainer: shared notes are kept in the control plane; wiped from disk, they are restored before the next review"
 
 }
 

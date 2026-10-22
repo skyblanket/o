@@ -3018,12 +3018,31 @@ fun handle_ci_green(db, running, retry, run_id, issue_id, num, head) {
                 redo: (if (redo_change(db, issue_id, issue) == 'true') { "1" } else { "" }),
                 session: "", dir: f"{home}/.o/maintainer/{company_id}/{issue_id}",
                 notes: f"{home}/.o/maintainer/{company_id}/NOTES.md"}
+        _rn = restore_notes(db, company_id, map_get(job, "notes"))
         _a = Store.log_activity(db, company_id, "orchestrator", "gate.start", issue_id)
         gpid = spawn(gate_worker(self(), job))
         info2 = map_put(map_put(map_put(info, "phase", 'gate'), "started_at", now), "worker_pid", gpid)
         # head: the PR commit CI passed; the merge is pinned to it
         %{running: map_put(running, issue_id, map_put(map_put(info2, "pr", num), "head", head)), retry: map_remove(retry, issue_id)}
     }
+}
+
+# NOTES.md missing on disk (a new machine, a wiped ~/.o) but kept in the
+# control plane: put it back before the gate primes from it (o#12).
+fun restore_notes(db, company_id, path) {
+    if (file_exists(path) == 'true') { "" } else {
+        saved = Store.notes_latest(db, company_id)
+        if (string_length(saved) == 0) { "" } else {
+            _m = sh(f"mkdir -p {sq(dirname(path))}")
+            _w = file_write(path, saved)
+            Store.log_activity(db, company_id, "orchestrator", "maintainer.notes_restored", company_id)
+        }
+    }
+}
+
+fun dirname(path) {
+    parts = string_split(path, "/")
+    Std.join(Std.take(parts, length(parts) - 1), "/")
 }
 
 fun gate_worker(orch, job) {
@@ -4136,7 +4155,9 @@ fun handle_gate_done(db, running, retry, run_id, issue_id, verdict, text, sessio
         account_cost_k(db, company_id, cost, "gate", issue_id)
         _rc = Store.run_add_cost(db, run_id, cost)
         home = getenv("HOME")
-        _n = append_notes(f"{home}/.o/maintainer/{company_id}/NOTES.md", text)
+        npath = f"{home}/.o/maintainer/{company_id}/NOTES.md"
+        _n = append_notes(npath, text)
+        _ns = if (file_exists(npath) == 'true') { Store.notes_save(db, company_id, file_read(npath)) } else { "" }
         if (verdict == "APPROVE") {
             _a = Store.log_activity(db, company_id, "maintainer", "gate.approve", issue_id)
             num = map_get(info, "pr")

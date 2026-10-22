@@ -242,6 +242,14 @@ fun route_retry(db, conn, method, p, body) {
     }}}}
 }
 
+# GET /api/companies/:id/maintainer: the merge gate's shared notes (as kept in
+# the control plane), its current session and how many reviews it has done.
+fun maintainer_info(db, conn, cid) {
+    c = Store.company_row(db, cid)
+    if (c == nil) { respond(conn, 404, err_json("no such company")) }
+    else { respond(conn, 200, json_encode(%{notes: Store.notes_latest(db, cid), session: default_str(map_get(c, "maintainer_session"), ""), reviews: default_num(map_get(c, "maintainer_reviews"), 0)})) }
+}
+
 fun max_rounds() { Orchestrator.env_int("O_MAX_ROUNDS", 3) }
 
 
@@ -258,6 +266,7 @@ fun route(db, dbpath, conn, method, path, body) {
         "/api/fs" -> route_fs(conn, method, body)
         "/api/approvals" -> route_approvals(db, conn, method)
         "/api/companies" -> route_companies(db, conn, method, body)
+        p when string_starts_with(p, "/api/companies/") == 'true' && string_ends_with(p, "/maintainer") == 'true' -> maintainer_info(db, conn, string_sub(p, 15, string_length(p) - 15 - 11))
         p when string_starts_with(p, "/api/companies/") == 'true' -> route_company(db, conn, method, p, body)
         p when string_starts_with(p, "/api/approvals/") == 'true' -> decide_approval(db, conn, method, p, body)
         p when string_starts_with(p, "/api/runs/") == 'true' -> run_result(db, conn, p)
