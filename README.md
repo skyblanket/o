@@ -534,7 +534,7 @@ The daemon reads its configuration from the environment. All are optional.
 
 | variable | default | meaning |
 |---|---|---|
-| `SW_SCHEDULERS` | CPU count | scheduler threads (a swarmrt setting). Each running agent, verify, gate review or persona holds one while its subprocess runs, and when all are held the API and orchestrator stall; set it well above how many can run at once (`deploy/o.env.example` uses 32). |
+| `SW_SCHEDULERS` | CPU count | scheduler threads (a swarmrt setting). Each running agent, verify, gate review or persona holds one while its subprocess runs, and when all are held the API and orchestrator stall. O keeps two free: it starts nothing new while `schedulers - 2` workers (agents, verifies, reviews, CI polls, gates) are in flight, logs `dispatch.throttled`, and warns at boot when `O_MAX_CONCURRENT * 2 + 2` exceeds it. Set it well above how many can run at once (`deploy/o.env.example` uses 32). |
 | `O_TICK_MS` / `O_BACKOFF_MS` | `5000` / `2000` | orchestrator tick and base retry backoff in ms (the test suite runs at 500 / 300). |
 | `O_MAX_CONCURRENT` | `3` | agent runs (build, verify, review) in flight across all companies. PRs waiting on CI, the gate or a merge hold no slot. Keep `SW_SCHEDULERS` above twice this. |
 | `O_DB` | `~/.o/o.db` | control-plane SQLite path. |
@@ -600,7 +600,7 @@ curl -X POST http://localhost:4100/api/companies/<id>/agents \
 curl -X POST http://localhost:4100/api/companies/<id>/issues \
   -d '{"title":"first task","priority":"high"}'
 
-curl http://localhost:4100/api/orchestrator   # live scheduler snapshot
+curl http://localhost:4100/api/orchestrator   # live scheduler snapshot (running, in_flight, schedulers, draining)
 curl http://localhost:4100/api/runs           # run history
 curl http://localhost:4100/api/activity       # activity log
 curl http://localhost:4100/api/companies/<id>/board   # per open issue: PR, CI, gate decision, why it waits
