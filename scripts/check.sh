@@ -18,6 +18,9 @@ export O_TICK_MS="${O_TICK_MS:-500}" O_BACKOFF_MS="${O_BACKOFF_MS:-300}"
 # the adaptive starting model (o#64) would read the stages' deliberate failures as
 # a weak model: off everywhere but its own stage
 export O_ADAPT=0
+# Daemons keep two scheduler threads free (o#10); give them room like a real
+# deploy does, so the parallel stages aren't throttled on a small CI box.
+export SW_SCHEDULERS="${SW_SCHEDULERS:-16}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
