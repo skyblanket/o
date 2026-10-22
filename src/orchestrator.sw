@@ -493,6 +493,7 @@ fun start(dbpath, port) {
     # reflection worker its own DB connection string and the daemon's base URL.
     orch = spawn(tick_loop(db, dbpath, port, 0, %{}, %{}))
     register('orchestrator', orch)
+    _pf = start_preflight(db, dbpath, orch)
     # The merger is a SINGLE process, so every company's merges are serialized
     # through it: only one `git checkout main && merge` touches a repo at a
     # time, and two green issues can never race a merge. It never touches the
@@ -563,6 +564,59 @@ fun park_inflight_prs(db, rows, n) {
 # busy_slots to reach 0, then restarts without killing work.
 fun draining(dbpath) { file_exists(dbpath ++ ".drain") }
 
+# ---- preflight (o#15) ---------------------------------------------------
+# At boot, one tiny run of the agent CLI, in the same sandbox builders get, is
+# asked to write probe.txt in a scratch repo. Until it has, nothing is
+# dispatched; if it can't (a broken sandbox, CLI or login), dispatch stays
+# held and GET /api/orchestrator says why, before any issue is touched. It runs
+# when O_PREFLIGHT=1, or when unset and a claude-code agent exists; restart
+# after fixing the cause to probe again.
+fun preflight_on(db) {
+    v = getenv("O_PREFLIGHT")
+    if (v == "0") { 'false' } else { if (v == "1") { 'true' } else { if (Store.claude_agents_n(db) > 0) { 'true' } else { 'false' } } }
+}
+
+fun start_preflight(db, dbpath, orch) {
+    _rm = sh(f"rm -f {sq(dbpath)}.preflight {sq(dbpath)}.preflight-on")
+    if (preflight_on(db) == 'true') {
+        _m = file_write(dbpath ++ ".preflight-on", "1")
+        spawn(preflight_worker(orch))
+    } else { "" }
+}
+
+# Held while the probe is pending or failed; never when it isn't on.
+fun preflight_holds(dbpath) {
+    if (file_exists(dbpath ++ ".preflight-on") == 'false') { 'false' } else {
+        st = preflight_state(dbpath)
+        if (map_get(st, "ok") == 'true') { 'false' } else { 'true' }
+    }
+}
+
+fun preflight_state(dbpath) {
+    if (file_exists(dbpath ++ ".preflight-on") == 'false') { %{ok: 'true', detail: "off"} }
+    else { if (file_exists(dbpath ++ ".preflight") == 'false') { %{ok: 'false', detail: "pending"} }
+    else {
+        t = file_read(dbpath ++ ".preflight")
+        lines = string_split(t, "\n")
+        %{ok: (if (hd(lines) == "ok") { 'true' } else { 'false' }), detail: Std.join(tl(lines), "\n")}
+    } }
+}
+
+fun preflight_worker(orch) {
+    dir = "/tmp/o-preflight-" ++ to_string(timestamp())
+    _i = sh(f"mkdir -p {sq(dir)} && git -C {sq(dir)} init -q && git -C {sq(dir)} -c user.email=o@localhost -c user.name=O commit -q --allow-empty -m probe")
+    _w = file_write(f"{dir}/PROMPT.txt", "This is a health check. Run exactly this shell command and nothing else: echo ok > probe.txt\nThen reply DONE.")
+    m = getenv("O_PREFLIGHT_MODEL")
+    r = claude_once(dir, claude_bin(), "", sandbox_prefix(dir, dir), (if (m == nil) { "haiku" } else { m }))
+    got = if (file_exists(f"{dir}/probe.txt") == 'true') { string_trim(file_read(f"{dir}/probe.txt")) } else { "" }
+    ok = if (got == "ok") { 'true' } else { 'false' }
+    said = str_or(map_get(parse_stream_result(f"{dir}/stream.jsonl"), "result"), "")
+    errt = if (file_exists(f"{dir}/err.log") == 'true') { tail_text(file_read(f"{dir}/err.log"), 1500) } else { "" }
+    detail = if (ok == 'true') { "ok" } else { "the agent CLI could not write probe.txt in a sandboxed scratch repo (exit " ++ to_string(elem(r, 0)) ++ "). It said: " ++ string_truncate(said, 1500) ++ "\nerr.log tail:\n" ++ errt }
+    _rm = sh(f"rm -rf {sq(dir)}")
+    send(orch, {'preflight_done', ok, detail})
+}
+
 fun ticker_loop(orch, interval) {
     sleep(interval)
     send(orch, 'tick')
@@ -625,8 +679,15 @@ fun tick_loop(db, dbpath, port, tick_n, running, retry) {
         {'persona_done', prun_id, pcost, pcode, ptext, verdicts} ->
             _pd = handle_persona_done(db, prun_id, pcost, pcode, ptext, verdicts)
             tick_loop(db, dbpath, port, tick_n, running, retry)
+        {'preflight_done', ok, detail} ->
+            # line 1 "ok" or "failed", then what the CLI said: no JSON round
+            # trip, so an ok can't decode as something other than 'true'
+            _w = file_write(dbpath ++ ".preflight", (if (ok == 'true') { "ok" } else { "failed" }) ++ "\n" ++ detail)
+            _a = Store.log_activity(db, "", "orchestrator", (if (ok == 'true') { "preflight.ok" } else { "preflight.failed" }), string_truncate(detail, 500))
+            _p = print(f"[orch] preflight: " ++ (if (ok == 'true') { "ok" } else { "FAILED, dispatch held: " ++ string_truncate(detail, 300) }))
+            tick_loop(db, dbpath, port, tick_n, running, retry)
         {'snapshot', from} ->
-            send(from, {'snapshot_reply', %{tick: tick_n, running: map_size(running), busy: busy_slots(running), retrying: map_size(retry), tick_interval_ms: tick_interval(), max_concurrent: max_concurrent(), in_flight: map_size(running), schedulers: schedulers(), draining: draining(dbpath)}})
+            send(from, {'snapshot_reply', %{tick: tick_n, running: map_size(running), busy: busy_slots(running), retrying: map_size(retry), tick_interval_ms: tick_interval(), max_concurrent: max_concurrent(), preflight: preflight_state(dbpath), in_flight: map_size(running), schedulers: schedulers(), draining: draining(dbpath)}})
             tick_loop(db, dbpath, port, tick_n, running, retry)
     }
 }
@@ -651,7 +712,7 @@ fun do_tick(db, dbpath, port, tick_n, running, retry) {
     sr = map_get(swept, "running")
     sq = breaker_scan(db, sr, map_get(swept, "retry"))
     cands = Store.candidate_issues(db)
-    want = if (draining(dbpath) == 'true') { 0 } else { dispatch_slots(db, busy_slots(sr)) }
+    want = if (draining(dbpath) == 'true' || preflight_holds(dbpath) == 'true') { 0 } else { dispatch_slots(db, busy_slots(sr)) }
     slots = throttle_slots(db, want, map_size(sr), length(cands))
     dispatch_batch(db, cands, slots, sr, sq, now)
 }

@@ -24,6 +24,8 @@ export SW_SCHEDULERS="${SW_SCHEDULERS:-16}"
 # The agent-broken breaker (o#15) would trip on stages that drive several
 # no-commit issues on purpose; only its own stage turns it on.
 export O_BROKEN_RUNS=0
+# Likewise the boot preflight probe (o#15): only its own stage runs it.
+export O_PREFLIGHT=0
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -2064,6 +2066,46 @@ nr="$(sqlite3 "$TMPT/o.db" "SELECT COUNT(*) FROM run r JOIN issue i ON i.id = r.
 pass "breaker: 3 no-commit runs across issues pause the company agent-broken, file one diagnostic, and put the issues back in Backlog ($nr runs spent)"
 stop_daemon "$DT"; rmtmp "$TMPT"
 pass "thread room: SW_SCHEDULERS=4 runs at most $maxf worker(s) at once, logs dispatch.throttled, the API answers within 1s throughout"
+
+# Preflight (o#15): at boot one sandboxed agent run must write probe.txt.
+# A CLI that can't holds all dispatch and /api/orchestrator says why; one that
+# can lets work start.
+TMPP="$(mktemp -d)"; PORTP="$(free_port 5450 300)"; BASEP="http://127.0.0.1:${PORTP}"
+cat > "$TMPP/claude-bad" <<'STUB'
+#!/bin/sh
+cat >/dev/null; echo "EROFS: read-only file system, clone3 /sys/fs/cgroup" >&2
+printf '{"type":"result","result":"Bash fails before it starts with EROFS","total_cost_usd":0.01,"session_id":"p"}\n'; exit 1
+STUB
+cat > "$TMPP/claude-good" <<'STUB'
+#!/bin/sh
+cat >/dev/null; echo ok > probe.txt
+printf '{"type":"result","result":"DONE","total_cost_usd":0.01,"session_id":"p"}\n'
+STUB
+chmod +x "$TMPP/claude-bad" "$TMPP/claude-good"
+SCRP="$TMPP/proj"; mkdir -p "$SCRP"; git -C "$SCRP" init -q -b main
+git -C "$SCRP" config user.email o@example.com; git -C "$SCRP" config user.name "O Test"
+git -C "$SCRP" commit -q --allow-empty -m seed
+pf_daemon() {  # <stub> -> starts a daemon on $BASEP with O_PREFLIGHT=1
+  HOME="$TMPP" O_DB="$TMPP/o.db" O_PORT="$PORTP" O_NO_OPEN=1 O_PREFLIGHT=1 O_CLAUDE_BIN="$TMPP/$1" ./bin/swarmd >>"$TMPP/daemon.log" 2>&1 &
+  DP=$!
+  for _i in $(seq 1 30); do [ "$(ocurl -s -o /dev/null -w '%{http_code}' "$BASEP/api/health" 2>/dev/null || true)" = "200" ] && break; sleep 0.5; done
+}
+pf_fail() { stop_daemon "$DP"; tail -20 "$TMPP/daemon.log" || true; rmtmp "$TMPP"; fail "$1"; }
+pf_daemon claude-bad
+CIDP="$(jget "$(ocurl -s -X POST "$BASEP/api/companies" -H 'Content-Type: application/json' -d "{\"name\":\"Pre Co\",\"issue_prefix\":\"PRE\",\"budget_monthly_cents\":100000,\"repo\":\"$SCRP\",\"verify_cmd\":\"true\"}")" 'd["id"]')"
+ocurl -s -X POST "$BASEP/api/companies/$CIDP/agents" -H 'Content-Type: application/json' -d '{"name":"Pre","runtime":"sim"}' >/dev/null
+IIDP="$(jget "$(ocurl -s -X POST "$BASEP/api/companies/$CIDP/issues" -H 'Content-Type: application/json' -d '{"title":"[sim:good] waits for preflight"}')" 'd["id"]')"
+for _i in $(seq 1 30); do sqlite3 "$TMPP/o.db" "SELECT COUNT(*) FROM activity WHERE verb='preflight.failed'" | grep -qx 1 && break; sleep 0.5; done
+sleep 3
+po="$(ocurl -s "$BASEP/api/orchestrator")"
+[ "$(jget "$po" 'str(d["preflight"]["ok"]).lower()')" = "false" ] && [ "$(jget "$po" '"EROFS" in d["preflight"]["detail"]')" = "True" ] || pf_fail "preflight: a CLI that can't write probe.txt is not reported in /api/orchestrator ($po)"
+[ "$(sqlite3 "$TMPP/o.db" "SELECT COUNT(*) FROM run WHERE issue_id='$IIDP'")" = "0" ] || pf_fail "preflight: an issue was dispatched although the preflight failed"
+stop_daemon "$DP"
+pf_daemon claude-good
+for _i in $(seq 1 60); do [ "$(sqlite3 "$TMPP/o.db" "SELECT status FROM issue WHERE id='$IIDP'")" = "Done" ] && break; sleep 0.5; done
+[ "$(sqlite3 "$TMPP/o.db" "SELECT status FROM issue WHERE id='$IIDP'")" = "Done" ] || pf_fail "preflight: after a passing preflight the issue did not run"
+stop_daemon "$DP"; rmtmp "$TMPP"
+pass "preflight: a CLI that can't write probe.txt holds all dispatch and /api/orchestrator says why; once it can, work starts"
 
 # Public read-only mode (o#41): GET routes answer; writes and /api/fs get 403.
 TMPR="$(mktemp -d)"; PORTR="$(free_port 5250 300)"; BASER="http://127.0.0.1:${PORTR}"
