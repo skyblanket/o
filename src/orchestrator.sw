@@ -317,6 +317,11 @@ fun test_hint() {
     " Testing: build, then run only the tests for the code you changed (a single test file or target, with a timeout). Do NOT run the project's full test suite or its CI targets (make test, test-sw, test-full, check and the like): O runs them after you commit and sends you any failure. Never sleep, poll or wait on a background job; if a command takes more than a few minutes, stop it and commit what you have."
 }
 
+# Builders that bundle unrelated fixes get the whole PR rejected (o#38).
+fun scope_hint() {
+    " Change only what this task needs. If you notice other bugs or cleanups on the way, don't fix them: list each as a line `NOTE: <file>: <what is wrong>` in your final message instead."
+}
+
 fun escalate_hint() {
     " If, after a real attempt, the task is beyond what you can do reliably (you can't find the root cause, or it needs deeper expertise than you have), stop and end your final message with one line `ESCALATE: <why>`; the next attempt then goes to a stronger model. Don't escalate for a flaky test or a broken environment: say what you saw instead."
 }
@@ -324,7 +329,7 @@ fun escalate_hint() {
 fun build_prompt(title, body, repo, protected) {
     if (string_length(repo) > 0) {
         fence = if (string_length(string_trim(protected)) > 0) { " You may NOT modify, rename or delete these protected paths (the verifier rejects any commit touching them): " ++ protected ++ ". If the task can only be done by changing one of them, don't work around it: commit nothing and end your final message with one line `NEEDS_HUMAN: <the exact change the protected file needs>`; a human makes it." } else { "" }
-        "You are an autonomous engineer working in a git checkout of a real project. Make the code changes this task needs, then run `git add -A` and `git commit -m` with a clear message. Do NOT commit PROMPT.txt, result.json or err.log." ++ fence ++ " Be focused and correct." ++ test_hint() ++ escalate_hint() ++ "\n\nTask: " ++ title ++ "\n\n" ++ body
+        "You are an autonomous engineer working in a git checkout of a real project. Make the code changes this task needs, then run `git add -A` and `git commit -m` with a clear message. Do NOT commit PROMPT.txt, result.json or err.log." ++ fence ++ " Be focused and correct." ++ scope_hint() ++ test_hint() ++ escalate_hint() ++ "\n\nTask: " ++ title ++ "\n\n" ++ body
     } else {
         "You are an autonomous agent in a fresh working directory. Complete the task below, creating whatever files are needed. Be concise.\n\nTask: " ++ title ++ "\n\n" ++ body
     }
@@ -497,7 +502,9 @@ fun start(dbpath, port) {
     _ticker = spawn(ticker_loop(orch, tick_interval()))
     interval = tick_interval()
     cap = max_concurrent()
-    print(f"  orchestrator  started (tick {interval}ms, max {cap} concurrent)")
+    nsched = schedulers()
+    print(f"  orchestrator  started (tick {interval}ms, max {cap} concurrent, {nsched} schedulers)")
+    _w = if (cap * 2 + 2 > nsched) { print(f"  WARNING: O_MAX_CONCURRENT={cap} needs SW_SCHEDULERS >= {cap * 2 + 2} (have {nsched}); dispatch will be throttled to keep the API answering") } else { "" }
     orch
 }
 
@@ -619,7 +626,7 @@ fun tick_loop(db, dbpath, port, tick_n, running, retry) {
             _pd = handle_persona_done(db, prun_id, pcost, pcode, ptext, verdicts)
             tick_loop(db, dbpath, port, tick_n, running, retry)
         {'snapshot', from} ->
-            send(from, {'snapshot_reply', %{tick: tick_n, running: map_size(running), busy: busy_slots(running), retrying: map_size(retry), tick_interval_ms: tick_interval(), max_concurrent: max_concurrent(), draining: draining(dbpath)}})
+            send(from, {'snapshot_reply', %{tick: tick_n, running: map_size(running), busy: busy_slots(running), retrying: map_size(retry), tick_interval_ms: tick_interval(), max_concurrent: max_concurrent(), in_flight: map_size(running), schedulers: schedulers(), draining: draining(dbpath)}})
             tick_loop(db, dbpath, port, tick_n, running, retry)
     }
 }
@@ -644,8 +651,42 @@ fun do_tick(db, dbpath, port, tick_n, running, retry) {
     sr = map_get(swept, "running")
     sq = map_get(swept, "retry")
     cands = Store.candidate_issues(db)
-    slots = if (draining(dbpath) == 'true') { 0 } else { dispatch_slots(db, busy_slots(sr)) }
+    want = if (draining(dbpath) == 'true') { 0 } else { dispatch_slots(db, busy_slots(sr)) }
+    slots = throttle_slots(db, want, map_size(sr), length(cands))
     dispatch_batch(db, cands, slots, sr, sq, now)
+}
+
+# Every agent, verify, review, CI poll and gate in flight blocks a swarmrt
+# scheduler thread while its subprocess runs. Once they hold them all, the
+# router and the tick loop get no thread and the API stops answering. So
+# dispatch nothing new while in_flight >= schedulers - 2: two threads always
+# stay free.
+fun schedulers() {
+    n = env_int("SW_SCHEDULERS", 0)
+    if (n > 0) { n } else {
+        c = if (file_exists("/proc/cpuinfo") == 'true') { length([l for l in string_split(file_read("/proc/cpuinfo"), "\n") when string_starts_with(l, "processor") == 'true']) } else { 0 }
+        if (c > 0) { c } else { 4 }
+    }
+}
+
+fun thread_room(in_flight) {
+    r = schedulers() - 2 - in_flight
+    if (r < 0) { 0 } else { r }
+}
+
+# The tick's dispatch slots, held under thread_room. Said once per tick while
+# work waits on it; logged as dispatch.throttled at most once a minute.
+fun throttle_slots(db, want, in_flight, ncands) {
+    room = thread_room(in_flight)
+    if (want <= room) { want } else {
+        _l = if (ncands > 0) {
+            _p = print(f"[orch] dispatch throttled: {in_flight} worker(s) in flight, {schedulers()} schedulers (2 kept free)")
+            if (Store.activity_count_since(db, "dispatch.throttled", timestamp() - 60000) == 0) {
+                Store.log_activity(db, "", "orchestrator", "dispatch.throttled", f"{in_flight}/{schedulers()}")
+            } else { "" }
+        } else { "" }
+        room
+    }
 }
 
 # Daily rollover: reset per-day counters, lift daily-budget pauses, and run

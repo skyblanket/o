@@ -1971,6 +1971,47 @@ wait_status "iss_rec_one" "Done" 60 || { tail -20 "$TMP/daemon.log"; fail "recov
 pass "recovery: a restart is not an attempt (same attempt, same model); interrupted twice at the last attempt -> Failed; orphan run Abandoned"
 
 # ============================================================
+# Thread room (o#10): with SW_SCHEDULERS=4 at most 2 workers run at once, so
+# two scheduler threads stay free and the API keeps answering.
+# ============================================================
+TMPT="$(mktemp -d)"
+PORTT="$(free_port 4950 300)"
+BASET="http://127.0.0.1:${PORTT}"
+HOME="$TMPT" O_DB="$TMPT/o.db" O_PORT="$PORTT" O_NO_OPEN=1 SW_SCHEDULERS=4 O_MAX_CONCURRENT=3 O_AUTO_FILE=0 \
+  ./bin/swarmd >"$TMPT/daemon.log" 2>&1 &
+DT=$!
+thr_fail() { stop_daemon "$DT"; tail -20 "$TMPT/daemon.log" || true; rmtmp "$TMPT"; fail "$1"; }
+for _i in $(seq 1 30); do [ "$(ocurl -s -o /dev/null -w '%{http_code}' "$BASET/api/health" 2>/dev/null || true)" = "200" ] && break; sleep 0.5; done
+grep -q "WARNING: O_MAX_CONCURRENT=3 needs SW_SCHEDULERS >= 8 (have 4)" "$TMPT/daemon.log" || thr_fail "thread room: no boot warning for O_MAX_CONCURRENT=3 on 4 schedulers"
+SCRT="$TMPT/proj"; mkdir -p "$SCRT"
+git -C "$SCRT" init -q -b main; git -C "$SCRT" config user.email "o@example.com"; git -C "$SCRT" config user.name "O Test"
+echo "thread room" > "$SCRT/README.md"; git -C "$SCRT" add -A; git -C "$SCRT" commit -q -m seed
+CIDT="$(jget "$(ocurl -s -X POST "$BASET/api/companies" -H 'Content-Type: application/json' \
+  -d "{\"name\":\"Thr Co\",\"issue_prefix\":\"THR\",\"budget_monthly_cents\":1000000,\"repo\":\"$SCRT\",\"verify_cmd\":\"sleep 6\"}")" 'd["id"]')"
+ocurl -s -X POST "$BASET/api/companies/$CIDT/agents" -H 'Content-Type: application/json' -d '{"name":"Thr","runtime":"sim"}' >/dev/null
+for n in 1 2 3 4 5; do ocurl -s -X POST "$BASET/api/companies/$CIDT/issues" -H 'Content-Type: application/json' -d "{\"title\":\"[sim:good] thread room $n\"}" >/dev/null; done
+maxf=0; slow=""
+for _i in $(seq 1 90); do
+  t0=$(date +%s%N)
+  o="$(ocurl -s -m 5 "$BASET/api/orchestrator" || true)"
+  ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+  [ "$ms" -gt 1000 ] && slow="$slow ${ms}ms"
+  f="$(jget "$o" 'd["in_flight"]' 2>/dev/null || echo 0)"
+  [ "${f:-0}" -gt "$maxf" ] && maxf="$f"
+  done_n="$(sqlite3 "$TMPT/o.db" "SELECT COUNT(*) FROM issue WHERE company_id='$CIDT' AND status='Done'")"
+  [ "$done_n" = "5" ] && break
+  sleep 0.5
+done
+[ "$done_n" = "5" ] || thr_fail "thread room: only $done_n of 5 issues Done"
+[ "$maxf" -le 2 ] || thr_fail "thread room: $maxf workers in flight at once on 4 schedulers (want <= 2)"
+[ "$maxf" -ge 1 ] || thr_fail "thread room: never saw a worker in flight"
+[ -z "$slow" ] || thr_fail "thread room: the API took over 1s to answer:$slow"
+[ "$(jget "$o" 'd["schedulers"]')" = "4" ] || thr_fail "thread room: /api/orchestrator does not report schedulers=4"
+[ "$(sqlite3 "$TMPT/o.db" "SELECT COUNT(*) FROM activity WHERE verb='dispatch.throttled'")" -ge 1 ] || thr_fail "thread room: no dispatch.throttled logged"
+stop_daemon "$DT"; rmtmp "$TMPT"
+pass "thread room: SW_SCHEDULERS=4 runs at most $maxf worker(s) at once, logs dispatch.throttled, the API answers within 1s throughout"
+
+# ============================================================
 # Phase-4 stages — self-feedback loop (2nd daemon, tight breakers)
 # ============================================================
 # A second daemon with O_SELF_FILE_CAP=2 + O_NO_SIGNAL_DAYS=2 so the auto-file
