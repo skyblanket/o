@@ -493,6 +493,7 @@ fun start(dbpath, port) {
     # reflection worker its own DB connection string and the daemon's base URL.
     orch = spawn(tick_loop(db, dbpath, port, 0, %{}, %{}))
     register('orchestrator', orch)
+    _pf = start_preflight(db, dbpath, orch)
     # The merger is a SINGLE process, so every company's merges are serialized
     # through it: only one `git checkout main && merge` touches a repo at a
     # time, and two green issues can never race a merge. It never touches the
@@ -563,6 +564,59 @@ fun park_inflight_prs(db, rows, n) {
 # busy_slots to reach 0, then restarts without killing work.
 fun draining(dbpath) { file_exists(dbpath ++ ".drain") }
 
+# ---- preflight (o#15) ---------------------------------------------------
+# At boot, one tiny run of the agent CLI, in the same sandbox builders get, is
+# asked to write probe.txt in a scratch repo. Until it has, nothing is
+# dispatched; if it can't (a broken sandbox, CLI or login), dispatch stays
+# held and GET /api/orchestrator says why, before any issue is touched. It runs
+# when O_PREFLIGHT=1, or when unset and a claude-code agent exists; restart
+# after fixing the cause to probe again.
+fun preflight_on(db) {
+    v = getenv("O_PREFLIGHT")
+    if (v == "0") { 'false' } else { if (v == "1") { 'true' } else { if (Store.claude_agents_n(db) > 0) { 'true' } else { 'false' } } }
+}
+
+fun start_preflight(db, dbpath, orch) {
+    _rm = sh(f"rm -f {sq(dbpath)}.preflight {sq(dbpath)}.preflight-on")
+    if (preflight_on(db) == 'true') {
+        _m = file_write(dbpath ++ ".preflight-on", "1")
+        spawn(preflight_worker(orch))
+    } else { "" }
+}
+
+# Held while the probe is pending or failed; never when it isn't on.
+fun preflight_holds(dbpath) {
+    if (file_exists(dbpath ++ ".preflight-on") == 'false') { 'false' } else {
+        st = preflight_state(dbpath)
+        if (map_get(st, "ok") == 'true') { 'false' } else { 'true' }
+    }
+}
+
+fun preflight_state(dbpath) {
+    if (file_exists(dbpath ++ ".preflight-on") == 'false') { %{ok: 'true', detail: "off"} }
+    else { if (file_exists(dbpath ++ ".preflight") == 'false') { %{ok: 'false', detail: "pending"} }
+    else {
+        t = file_read(dbpath ++ ".preflight")
+        lines = string_split(t, "\n")
+        %{ok: (if (hd(lines) == "ok") { 'true' } else { 'false' }), detail: Std.join(tl(lines), "\n")}
+    } }
+}
+
+fun preflight_worker(orch) {
+    dir = "/tmp/o-preflight-" ++ to_string(timestamp())
+    _i = sh(f"mkdir -p {sq(dir)} && git -C {sq(dir)} init -q && git -C {sq(dir)} -c user.email=o@localhost -c user.name=O commit -q --allow-empty -m probe")
+    _w = file_write(f"{dir}/PROMPT.txt", "This is a health check. Run exactly this shell command and nothing else: echo ok > probe.txt\nThen reply DONE.")
+    m = getenv("O_PREFLIGHT_MODEL")
+    r = claude_once(dir, claude_bin(), "", sandbox_prefix(dir, dir), (if (m == nil) { "haiku" } else { m }))
+    got = if (file_exists(f"{dir}/probe.txt") == 'true') { string_trim(file_read(f"{dir}/probe.txt")) } else { "" }
+    ok = if (got == "ok") { 'true' } else { 'false' }
+    said = str_or(map_get(parse_stream_result(f"{dir}/stream.jsonl"), "result"), "")
+    errt = if (file_exists(f"{dir}/err.log") == 'true') { tail_text(file_read(f"{dir}/err.log"), 1500) } else { "" }
+    detail = if (ok == 'true') { "ok" } else { "the agent CLI could not write probe.txt in a sandboxed scratch repo (exit " ++ to_string(elem(r, 0)) ++ "). It said: " ++ string_truncate(said, 1500) ++ "\nerr.log tail:\n" ++ errt }
+    _rm = sh(f"rm -rf {sq(dir)}")
+    send(orch, {'preflight_done', ok, detail})
+}
+
 fun ticker_loop(orch, interval) {
     sleep(interval)
     send(orch, 'tick')
@@ -625,8 +679,15 @@ fun tick_loop(db, dbpath, port, tick_n, running, retry) {
         {'persona_done', prun_id, pcost, pcode, ptext, verdicts} ->
             _pd = handle_persona_done(db, prun_id, pcost, pcode, ptext, verdicts)
             tick_loop(db, dbpath, port, tick_n, running, retry)
+        {'preflight_done', ok, detail} ->
+            # line 1 "ok" or "failed", then what the CLI said: no JSON round
+            # trip, so an ok can't decode as something other than 'true'
+            _w = file_write(dbpath ++ ".preflight", (if (ok == 'true') { "ok" } else { "failed" }) ++ "\n" ++ detail)
+            _a = Store.log_activity(db, "", "orchestrator", (if (ok == 'true') { "preflight.ok" } else { "preflight.failed" }), string_truncate(detail, 500))
+            _p = print(f"[orch] preflight: " ++ (if (ok == 'true') { "ok" } else { "FAILED, dispatch held: " ++ string_truncate(detail, 300) }))
+            tick_loop(db, dbpath, port, tick_n, running, retry)
         {'snapshot', from} ->
-            send(from, {'snapshot_reply', %{tick: tick_n, running: map_size(running), busy: busy_slots(running), retrying: map_size(retry), tick_interval_ms: tick_interval(), max_concurrent: max_concurrent(), in_flight: map_size(running), schedulers: schedulers(), draining: draining(dbpath)}})
+            send(from, {'snapshot_reply', %{tick: tick_n, running: map_size(running), busy: busy_slots(running), retrying: map_size(retry), tick_interval_ms: tick_interval(), max_concurrent: max_concurrent(), preflight: preflight_state(dbpath), in_flight: map_size(running), schedulers: schedulers(), draining: draining(dbpath)}})
             tick_loop(db, dbpath, port, tick_n, running, retry)
     }
 }
@@ -649,9 +710,9 @@ fun do_tick(db, dbpath, port, tick_n, running, retry) {
     _po = if (quiet) { "" } else { maybe_policy(db, now) }
     swept = sweep_stalls(db, map_keys(running), running, retry, now)
     sr = map_get(swept, "running")
-    sq = map_get(swept, "retry")
+    sq = breaker_scan(db, sr, map_get(swept, "retry"))
     cands = Store.candidate_issues(db)
-    want = if (draining(dbpath) == 'true') { 0 } else { dispatch_slots(db, busy_slots(sr)) }
+    want = if (draining(dbpath) == 'true' || preflight_holds(dbpath) == 'true') { 0 } else { dispatch_slots(db, busy_slots(sr)) }
     slots = throttle_slots(db, want, map_size(sr), length(cands))
     dispatch_batch(db, cands, slots, sr, sq, now)
 }
@@ -713,6 +774,57 @@ fun process_rolled(db, infos) {
         }
         process_rolled(db, tl(infos))
     }
+}
+
+# ---- agent-broken breaker (o#15) --------------------------------------
+# When a company's last O_BROKEN_RUNS (3; 0 = off) finished runs, on at least
+# two different issues, all ended with no commit or a crash, the agents can't work
+# at all (a broken sandbox, CLI or auth), and every further run only burns
+# money. The company is paused 'agent-broken', a diagnostic issue says what
+# the agent reported, and those issues go back to Backlog so the broken runs
+# don't count against them. Only runs since the last trip are looked at.
+fun broken_runs() { env_int("O_BROKEN_RUNS", 3) }
+
+fun breaker_scan(db, running, retry) {
+    n = broken_runs()
+    if (n <= 0) { retry } else { breaker_each(db, running, retry, Store.companies(db), n) }
+}
+
+fun breaker_each(db, running, retry, cos, n) {
+    if (length(cos) == 0) { retry } else {
+        c = hd(cos)
+        r2 = if (map_get(c, "status") != "active") { retry } else { breaker_check(db, running, retry, map_get(c, "id"), n) }
+        breaker_each(db, running, r2, tl(cos), n)
+    }
+}
+
+fun breaker_check(db, running, retry, cid, n) {
+    rows = Store.finished_runs_since(db, cid, Store.last_verb_ts(db, cid, "budget.agent_broken"), n)
+    broken = [r for r in rows when map_get(r, "verify_state") == "red_no_commit" || map_get(r, "verify_state") == "red_agent"]
+    issues = Std.unique([map_get(r, "issue_id") for r in rows])
+    if (length(rows) < n || length(broken) < n || length(issues) < 2) { retry } else {
+        _p = Store.company_pause(db, cid, "agent-broken")
+        _l = Store.log_activity(db, cid, "budget-guard", "budget.agent_broken", cid)
+        last = hd(rows)
+        ws = str_or(map_get(last, "workspace_path"), "")
+        said = if (string_length(ws) > 0 && file_exists(ws ++ "/result.json") == 'true') { res = json_decode(file_read(ws ++ "/result.json")); if (res == nil) { "" } else { str_or(map_get(res, "result"), "") } } else { "" }
+        errt = if (string_length(ws) > 0 && file_exists(ws ++ "/err.log") == 'true') { tail_text(file_read(ws ++ "/err.log"), 2000) } else { "" }
+        title = f"Agent-broken breaker tripped for {cid}"
+        body = "O paused company " ++ cid ++ ": its last " ++ to_string(n) ++ " agent runs, on " ++ to_string(length(issues)) ++ " different issues, all ended with no commit or a crash. That usually means the agent can't work at all here (sandbox, CLI, auth or environment), not that the issues are hard. The issues were put back to Backlog.\n\nLast run's verdict (" ++ str_or(map_get(last, "verify_state"), "") ++ "):\n" ++ string_truncate(str_or(map_get(last, "verify_output"), ""), 2000) ++ "\n\nWhat the agent said at the end:\n" ++ string_truncate(said, 3000) ++ "\n\nerr.log tail:\n" ++ errt ++ "\n\nFix the cause, then set the company active again."
+        _sf = auto_file(db, cid, nil, "agent-broken", cid, title, body, "high")
+        back = [i for i in issues when map_get(running, i) == nil]
+        _b = [Store.issue_set_status(db, i, "Backlog") for i in back]
+        _pr = print(f"[orch] agent-broken breaker: paused {cid}; {length(back)} issue(s) back to Backlog")
+        breaker_unretry(retry, back)
+    }
+}
+
+fun breaker_unretry(retry, ids) {
+    if (length(ids) == 0) { retry } else { breaker_unretry(map_remove(retry, hd(ids)), tl(ids)) }
+}
+
+fun tail_text(t, k) {
+    if (string_length(t) <= k) { t } else { string_sub(t, string_length(t) - k, k) }
 }
 
 # The no-signal breaker fired: log it and auto-file an operator-origin
@@ -918,7 +1030,11 @@ fun dispatch_batch(db, cands, slots, running, retry, now) {
                         recovered = (map_has_key(retry, iid) == 'false' || env_retry) && str_or(map_get(issue, "status"), "") == "Verifying"
                         running2 = if (recovered && has_committed_work(db, issue, iid) == 'true') { resume_at_verify(db, issue, iid, attempt, running, now) } else { dispatch_one(db, issue, iid, attempt, running, now) }
                         retry2 = map_remove(retry, iid)
-                        dispatch_batch(db, tl(cands), slots - 1, running2, retry2, now)
+                        # only a run that started uses a slot: an issue that
+                        # can't start (its company has no agent) must not
+                        # starve the issues behind it
+                        used = if (map_size(running2) > map_size(running)) { 1 } else { 0 }
+                        dispatch_batch(db, tl(cands), slots - used, running2, retry2, now)
                     }
                 }
             }

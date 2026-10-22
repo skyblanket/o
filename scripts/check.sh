@@ -21,6 +21,11 @@ export O_ADAPT=0
 # Daemons keep two scheduler threads free (o#10); give them room like a real
 # deploy does, so the parallel stages aren't throttled on a small CI box.
 export SW_SCHEDULERS="${SW_SCHEDULERS:-16}"
+# The agent-broken breaker (o#15) would trip on stages that drive several
+# no-commit issues on purpose; only its own stage turns it on.
+export O_BROKEN_RUNS=0
+# Likewise the boot preflight probe (o#15): only its own stage runs it.
+export O_PREFLIGHT=0
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -262,6 +267,7 @@ while [ $# -gt 0 ]; do
 done
 listed() { [ -f "$GHS/$1" ] && grep -qx "$2" "$GHS/$1"; }
 num_for() { grep -lx "$1" "$GHS"/pr_* 2>/dev/null | head -1 | sed 's|.*/pr_||'; }
+echo "$method $path" >> "$GHS/calls.log"
 case "$method $path" in
   "GET repos/acme/widgets/issues?"*)
     # labels=X keeps issues carrying X; an issue with no "labels" key counts as
@@ -720,7 +726,12 @@ echo fix > "$tmpf/c/base-fix.txt"; git -C "$tmpf/c" add base-fix.txt
 git -C "$tmpf/c" -c user.email=h@x -c user.name=human commit -q -m "base moves on"
 for _i in 1 2 3 4 5; do git -C "$tmpf/c" push -q origin main 2>/dev/null && break; git -C "$tmpf/c" -c user.email=h@x -c user.name=human pull -q --rebase origin main; done
 sed -i "\|o/$IID_FL2|d" "$GHS/hold_ci"
-wait_status_at "$BASE4" "$IID_FL2" "Done" 120 || { tail -30 "$TMP4/daemon.log"; fail "ci rerun: with no Actions permission, a PR behind base should be updated and re-checked"; }
+wait_status_at "$BASE4" "$IID_FL2" "Done" 120 || {
+  sqlite3 "$TMP4/o.db" "SELECT attempt, state, verify_state, substr(verify_output, 1, 400) FROM run WHERE issue_id='$IID_FL2' ORDER BY started_at"
+  sqlite3 "$TMP4/o.db" "SELECT verb FROM activity WHERE target='$IID_FL2' ORDER BY ts" | tr '\n' ' '; echo
+  n2="$(pr_of "$IID_FL2" 2>/dev/null)"; echo "PR $n2; stub files: $(cd "$GHS" && ls | grep -E "_${n2:-none}\$" | tr '\n' ' ')"
+  grep -E "pulls/${n2:-none}|compare|rerun" "$GHS/calls.log" | tail -25
+  fail "ci rerun: with no Actions permission, a PR behind base should be updated and re-checked"; }
 [ -f "$GHS/updated_$(pr_of "$IID_FL2")" ] || fail "ci rerun: the PR behind base was not updated"
 [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM run WHERE issue_id='$IID_FL2' AND verify_state = 'red_ci'")" = "0" ] || fail "ci rerun: the flaky check was blamed on the change"
 rm -f "$GHS/no_actions"
@@ -2003,7 +2014,7 @@ pass "recovery: a restart is not an attempt (same attempt, same model); interrup
 TMPT="$(mktemp -d)"
 PORTT="$(free_port 4950 300)"
 BASET="http://127.0.0.1:${PORTT}"
-HOME="$TMPT" O_DB="$TMPT/o.db" O_PORT="$PORTT" O_NO_OPEN=1 SW_SCHEDULERS=4 O_MAX_CONCURRENT=3 O_AUTO_FILE=0 \
+HOME="$TMPT" O_DB="$TMPT/o.db" O_PORT="$PORTT" O_NO_OPEN=1 SW_SCHEDULERS=4 O_MAX_CONCURRENT=3 O_AUTO_FILE=0 O_BROKEN_RUNS=3 \
   ./bin/swarmd >"$TMPT/daemon.log" 2>&1 &
 DT=$!
 thr_fail() { stop_daemon "$DT"; tail -20 "$TMPT/daemon.log" || true; rmtmp "$TMPT"; fail "$1"; }
@@ -2043,8 +2054,64 @@ i2="$(ocurl -s -w ' %{http_code}' -X POST "$BASET/api/companies/$CIDI/issues" -H
 ocurl -s -X POST "$BASET/api/companies/$CIDI/issues" -H 'Content-Type: application/json' -H 'Idempotency-Key: other' -d '{"title":"filed once"}' >/dev/null
 [ "$(sqlite3 "$TMPT/o.db" "SELECT COUNT(*) FROM issue WHERE company_id='$CIDI'")" = "2" ] || thr_fail "idempotency: want 2 issues from keys same, same, other"
 pass "idempotency: a repeated Idempotency-Key replays the first answer and files nothing; a new key files"
+# Agent-broken breaker (o#15): agents that never commit, on 5 issues. After 3
+# such runs the company is paused with one diagnostic issue, and the issues
+# go back to Backlog instead of burning their attempts.
+CIDB="$(jget "$(ocurl -s -X POST "$BASET/api/companies" -H 'Content-Type: application/json' \
+  -d "{\"name\":\"Broken Co\",\"issue_prefix\":\"BRK\",\"budget_monthly_cents\":1000000,\"repo\":\"$SCRT\",\"verify_cmd\":\"true\"}")" 'd["id"]')"
+ocurl -s -X POST "$BASET/api/companies/$CIDB/agents" -H 'Content-Type: application/json' -d '{"name":"Brk","runtime":"sim"}' >/dev/null
+for n in 1 2 3 4 5; do ocurl -s -X POST "$BASET/api/companies/$CIDB/issues" -H 'Content-Type: application/json' -d "{\"title\":\"[sim:no-commit] broken env $n\"}" >/dev/null; done
+for _i in $(seq 1 60); do [ "$(sqlite3 "$TMPT/o.db" "SELECT pause_reason FROM company WHERE id='$CIDB'")" = "agent-broken" ] && break; sleep 1; done
+[ "$(sqlite3 "$TMPT/o.db" "SELECT status || '/' || pause_reason FROM company WHERE id='$CIDB'")" = "paused/agent-broken" ] || thr_fail "breaker: the company was not paused agent-broken"
+sleep 3
+[ "$(sqlite3 "$TMPT/o.db" "SELECT COUNT(*) FROM issue WHERE company_id='$CIDB' AND fingerprint LIKE 'agent-broken:%'")" = "1" ] || thr_fail "breaker: want exactly one diagnostic issue"
+# (a run still in flight when it trips finishes on its own; none may fail)
+[ "$(sqlite3 "$TMPT/o.db" "SELECT COUNT(*) FROM issue WHERE company_id='$CIDB' AND title LIKE '[sim:no-commit]%' AND status='Backlog'")" -ge 4 ] && [ "$(sqlite3 "$TMPT/o.db" "SELECT COUNT(*) FROM issue WHERE company_id='$CIDB' AND status='Failed'")" = "0" ] || { sqlite3 "$TMPT/o.db" "SELECT identifier, status FROM issue WHERE company_id='$CIDB'"; thr_fail "breaker: the issues should be back in Backlog, none Failed"; }
+nr="$(sqlite3 "$TMPT/o.db" "SELECT COUNT(*) FROM run r JOIN issue i ON i.id = r.issue_id WHERE i.company_id='$CIDB'")"
+[ "$nr" -le 4 ] || thr_fail "breaker: $nr runs before it tripped (want it to stop after 3, at most one more in flight)"
+pass "breaker: 3 no-commit runs across issues pause the company agent-broken, file one diagnostic, and put the issues back in Backlog ($nr runs spent)"
 stop_daemon "$DT"; rmtmp "$TMPT"
 pass "thread room: SW_SCHEDULERS=4 runs at most $maxf worker(s) at once, logs dispatch.throttled, the API answers within 1s throughout"
+
+# Preflight (o#15): at boot one sandboxed agent run must write probe.txt.
+# A CLI that can't holds all dispatch and /api/orchestrator says why; one that
+# can lets work start.
+TMPP="$(mktemp -d)"; PORTP="$(free_port 5450 300)"; BASEP="http://127.0.0.1:${PORTP}"
+cat > "$TMPP/claude-bad" <<'STUB'
+#!/bin/sh
+cat >/dev/null; echo "EROFS: read-only file system, clone3 /sys/fs/cgroup" >&2
+printf '{"type":"result","result":"Bash fails before it starts with EROFS","total_cost_usd":0.01,"session_id":"p"}\n'; exit 1
+STUB
+cat > "$TMPP/claude-good" <<'STUB'
+#!/bin/sh
+cat >/dev/null; echo ok > probe.txt
+printf '{"type":"result","result":"DONE","total_cost_usd":0.01,"session_id":"p"}\n'
+STUB
+chmod +x "$TMPP/claude-bad" "$TMPP/claude-good"
+SCRP="$TMPP/proj"; mkdir -p "$SCRP"; git -C "$SCRP" init -q -b main
+git -C "$SCRP" config user.email o@example.com; git -C "$SCRP" config user.name "O Test"
+git -C "$SCRP" commit -q --allow-empty -m seed
+pf_daemon() {  # <stub> -> starts a daemon on $BASEP with O_PREFLIGHT=1
+  HOME="$TMPP" O_DB="$TMPP/o.db" O_PORT="$PORTP" O_NO_OPEN=1 O_PREFLIGHT=1 O_CLAUDE_BIN="$TMPP/$1" ./bin/swarmd >>"$TMPP/daemon.log" 2>&1 &
+  DP=$!
+  for _i in $(seq 1 30); do [ "$(ocurl -s -o /dev/null -w '%{http_code}' "$BASEP/api/health" 2>/dev/null || true)" = "200" ] && break; sleep 0.5; done
+}
+pf_fail() { stop_daemon "$DP"; tail -20 "$TMPP/daemon.log" || true; rmtmp "$TMPP"; fail "$1"; }
+pf_daemon claude-bad
+CIDP="$(jget "$(ocurl -s -X POST "$BASEP/api/companies" -H 'Content-Type: application/json' -d "{\"name\":\"Pre Co\",\"issue_prefix\":\"PRE\",\"budget_monthly_cents\":100000,\"repo\":\"$SCRP\",\"verify_cmd\":\"true\"}")" 'd["id"]')"
+ocurl -s -X POST "$BASEP/api/companies/$CIDP/agents" -H 'Content-Type: application/json' -d '{"name":"Pre","runtime":"sim"}' >/dev/null
+IIDP="$(jget "$(ocurl -s -X POST "$BASEP/api/companies/$CIDP/issues" -H 'Content-Type: application/json' -d '{"title":"[sim:good] waits for preflight"}')" 'd["id"]')"
+for _i in $(seq 1 30); do sqlite3 "$TMPP/o.db" "SELECT COUNT(*) FROM activity WHERE verb='preflight.failed'" | grep -qx 1 && break; sleep 0.5; done
+sleep 3
+po="$(ocurl -s "$BASEP/api/orchestrator")"
+[ "$(jget "$po" 'str(d["preflight"]["ok"]).lower()')" = "false" ] && [ "$(jget "$po" '"EROFS" in d["preflight"]["detail"]')" = "True" ] || pf_fail "preflight: a CLI that can't write probe.txt is not reported in /api/orchestrator ($po)"
+[ "$(sqlite3 "$TMPP/o.db" "SELECT COUNT(*) FROM run WHERE issue_id='$IIDP'")" = "0" ] || pf_fail "preflight: an issue was dispatched although the preflight failed"
+stop_daemon "$DP"
+pf_daemon claude-good
+for _i in $(seq 1 60); do [ "$(sqlite3 "$TMPP/o.db" "SELECT status FROM issue WHERE id='$IIDP'")" = "Done" ] && break; sleep 0.5; done
+[ "$(sqlite3 "$TMPP/o.db" "SELECT status FROM issue WHERE id='$IIDP'")" = "Done" ] || pf_fail "preflight: after a passing preflight the issue did not run"
+stop_daemon "$DP"; rmtmp "$TMPP"
+pass "preflight: a CLI that can't write probe.txt holds all dispatch and /api/orchestrator says why; once it can, work starts"
 
 # Public read-only mode (o#41): GET routes answer; writes and /api/fs get 403.
 TMPR="$(mktemp -d)"; PORTR="$(free_port 5250 300)"; BASER="http://127.0.0.1:${PORTR}"

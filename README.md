@@ -540,6 +540,8 @@ The daemon reads its configuration from the environment. All are optional.
 | `O_MAX_CONCURRENT` | `3` | agent runs (build, verify, review) in flight across all companies. PRs waiting on CI, the gate or a merge hold no slot. Keep `SW_SCHEDULERS` above twice this. |
 | `O_DB` | `~/.o/o.db` | control-plane SQLite path. |
 | `O_PORT` | `4100` | HTTP port. |
+| `O_BROKEN_RUNS` | `3` | agent-broken breaker: when a company's last N finished runs, on at least two issues, all ended with no commit or a crash, the company is paused `agent-broken`, one diagnostic issue carries the agent's last words and `err.log`, and the issues go back to Backlog. `0` turns it off. |
+| `O_PREFLIGHT` | on when a claude-code agent exists | `1`/`0` forces the boot probe on or off: one sandboxed agent run (`O_PREFLIGHT_MODEL`, default `haiku`) must write `probe.txt` in a scratch repo before anything is dispatched. If it can't, dispatch stays held and `GET /api/orchestrator` shows `preflight` with what the CLI said; fix the cause and restart. |
 | `O_PUBLIC_READONLY` | unset | `1` serves GET routes only, for exposing the UI through a tunnel: every write, issue filing included, and `/api/fs` get 403. |
 | `O_CLAUDE_BIN` | `claude` on `PATH` | claude-code binary for the `claude-code` runtime. |
 | `O_SWARM_BIN` | `swarm-code` on `PATH` | binary for the `swarm-code` runtime. |
