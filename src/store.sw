@@ -9,7 +9,7 @@
 
 module Store
 
-export [next_id, idem_get, idem_put, companies, company_row, company_create, company_update,
+export [next_id, idem_get, idem_put, notes_latest, notes_save, companies, company_row, company_create, company_update,
         company_add_spend, enforce_budget, rollover_day, company_mark_green, global_spent_today,
         company_touch_reflect, companies_to_reflect, company_set_github, companies_with_github, company_set_maintainer, issues_in_review,
         issues_for, issue_row, issue_create, issue_create_auto, issue_create_with_origin, issue_open_fp_count, issue_import_github,
@@ -93,6 +93,23 @@ fun issues_stranded_in_review(db) {
 # Open issues whose worktree may need a health check.
 fun issues_with_workspace(db) {
     db_query(db, "SELECT i.id, i.company_id, c.repo FROM issue i JOIN company c ON c.id = i.company_id WHERE i.status NOT IN ('Done', 'Canceled', 'Reverted') AND c.repo != ''", [])
+}
+
+# The merge gate's shared NOTES.md, kept in the control plane (o#12) so a
+# lost ~/.o doesn't reset what the maintainer learned. A version is stored
+# when the text changes; the last 20 are kept.
+fun notes_latest(db, company_id) {
+    r = db_query(db, "SELECT notes FROM maintainer_note WHERE company_id = ? ORDER BY ts DESC LIMIT 1", [company_id])
+    if (length(r) == 0) { "" } else { str_or_empty(map_get(hd(r), "notes")) }
+}
+
+fun str_or_empty(v) { if (v == nil) { "" } else { v } }
+
+fun notes_save(db, company_id, notes) {
+    if (notes == notes_latest(db, company_id)) { "" } else {
+        _i = db_query(db, "INSERT INTO maintainer_note (company_id, notes, ts) VALUES (?, ?, ?)", [company_id, notes, timestamp()])
+        db_query(db, "DELETE FROM maintainer_note WHERE company_id = ? AND ts NOT IN (SELECT ts FROM maintainer_note WHERE company_id = ? ORDER BY ts DESC LIMIT 20)", [company_id, company_id])
+    }
 }
 
 # Idempotency-Key replay (o#11): the stored 2xx response for a key seen in

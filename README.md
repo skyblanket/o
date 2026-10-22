@@ -352,7 +352,8 @@ them.
 `~/.o/maintainer/<company>/NOTES.md`, in its prompt. A review can end with up
 to three `NOTE: <lesson>` lines (a convention, a pitfall, how to test an
 area). O, the only writer, appends them for the next reviews, deduped and
-capped.
+capped. Each change is also kept in the control plane (the last 20 versions),
+so a new machine or a wiped `~/.o` gets the notes back before the next review.
 
 **3. The verdict is the last `VERDICT:` line.** The same protocol is used for
 the pre-PR screen.
@@ -608,6 +609,7 @@ curl http://localhost:4100/api/companies/<id>/board   # per open issue: PR, CI, 
 curl http://localhost:4100/api/companies/<id>/spend?days=14   # spend by role per day, cost per merge
 curl http://localhost:4100/api/companies/<id>/gate    # the gate's .o-review.json and session
 curl http://localhost:4100/api/issues/<id>/activity   # one issue's pipeline, in order
+curl http://localhost:4100/api/companies/<id>/maintainer  # the merge gate's shared notes, session and review count
 curl http://localhost:4100/api/waiting        # everything waiting on a person, oldest first
 curl http://localhost:4100/api/proof          # the track record
 ```
