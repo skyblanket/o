@@ -611,6 +611,8 @@ curl http://localhost:4100/api/waiting        # everything waiting on a person, 
 curl http://localhost:4100/api/proof          # the track record
 ```
 
+Every write that creates something takes an optional `Idempotency-Key` header. A repeated key (same method and path, within 24h) gets the first 2xx answer back and writes nothing, so a client that retries after a dropped response can't file the same issue, report or feedback twice. O's own reflection and persona prompts and `feedback/o-feedback.js` send one.
+
 The UI (`cd ui && npm run dev`) shows each issue's pipeline by attempt (agent, verify, review, PR + CI, gate, merge). Cards carry their PR, CI state and gate decision, and In Review cards say why they wait. The company header shows 14 days of spend by role (agent, reviewer, gate, planner, reflect, persona) with the cost per merge. Manage sets the GitHub repo and ship mode, and shows the gate's config.
 
 ## Known limitations

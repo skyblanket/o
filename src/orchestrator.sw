@@ -1582,7 +1582,7 @@ fun reflect_worker(dbpath, company_id, port) {
 fun build_reflect_prompt(name, repo, port, company_id, spent, greens, acts, fails, issues) {
     url = f"http://127.0.0.1:{port}/api/companies/{company_id}/issues"
     payload = "{\"title\":\"...\",\"body\":\"...\",\"priority\":\"medium\",\"origin\":\"reflect\"}"
-    head = "You are the daily reflection pass for company " ++ name ++ ", the autonomous maintainer of " ++ repo ++ ". Below is the last 24h: activity, failed/reverted runs with verify output, and currently open issues. Identify at most 3 concrete, high-value improvement issues — root causes behind repeated failures, flaky or slow verification, missing tests, recurring conflict hotspots. Do NOT duplicate an open issue. Do NOT modify any files. File each via: curl -s -X POST " ++ url ++ " -H 'Content-Type: application/json' -d '" ++ payload ++ "'. If nothing is worth filing, file nothing. Then reply DONE.\n\n"
+    head = "You are the daily reflection pass for company " ++ name ++ ", the autonomous maintainer of " ++ repo ++ ". Below is the last 24h: activity, failed/reverted runs with verify output, and currently open issues. Identify at most 3 concrete, high-value improvement issues — root causes behind repeated failures, flaky or slow verification, missing tests, recurring conflict hotspots. Do NOT duplicate an open issue. Do NOT modify any files. File each via: curl -s -X POST " ++ url ++ " -H 'Content-Type: application/json' -H 'Idempotency-Key: reflect-<a short slug of that issue's title>' -d '" ++ payload ++ "' (the key makes a retried POST file nothing twice; use a different slug per issue). If nothing is worth filing, file nothing. Then reply DONE.\n\n"
     stats = f"Today so far: spent {spent} cents, {greens} verified-green merges.\n\n"
     a_sec = "== Activity (last 24h) ==\n" ++ fmt_activity(acts) ++ "\n"
     f_sec = "== Failed / reverted runs ==\n" ++ fmt_fails(fails) ++ "\n"
@@ -5201,7 +5201,7 @@ fun persona_worker(job) {
 
 fun persona_report_url_help(url, run_id) {
     example = "{\"run_id\":\"" ++ run_id ++ "\",\"severity\":\"blocked\",\"title\":\"...\",\"doc_section\":\"README.md > Install\",\"steps\":\"1. ...\\n2. ...\",\"expected\":\"...\",\"actual\":\"<the exact output, pasted>\",\"env\":\"<uname -sm and tool versions>\"}"
-    "To report a problem, write the JSON to a file and POST it:\n  curl -s -X POST " ++ url ++ " -H 'Content-Type: application/json' -d @report.json\nwhere report.json looks like:\n  " ++ example ++ "\n" ++
+    "To report a problem, write the JSON to a file and POST it:\n  curl -s -X POST " ++ url ++ " -H 'Content-Type: application/json' -H 'Idempotency-Key: " ++ run_id ++ "-<report number: 1, 2, ...>' -d @report.json\n(a retry with the same key records nothing twice) where report.json looks like:\n  " ++ example ++ "\n" ++
     "severity is one of:\n  blocked  - you cannot get any further toward your goal. Report it, then stop.\n  wrong    - the docs say one thing and the product does another.\n  friction - you got past it, but it was confusing, slow or needed guessing.\n" ++
     "`actual` must be the real output, copied verbatim, not a summary. A report without steps and actual is refused. Report each distinct problem once. If the POST gets no response, retry it once.\n"
 }

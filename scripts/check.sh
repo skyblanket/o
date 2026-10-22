@@ -2008,6 +2008,15 @@ done
 [ -z "$slow" ] || thr_fail "thread room: the API took over 1s to answer:$slow"
 [ "$(jget "$o" 'd["schedulers"]')" = "4" ] || thr_fail "thread room: /api/orchestrator does not report schedulers=4"
 [ "$(sqlite3 "$TMPT/o.db" "SELECT COUNT(*) FROM activity WHERE verb='dispatch.throttled'")" -ge 1 ] || thr_fail "thread room: no dispatch.throttled logged"
+# Idempotency-Key (o#11): the same key replays the first answer and files
+# nothing; a different key files again. A company with no agent, so nothing runs.
+CIDI="$(jget "$(ocurl -s -X POST "$BASET/api/companies" -H 'Content-Type: application/json' -d '{"name":"Idem Co","issue_prefix":"IDM","budget_monthly_cents":1000}')" 'd["id"]')"
+i1="$(ocurl -s -X POST "$BASET/api/companies/$CIDI/issues" -H 'Content-Type: application/json' -H 'Idempotency-Key: same' -d '{"title":"filed once"}')"
+i2="$(ocurl -s -w ' %{http_code}' -X POST "$BASET/api/companies/$CIDI/issues" -H 'Content-Type: application/json' -H 'Idempotency-Key: same' -d '{"title":"filed once"}')"
+[ "$i2" = "$i1 201" ] || thr_fail "idempotency: a repeated key did not replay the first response (got: $i2)"
+ocurl -s -X POST "$BASET/api/companies/$CIDI/issues" -H 'Content-Type: application/json' -H 'Idempotency-Key: other' -d '{"title":"filed once"}' >/dev/null
+[ "$(sqlite3 "$TMPT/o.db" "SELECT COUNT(*) FROM issue WHERE company_id='$CIDI'")" = "2" ] || thr_fail "idempotency: want 2 issues from keys same, same, other"
+pass "idempotency: a repeated Idempotency-Key replays the first answer and files nothing; a new key files"
 stop_daemon "$DT"; rmtmp "$TMPT"
 pass "thread room: SW_SCHEDULERS=4 runs at most $maxf worker(s) at once, logs dispatch.throttled, the API answers within 1s throughout"
 
