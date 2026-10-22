@@ -131,8 +131,15 @@ fun orch_snapshot(conn) {
 #             (it is stripped from their env), so an agent cannot rewrite the
 #             verify_cmd / protected_paths that gate its own merges. Filing
 #             issues and feedback stays open: that is how reflection reports.
+# O_PUBLIC_READONLY=1 (o#41), for exposing the UI through a tunnel: only GET
+# routes answer. Every write (issue filing included, which is otherwise open
+# without a token) and /api/fs are refused with 403.
+fun public_readonly() { getenv("O_PUBLIC_READONLY") == "1" }
+
 fun dispatch(db, dbpath, conn, method, path, hdrs, body) {
-    if (method == 'OPTIONS') {
+    if (public_readonly() && (string_starts_with(path, "/api/fs") == 'true' || (method != 'GET' && method != 'OPTIONS'))) {
+        respond(conn, 403, err_json("this O is read-only (O_PUBLIC_READONLY=1)"))
+    } else { if (method == 'OPTIONS') {
         if (loopback_origin(hdr(hdrs, "origin")) == 'true') {
             http_respond(conn, 204, json_headers(), "")
         } else {
@@ -152,7 +159,7 @@ fun dispatch(db, dbpath, conn, method, path, hdrs, body) {
                 }
             }
         }
-    }
+    }}
 }
 
 # Header lookup (keys arrive lowercased); missing -> "".

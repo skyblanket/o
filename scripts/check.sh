@@ -2023,6 +2023,17 @@ pass "idempotency: a repeated Idempotency-Key replays the first answer and files
 stop_daemon "$DT"; rmtmp "$TMPT"
 pass "thread room: SW_SCHEDULERS=4 runs at most $maxf worker(s) at once, logs dispatch.throttled, the API answers within 1s throughout"
 
+# Public read-only mode (o#41): GET routes answer; writes and /api/fs get 403.
+TMPR="$(mktemp -d)"; PORTR="$(free_port 5250 300)"; BASER="http://127.0.0.1:${PORTR}"
+HOME="$TMPR" O_DB="$TMPR/o.db" O_PORT="$PORTR" O_NO_OPEN=1 O_PUBLIC_READONLY=1 ./bin/swarmd >"$TMPR/daemon.log" 2>&1 &
+DR=$!
+for _i in $(seq 1 30); do [ "$(ocurl -s -o /dev/null -w '%{http_code}' "$BASER/api/health" 2>/dev/null || true)" = "200" ] && break; sleep 0.5; done
+ro() { ocurl -s -o /dev/null -w '%{http_code}' -X "$1" "$BASER$2" -H 'Content-Type: application/json' -d '{"title":"x","name":"x","issue_prefix":"X"}'; }
+got="$(ro GET /api/health) $(ro GET /api/companies) $(ro GET /api/fs) $(ro POST /api/companies) $(ro POST /api/companies/co_x/issues) $(ro POST /api/orchestrator/drain)"
+stop_daemon "$DR"; rmtmp "$TMPR"
+[ "$got" = "200 200 403 403 403 403" ] || fail "public read-only: want GETs 200, /api/fs and writes 403; got $got"
+pass "public read-only: GET routes answer; /api/fs, company and issue writes and drain get 403 (O_PUBLIC_READONLY=1)"
+
 # ============================================================
 # Phase-4 stages — self-feedback loop (2nd daemon, tight breakers)
 # ============================================================
