@@ -649,7 +649,7 @@ fun do_tick(db, dbpath, port, tick_n, running, retry) {
     _po = if (quiet) { "" } else { maybe_policy(db, now) }
     swept = sweep_stalls(db, map_keys(running), running, retry, now)
     sr = map_get(swept, "running")
-    sq = map_get(swept, "retry")
+    sq = breaker_scan(db, sr, map_get(swept, "retry"))
     cands = Store.candidate_issues(db)
     want = if (draining(dbpath) == 'true') { 0 } else { dispatch_slots(db, busy_slots(sr)) }
     slots = throttle_slots(db, want, map_size(sr), length(cands))
@@ -713,6 +713,57 @@ fun process_rolled(db, infos) {
         }
         process_rolled(db, tl(infos))
     }
+}
+
+# ---- agent-broken breaker (o#15) --------------------------------------
+# When a company's last O_BROKEN_RUNS (3; 0 = off) finished runs, on at least
+# two different issues, all ended with no commit or a crash, the agents can't work
+# at all (a broken sandbox, CLI or auth), and every further run only burns
+# money. The company is paused 'agent-broken', a diagnostic issue says what
+# the agent reported, and those issues go back to Backlog so the broken runs
+# don't count against them. Only runs since the last trip are looked at.
+fun broken_runs() { env_int("O_BROKEN_RUNS", 3) }
+
+fun breaker_scan(db, running, retry) {
+    n = broken_runs()
+    if (n <= 0) { retry } else { breaker_each(db, running, retry, Store.companies(db), n) }
+}
+
+fun breaker_each(db, running, retry, cos, n) {
+    if (length(cos) == 0) { retry } else {
+        c = hd(cos)
+        r2 = if (map_get(c, "status") != "active") { retry } else { breaker_check(db, running, retry, map_get(c, "id"), n) }
+        breaker_each(db, running, r2, tl(cos), n)
+    }
+}
+
+fun breaker_check(db, running, retry, cid, n) {
+    rows = Store.finished_runs_since(db, cid, Store.last_verb_ts(db, cid, "budget.agent_broken"), n)
+    broken = [r for r in rows when map_get(r, "verify_state") == "red_no_commit" || map_get(r, "verify_state") == "red_agent"]
+    issues = Std.unique([map_get(r, "issue_id") for r in rows])
+    if (length(rows) < n || length(broken) < n || length(issues) < 2) { retry } else {
+        _p = Store.company_pause(db, cid, "agent-broken")
+        _l = Store.log_activity(db, cid, "budget-guard", "budget.agent_broken", cid)
+        last = hd(rows)
+        ws = str_or(map_get(last, "workspace_path"), "")
+        said = if (string_length(ws) > 0 && file_exists(ws ++ "/result.json") == 'true') { res = json_decode(file_read(ws ++ "/result.json")); if (res == nil) { "" } else { str_or(map_get(res, "result"), "") } } else { "" }
+        errt = if (string_length(ws) > 0 && file_exists(ws ++ "/err.log") == 'true') { tail_text(file_read(ws ++ "/err.log"), 2000) } else { "" }
+        title = f"Agent-broken breaker tripped for {cid}"
+        body = "O paused company " ++ cid ++ ": its last " ++ to_string(n) ++ " agent runs, on " ++ to_string(length(issues)) ++ " different issues, all ended with no commit or a crash. That usually means the agent can't work at all here (sandbox, CLI, auth or environment), not that the issues are hard. The issues were put back to Backlog.\n\nLast run's verdict (" ++ str_or(map_get(last, "verify_state"), "") ++ "):\n" ++ string_truncate(str_or(map_get(last, "verify_output"), ""), 2000) ++ "\n\nWhat the agent said at the end:\n" ++ string_truncate(said, 3000) ++ "\n\nerr.log tail:\n" ++ errt ++ "\n\nFix the cause, then set the company active again."
+        _sf = auto_file(db, cid, nil, "agent-broken", cid, title, body, "high")
+        back = [i for i in issues when map_get(running, i) == nil]
+        _b = [Store.issue_set_status(db, i, "Backlog") for i in back]
+        _pr = print(f"[orch] agent-broken breaker: paused {cid}; {length(back)} issue(s) back to Backlog")
+        breaker_unretry(retry, back)
+    }
+}
+
+fun breaker_unretry(retry, ids) {
+    if (length(ids) == 0) { retry } else { breaker_unretry(map_remove(retry, hd(ids)), tl(ids)) }
+}
+
+fun tail_text(t, k) {
+    if (string_length(t) <= k) { t } else { string_sub(t, string_length(t) - k, k) }
 }
 
 # The no-signal breaker fired: log it and auto-file an operator-origin
@@ -918,7 +969,11 @@ fun dispatch_batch(db, cands, slots, running, retry, now) {
                         recovered = (map_has_key(retry, iid) == 'false' || env_retry) && str_or(map_get(issue, "status"), "") == "Verifying"
                         running2 = if (recovered && has_committed_work(db, issue, iid) == 'true') { resume_at_verify(db, issue, iid, attempt, running, now) } else { dispatch_one(db, issue, iid, attempt, running, now) }
                         retry2 = map_remove(retry, iid)
-                        dispatch_batch(db, tl(cands), slots - 1, running2, retry2, now)
+                        # only a run that started uses a slot: an issue that
+                        # can't start (its company has no agent) must not
+                        # starve the issues behind it
+                        used = if (map_size(running2) > map_size(running)) { 1 } else { 0 }
+                        dispatch_batch(db, tl(cands), slots - used, running2, retry2, now)
                     }
                 }
             }

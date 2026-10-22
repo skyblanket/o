@@ -21,6 +21,9 @@ export O_ADAPT=0
 # Daemons keep two scheduler threads free (o#10); give them room like a real
 # deploy does, so the parallel stages aren't throttled on a small CI box.
 export SW_SCHEDULERS="${SW_SCHEDULERS:-16}"
+# The agent-broken breaker (o#15) would trip on stages that drive several
+# no-commit issues on purpose; only its own stage turns it on.
+export O_BROKEN_RUNS=0
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -2003,7 +2006,7 @@ pass "recovery: a restart is not an attempt (same attempt, same model); interrup
 TMPT="$(mktemp -d)"
 PORTT="$(free_port 4950 300)"
 BASET="http://127.0.0.1:${PORTT}"
-HOME="$TMPT" O_DB="$TMPT/o.db" O_PORT="$PORTT" O_NO_OPEN=1 SW_SCHEDULERS=4 O_MAX_CONCURRENT=3 O_AUTO_FILE=0 \
+HOME="$TMPT" O_DB="$TMPT/o.db" O_PORT="$PORTT" O_NO_OPEN=1 SW_SCHEDULERS=4 O_MAX_CONCURRENT=3 O_AUTO_FILE=0 O_BROKEN_RUNS=3 \
   ./bin/swarmd >"$TMPT/daemon.log" 2>&1 &
 DT=$!
 thr_fail() { stop_daemon "$DT"; tail -20 "$TMPT/daemon.log" || true; rmtmp "$TMPT"; fail "$1"; }
@@ -2043,6 +2046,22 @@ i2="$(ocurl -s -w ' %{http_code}' -X POST "$BASET/api/companies/$CIDI/issues" -H
 ocurl -s -X POST "$BASET/api/companies/$CIDI/issues" -H 'Content-Type: application/json' -H 'Idempotency-Key: other' -d '{"title":"filed once"}' >/dev/null
 [ "$(sqlite3 "$TMPT/o.db" "SELECT COUNT(*) FROM issue WHERE company_id='$CIDI'")" = "2" ] || thr_fail "idempotency: want 2 issues from keys same, same, other"
 pass "idempotency: a repeated Idempotency-Key replays the first answer and files nothing; a new key files"
+# Agent-broken breaker (o#15): agents that never commit, on 5 issues. After 3
+# such runs the company is paused with one diagnostic issue, and the issues
+# go back to Backlog instead of burning their attempts.
+CIDB="$(jget "$(ocurl -s -X POST "$BASET/api/companies" -H 'Content-Type: application/json' \
+  -d "{\"name\":\"Broken Co\",\"issue_prefix\":\"BRK\",\"budget_monthly_cents\":1000000,\"repo\":\"$SCRT\",\"verify_cmd\":\"true\"}")" 'd["id"]')"
+ocurl -s -X POST "$BASET/api/companies/$CIDB/agents" -H 'Content-Type: application/json' -d '{"name":"Brk","runtime":"sim"}' >/dev/null
+for n in 1 2 3 4 5; do ocurl -s -X POST "$BASET/api/companies/$CIDB/issues" -H 'Content-Type: application/json' -d "{\"title\":\"[sim:no-commit] broken env $n\"}" >/dev/null; done
+for _i in $(seq 1 60); do [ "$(sqlite3 "$TMPT/o.db" "SELECT pause_reason FROM company WHERE id='$CIDB'")" = "agent-broken" ] && break; sleep 1; done
+[ "$(sqlite3 "$TMPT/o.db" "SELECT status || '/' || pause_reason FROM company WHERE id='$CIDB'")" = "paused/agent-broken" ] || thr_fail "breaker: the company was not paused agent-broken"
+sleep 3
+[ "$(sqlite3 "$TMPT/o.db" "SELECT COUNT(*) FROM issue WHERE company_id='$CIDB' AND fingerprint LIKE 'agent-broken:%'")" = "1" ] || thr_fail "breaker: want exactly one diagnostic issue"
+# (a run still in flight when it trips finishes on its own; none may fail)
+[ "$(sqlite3 "$TMPT/o.db" "SELECT COUNT(*) FROM issue WHERE company_id='$CIDB' AND title LIKE '[sim:no-commit]%' AND status='Backlog'")" -ge 4 ] && [ "$(sqlite3 "$TMPT/o.db" "SELECT COUNT(*) FROM issue WHERE company_id='$CIDB' AND status='Failed'")" = "0" ] || { sqlite3 "$TMPT/o.db" "SELECT identifier, status FROM issue WHERE company_id='$CIDB'"; thr_fail "breaker: the issues should be back in Backlog, none Failed"; }
+nr="$(sqlite3 "$TMPT/o.db" "SELECT COUNT(*) FROM run r JOIN issue i ON i.id = r.issue_id WHERE i.company_id='$CIDB'")"
+[ "$nr" -le 4 ] || thr_fail "breaker: $nr runs before it tripped (want it to stop after 3, at most one more in flight)"
+pass "breaker: 3 no-commit runs across issues pause the company agent-broken, file one diagnostic, and put the issues back in Backlog ($nr runs spent)"
 stop_daemon "$DT"; rmtmp "$TMPT"
 pass "thread room: SW_SCHEDULERS=4 runs at most $maxf worker(s) at once, logs dispatch.throttled, the API answers within 1s throughout"
 

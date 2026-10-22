@@ -9,7 +9,7 @@
 
 module Store
 
-export [next_id, idem_get, idem_put, notes_latest, notes_save, companies, company_row, company_create, company_update,
+export [next_id, finished_runs_since, last_verb_ts, company_pause, idem_get, idem_put, notes_latest, notes_save, companies, company_row, company_create, company_update,
         company_add_spend, enforce_budget, rollover_day, company_mark_green, global_spent_today,
         company_touch_reflect, companies_to_reflect, company_set_github, companies_with_github, company_set_maintainer, issues_in_review,
         issues_for, issue_row, issue_create, issue_create_auto, issue_create_with_origin, issue_open_fp_count, issue_import_github,
@@ -93,6 +93,21 @@ fun issues_stranded_in_review(db) {
 # Open issues whose worktree may need a health check.
 fun issues_with_workspace(db) {
     db_query(db, "SELECT i.id, i.company_id, c.repo FROM issue i JOIN company c ON c.id = i.company_id WHERE i.status NOT IN ('Done', 'Canceled', 'Reverted') AND c.repo != ''", [])
+}
+
+# A company's most recent finished runs (a verdict recorded) started after
+# `since`, newest first: what the agent-broken breaker looks at.
+fun finished_runs_since(db, company_id, since, n) {
+    db_query(db, "SELECT r.issue_id, r.verify_state, r.verify_output, r.workspace_path FROM run r JOIN issue i ON i.id = r.issue_id WHERE i.company_id = ? AND r.started_at > ? AND r.verify_state != '' ORDER BY r.ended_at DESC, r.started_at DESC LIMIT ?", [company_id, since, n])
+}
+
+fun last_verb_ts(db, company_id, verb) {
+    r = db_query(db, "SELECT MAX(ts) AS t FROM activity WHERE company_id = ? AND verb = ?", [company_id, verb])
+    if (length(r) == 0) { 0 } else { v = map_get(hd(r), "t"); if (v == nil) { 0 } else { v } }
+}
+
+fun company_pause(db, id, reason) {
+    db_query(db, "UPDATE company SET status = 'paused', pause_reason = ?, updated_at = ? WHERE id = ?", [reason, timestamp(), id])
 }
 
 # The merge gate's shared NOTES.md, kept in the control plane (o#12) so a
