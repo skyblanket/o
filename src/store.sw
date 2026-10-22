@@ -9,7 +9,7 @@
 
 module Store
 
-export [next_id, companies, company_row, company_create, company_update,
+export [next_id, idem_get, idem_put, companies, company_row, company_create, company_update,
         company_add_spend, enforce_budget, rollover_day, company_mark_green, global_spent_today,
         company_touch_reflect, companies_to_reflect, company_set_github, companies_with_github, company_set_maintainer, issues_in_review,
         issues_for, issue_row, issue_create, issue_create_auto, issue_create_with_origin, issue_open_fp_count, issue_import_github,
@@ -93,6 +93,19 @@ fun issues_stranded_in_review(db) {
 # Open issues whose worktree may need a health check.
 fun issues_with_workspace(db) {
     db_query(db, "SELECT i.id, i.company_id, c.repo FROM issue i JOIN company c ON c.id = i.company_id WHERE i.status NOT IN ('Done', 'Canceled', 'Reverted') AND c.repo != ''", [])
+}
+
+# Idempotency-Key replay (o#11): the stored 2xx response for a key seen in
+# the last 24h, or nil. Older keys are pruned on every put.
+fun idem_get(db, key) {
+    r = db_query(db, "SELECT status, body FROM idem WHERE k = ? AND ts >= ?", [key, timestamp() - 86400000])
+    if (length(r) == 0) { nil } else { hd(r) }
+}
+
+fun idem_put(db, key, status, body) {
+    now = timestamp()
+    _d = db_query(db, "DELETE FROM idem WHERE ts < ?", [now - 86400000])
+    db_query(db, "INSERT OR REPLACE INTO idem (k, status, body, ts) VALUES (?, ?, ?, ?)", [key, status, body, now])
 }
 
 fun activity_count_since(db, verb, since) {

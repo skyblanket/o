@@ -51,11 +51,32 @@ fun serve(db, dbpath) {
 # swarmrt's http_respond takes headers as ONE string — each line
 # CRLF-terminated; the runtime appends the final blank line.
 fun json_headers() {
-    "Content-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\n"
+    "Content-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization, Idempotency-Key\r\n"
 }
 
+# conn is the request's connection, or {'idem', conn, key, db} when the write
+# carried an Idempotency-Key: a 2xx answer is then stored for replay.
 fun respond(conn, status, body) {
-    http_respond(conn, status, json_headers(), body)
+    case conn {
+        {'idem', c, k, db} ->
+            _s = if (status >= 200 && status < 300) { Store.idem_put(db, k, status, body) } else { "" }
+            http_respond(c, status, json_headers(), body)
+        _ -> http_respond(conn, status, json_headers(), body)
+    }
+}
+
+# A write with an Idempotency-Key header that was already answered (2xx, in
+# the last 24h) gets the same answer again and writes nothing: a client that
+# retries after a dropped response can't file the same thing twice. Keys are
+# scoped to the method and path.
+fun idem_route(db, dbpath, conn, method, path, hdrs, body) {
+    key = hdr(hdrs, "idempotency-key")
+    if (string_length(key) == 0) { route(db, dbpath, conn, method, path, body) } else {
+        k = to_string(method) ++ " " ++ path ++ " " ++ key
+        prev = Store.idem_get(db, k)
+        if (prev == nil) { route(db, dbpath, {'idem', conn, k, db}, method, path, body) }
+        else { http_respond(conn, map_get(prev, "status"), json_headers(), map_get(prev, "body")) }
+    }
 }
 
 fun err_json(msg) {
@@ -110,8 +131,15 @@ fun orch_snapshot(conn) {
 #             (it is stripped from their env), so an agent cannot rewrite the
 #             verify_cmd / protected_paths that gate its own merges. Filing
 #             issues and feedback stays open: that is how reflection reports.
+# O_PUBLIC_READONLY=1 (o#41), for exposing the UI through a tunnel: only GET
+# routes answer. Every write (issue filing included, which is otherwise open
+# without a token) and /api/fs are refused with 403.
+fun public_readonly() { getenv("O_PUBLIC_READONLY") == "1" }
+
 fun dispatch(db, dbpath, conn, method, path, hdrs, body) {
-    if (method == 'OPTIONS') {
+    if (public_readonly() && (string_starts_with(path, "/api/fs") == 'true' || (method != 'GET' && method != 'OPTIONS'))) {
+        respond(conn, 403, err_json("this O is read-only (O_PUBLIC_READONLY=1)"))
+    } else { if (method == 'OPTIONS') {
         if (loopback_origin(hdr(hdrs, "origin")) == 'true') {
             http_respond(conn, 204, json_headers(), "")
         } else {
@@ -127,11 +155,11 @@ fun dispatch(db, dbpath, conn, method, path, hdrs, body) {
                 if (token_ok(path, hdrs) == 'false') {
                     respond(conn, 401, err_json("this write requires Authorization: Bearer $O_API_TOKEN"))
                 } else {
-                    route(db, dbpath, conn, method, path, body)
+                    idem_route(db, dbpath, conn, method, path, hdrs, body)
                 }
             }
         }
-    }
+    }}
 }
 
 # Header lookup (keys arrive lowercased); missing -> "".

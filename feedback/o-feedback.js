@@ -30,6 +30,7 @@
     "";
 
   var batch = [];
+  var batchKey = ""; // Idempotency-Key for the batch as it stands; reset when it changes
   var active = false;
   var overlayEl = null;     // hover highlight
   var inputWrap = null;     // floating instruction input
@@ -218,6 +219,7 @@
   }
 
   function saveAnnotation(el, instruction) {
+    batchKey = "";
     batch.push({
       selector: cssPath(el),
       html: (el.outerHTML || "").slice(0, 2000),
@@ -285,7 +287,7 @@
         rm.className = "o-fb-rm";
         rm.textContent = "×";
         rm.title = "remove";
-        rm.addEventListener("click", function () { batch.splice(i, 1); renderPanel(); });
+        rm.addEventListener("click", function () { batch.splice(i, 1); batchKey = ""; renderPanel(); });
         var sel = document.createElement("div");
         sel.className = "o-fb-sel";
         sel.textContent = a.selector;
@@ -310,7 +312,7 @@
     var clear = document.createElement("button");
     clear.className = "o-fb-btn o-fb-clear";
     clear.textContent = "Clear";
-    clear.addEventListener("click", function () { batch = []; renderPanel(); });
+    clear.addEventListener("click", function () { batch = []; batchKey = ""; renderPanel(); });
     foot.appendChild(send);
     foot.appendChild(clear);
     panel.appendChild(foot);
@@ -321,9 +323,12 @@
     if (!batch.length) return;
     if (!COMPANY) { toast("Set O_FEEDBACK.company first"); return; }
     var payload = { page_url: location.href, annotations: batch.slice() };
+    // one key per batch until it is filed: resending after a dropped
+    // response returns the same issue instead of filing a second one
+    if (!batchKey) batchKey = "fb-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2);
     fetch(ENDPOINT + "/api/companies/" + encodeURIComponent(COMPANY) + "/feedback", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "Idempotency-Key": batchKey },
       body: JSON.stringify(payload)
     }).then(function (r) {
       return r.json().then(function (d) { return { ok: r.status === 201, d: d }; });
@@ -332,6 +337,7 @@
         var ident = res.d.identifier || res.d.id || "issue";
         toast("Filed " + ident + " ✓");
         batch = [];
+        batchKey = "";
         renderPanel();
       } else {
         toast("Error: " + ((res.d && res.d.error) || "could not file"));
@@ -374,7 +380,7 @@
     toggle: toggle,
     open: function () { ensurePanel(); setActive(true); },
     close: function () { setActive(false); },
-    clear: function () { batch = []; renderPanel(); },
+    clear: function () { batch = []; batchKey = ""; renderPanel(); },
     batch: function () { return batch.slice(); },
     config: function () { return { endpoint: ENDPOINT, company: COMPANY }; }
   };

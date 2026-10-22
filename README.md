@@ -539,6 +539,7 @@ The daemon reads its configuration from the environment. All are optional.
 | `O_MAX_CONCURRENT` | `3` | agent runs (build, verify, review) in flight across all companies. PRs waiting on CI, the gate or a merge hold no slot. Keep `SW_SCHEDULERS` above twice this. |
 | `O_DB` | `~/.o/o.db` | control-plane SQLite path. |
 | `O_PORT` | `4100` | HTTP port. |
+| `O_PUBLIC_READONLY` | unset | `1` serves GET routes only, for exposing the UI through a tunnel: every write, issue filing included, and `/api/fs` get 403. |
 | `O_CLAUDE_BIN` | `claude` on `PATH` | claude-code binary for the `claude-code` runtime. |
 | `O_SWARM_BIN` | `swarm-code` on `PATH` | binary for the `swarm-code` runtime. |
 | `O_MAX_TURNS` | `50` | per-run turn cap passed to claude-code. |
@@ -610,6 +611,8 @@ curl http://localhost:4100/api/issues/<id>/activity   # one issue's pipeline, in
 curl http://localhost:4100/api/waiting        # everything waiting on a person, oldest first
 curl http://localhost:4100/api/proof          # the track record
 ```
+
+Every write that creates something takes an optional `Idempotency-Key` header. A repeated key (same method and path, within 24h) gets the first 2xx answer back and writes nothing, so a client that retries after a dropped response can't file the same issue, report or feedback twice. O's own reflection and persona prompts and `feedback/o-feedback.js` send one.
 
 The UI (`cd ui && npm run dev`) shows each issue's pipeline by attempt (agent, verify, review, PR + CI, gate, merge). Cards carry their PR, CI state and gate decision, and In Review cards say why they wait. The company header shows 14 days of spend by role (agent, reviewer, gate, planner, reflect, persona) with the cost per merge. Manage sets the GitHub repo and ship mode, and shows the gate's config.
 
