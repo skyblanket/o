@@ -267,6 +267,7 @@ while [ $# -gt 0 ]; do
 done
 listed() { [ -f "$GHS/$1" ] && grep -qx "$2" "$GHS/$1"; }
 num_for() { grep -lx "$1" "$GHS"/pr_* 2>/dev/null | head -1 | sed 's|.*/pr_||'; }
+echo "$method $path" >> "$GHS/calls.log"
 case "$method $path" in
   "GET repos/acme/widgets/issues?"*)
     # labels=X keeps issues carrying X; an issue with no "labels" key counts as
@@ -725,7 +726,12 @@ echo fix > "$tmpf/c/base-fix.txt"; git -C "$tmpf/c" add base-fix.txt
 git -C "$tmpf/c" -c user.email=h@x -c user.name=human commit -q -m "base moves on"
 for _i in 1 2 3 4 5; do git -C "$tmpf/c" push -q origin main 2>/dev/null && break; git -C "$tmpf/c" -c user.email=h@x -c user.name=human pull -q --rebase origin main; done
 sed -i "\|o/$IID_FL2|d" "$GHS/hold_ci"
-wait_status_at "$BASE4" "$IID_FL2" "Done" 120 || { tail -30 "$TMP4/daemon.log"; fail "ci rerun: with no Actions permission, a PR behind base should be updated and re-checked"; }
+wait_status_at "$BASE4" "$IID_FL2" "Done" 120 || {
+  sqlite3 "$TMP4/o.db" "SELECT attempt, state, verify_state, substr(verify_output, 1, 400) FROM run WHERE issue_id='$IID_FL2' ORDER BY started_at"
+  sqlite3 "$TMP4/o.db" "SELECT verb FROM activity WHERE target='$IID_FL2' ORDER BY ts" | tr '\n' ' '; echo
+  n2="$(pr_of "$IID_FL2" 2>/dev/null)"; echo "PR $n2; stub files: $(cd "$GHS" && ls | grep -E "_${n2:-none}\$" | tr '\n' ' ')"
+  grep -E "pulls/${n2:-none}|compare|rerun" "$GHS/calls.log" | tail -25
+  fail "ci rerun: with no Actions permission, a PR behind base should be updated and re-checked"; }
 [ -f "$GHS/updated_$(pr_of "$IID_FL2")" ] || fail "ci rerun: the PR behind base was not updated"
 [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM run WHERE issue_id='$IID_FL2' AND verify_state = 'red_ci'")" = "0" ] || fail "ci rerun: the flaky check was blamed on the change"
 rm -f "$GHS/no_actions"
