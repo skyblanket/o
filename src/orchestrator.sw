@@ -635,7 +635,7 @@ fun tick_loop(db, dbpath, port, tick_n, running, retry) {
             print(f"[orch] tick {tick_n}  running={rc}  retry={qc}")
             tick_loop(db, dbpath, port, tick_n + 1, nr, nq)
         {'run_done', run_id, issue_id, outcome, cost, session_id} ->
-            r = handle_done(db, running, retry, run_id, issue_id, outcome, cost, session_id)
+            r = if (outcome == 'no_workspace') { handle_no_workspace(db, running, retry, run_id, issue_id) } else { handle_done(db, running, retry, run_id, issue_id, outcome, cost, session_id) }
             tick_loop(db, dbpath, port, tick_n, map_get(r, "running"), map_get(r, "retry"))
         {'verify_done', run_id, issue_id, verdict, tail} ->
             r = handle_verify_done(db, running, retry, run_id, issue_id, verdict, tail)
@@ -1002,6 +1002,15 @@ fun sweep_stalls(db, ids, running, retry, now) {
 }
 
 # Dispatch up to `slots` eligible candidates.
+# A parent whose auto-filed follow-up ("Fix failing verification: X") is
+# still open waits for it: both would work on the parent's branch (o#33).
+fun followup_open(db, issue) {
+    ident = str_or(map_get(issue, "identifier"), "")
+    if (string_length(ident) == 0) { 'false' } else {
+        if (Store.issue_open_fp_count(db, map_get(issue, "company_id"), "verify-final:" ++ ident) > 0) { 'true' } else { 'false' }
+    }
+}
+
 fun dispatch_batch(db, cands, slots, running, retry, now) {
     if (slots <= 0) {
         %{running: running, retry: retry}
@@ -1014,7 +1023,7 @@ fun dispatch_batch(db, cands, slots, running, retry, now) {
             if (map_has_key(running, iid) == 'true') {
                 dispatch_batch(db, tl(cands), slots, running, retry, now)
             } else {
-                if (is_cooling(retry, iid, now) == 'true') {
+                if (is_cooling(retry, iid, now) == 'true' || followup_open(db, issue) == 'true') {
                     dispatch_batch(db, tl(cands), slots, running, retry, now)
                 } else {
                     attempt = if (map_has_key(retry, iid) == 'true') { attempt_for(retry, iid) } else { recovered_attempt(db, issue, iid) }
@@ -1355,7 +1364,7 @@ fun run_claude_code(orch, run_id, issue_id, prompt, workspace, repo, session_id,
         _mk = sh(f"mkdir -p {workspace}")
     }
     if (ws_missing(repo, workspace)) {
-        send(orch, {'run_done', run_id, issue_id, 'crashed', 0, ""})
+        send(orch, {'run_done', run_id, issue_id, 'no_workspace', 0, ""})
     } else {
         run_claude_code_in(orch, run_id, issue_id, prompt, workspace, repo, session_id, model)
     }
@@ -1511,7 +1520,7 @@ fun run_swarm_code(orch, run_id, issue_id, prompt, workspace, repo, start) {
         _mk = sh(f"mkdir -p {workspace}")
     }
     if (ws_missing(repo, workspace)) {
-        send(orch, {'run_done', run_id, issue_id, 'crashed', 0, ""})
+        send(orch, {'run_done', run_id, issue_id, 'no_workspace', 0, ""})
     } else {
         run_swarm_code_in(orch, run_id, issue_id, prompt, workspace, repo)
     }
@@ -1765,7 +1774,9 @@ fun prepare_worktree(repo, workspace, issue_id, start) {
 # instead of re-creating it.
 fun wt_add(repo, workspace, branch, start, tries) {
     have = elem(sh(f"git -C {sq(repo)} rev-parse --verify --quiet refs/heads/{branch}"), 0) == 0
-    r = if (have) { sh(f"git -C {sq(repo)} worktree add {workspace} {branch}") } else { sh(f"git -C {sq(repo)} worktree add {workspace} -b {branch} {start}") }
+    r = if (have) { sh(f"git -C {sq(repo)} worktree add {workspace} {branch} 2>&1") } else { sh(f"git -C {sq(repo)} worktree add {workspace} -b {branch} {start} 2>&1") }
+    # git's own words, for handle_no_workspace if no attempt succeeds
+    _e = if (elem(r, 0) == 0) { sh(f"rm -f {sq(workspace)}.wterr") } else { _d = sh(f"mkdir -p {sq(dirname(workspace))}"); file_write(workspace ++ ".wterr", str_or(elem(r, 1), "")) }
     if (elem(r, 0) == 0) {
         ""
     } else {
@@ -1803,7 +1814,7 @@ fun run_sim(orch, run_id, issue_id, outcome, workspace, repo, title, protected, 
     if (string_length(repo) > 0) {
         _wt = prepare_worktree(repo, workspace, issue_id, start)
         if (ws_missing(repo, workspace)) {
-            send(orch, {'run_done', run_id, issue_id, 'crashed', 0, ""})
+            send(orch, {'run_done', run_id, issue_id, 'no_workspace', 0, ""})
         } else {
             # PROMPT.txt is written but left UNTRACKED — the [sim:regress] case
             # relies on it existing in the worktree (green) yet absent on main
@@ -1992,6 +2003,35 @@ fun persist_session(db, info, session_id) {
 }
 
 # ---- run completion ------------------------------------------
+# The run's worktree could not be created (o#33): e.g. its branch is checked
+# out in another run's worktree. The run never started, so it is not an
+# attempt: it is retried on the normal backoff at the same attempt, with git's
+# error recorded. After O_WS_TRIES (5) such failures the issue fails, saying
+# why, instead of looping forever.
+fun handle_no_workspace(db, running, retry, run_id, issue_id) {
+    info = map_get(running, issue_id)
+    if (info == nil) { %{running: running, retry: retry} } else {
+        now = timestamp()
+        company_id = map_get(info, "company_id")
+        ws = str_or(map_get(info, "workspace"), "")
+        errf = ws ++ ".wterr"
+        err = if (file_exists(errf) == 'true') { string_trim(file_read(errf)) } else { "" }
+        msg = "The run never started: git could not create its worktree at " ++ ws ++ ".\n" ++ (if (string_length(err) > 0) { err } else { "(no error text)" })
+        _m = Store.run_finish(db, run_id, "NoWorkspace", 0)
+        _v = Store.run_set_verify(db, run_id, "no_workspace", msg)
+        _a = Store.log_activity(db, company_id, "orchestrator", "run.no_workspace", issue_id)
+        _p = print("[orch] no workspace for " ++ issue_id ++ ": " ++ string_truncate(err, 200))
+        attempt = map_get(info, "attempt")
+        if (Store.count_target_verb(db, issue_id, "run.no_workspace") >= env_int("O_WS_TRIES", 5)) {
+            _is = Store.issue_set_status(db, issue_id, "Failed")
+            _a2 = Store.log_activity(db, company_id, "orchestrator", "run.failed_final", issue_id)
+            %{running: map_remove(running, issue_id), retry: map_remove(retry, issue_id)}
+        } else {
+            %{running: map_remove(running, issue_id), retry: map_put(retry, issue_id, %{attempt: attempt, due_at: now + backoff_ms(attempt)})}
+        }
+    }
+}
+
 fun handle_done(db, running, retry, run_id, issue_id, outcome, cost, session_id) {
     info = map_get(running, issue_id)
     if (info == nil) {
