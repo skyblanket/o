@@ -831,6 +831,44 @@ fun count_verbs(db, verbs) {
     if (length(r) == 0) { 0 } else { map_get(hd(r), "n") }
 }
 
+fun spend_add(db, cid, kind, cents, iid) {
+    _u = db_query(db, "INSERT INTO spend (company_id, kind, cents, issue_id, ts) VALUES (?, ?, ?, ?, ?)", [cid, kind, cents, iid, timestamp()])
+    kind
+}
+
+fun spend_by_day(db, cid, since) {
+    db_query(db, "SELECT (ts / 86400000) AS day, kind, CAST(ROUND(SUM(cents)) AS INTEGER) AS cents FROM spend WHERE company_id = ? AND ts >= ? GROUP BY day, kind ORDER BY day, kind", [cid, since])
+}
+
+fun spend_total(db, cid, since) {
+    r = db_query(db, "SELECT CAST(ROUND(COALESCE(SUM(cents), 0)) AS INTEGER) AS c FROM spend WHERE company_id = ? AND ts >= ?", [cid, since])
+    if (length(r) == 0) { 0 } else { map_get(hd(r), "c") }
+}
+
+fun merges_since(db, cid, since) {
+    r = db_query(db, "SELECT COUNT(*) AS n FROM activity WHERE company_id = ? AND ts >= ? AND verb IN ('ci.merged', 'merge.done', 'pr.merged')", [cid, since])
+    if (length(r) == 0) { 0 } else { map_get(hd(r), "n") }
+}
+
+fun activity_for_target(db, target) {
+    db_query(db, "SELECT actor, verb, ts, payload FROM activity WHERE target = ? ORDER BY ts", [target])
+}
+
+fun issues_board(db, cid) {
+    db_query(db, "SELECT id, status FROM issue WHERE company_id = ? AND status NOT IN ('Done', 'Canceled')", [cid])
+}
+
+# The latest of these verbs logged for a target, or "".
+fun last_verb_of(db, target, verbs) {
+    r = db_query(db, "SELECT verb FROM activity WHERE target = ? AND verb IN (" ++ Std.join(["?" for v in verbs], ", ") ++ ") ORDER BY ts DESC LIMIT 1", [target] ++ verbs)
+    if (length(r) == 0) { "" } else { map_get(hd(r), "verb") }
+}
+
+fun company_clear_maintainer(db, id) {
+    _u = db_query(db, "UPDATE company SET maintainer_session = '', maintainer_reviews = 0, updated_at = ? WHERE id = ?", [timestamp(), id])
+    id
+}
+
 fun error_row(db, cid, key) {
     r = db_query(db, "SELECT issue_id, count, users, fresh, escaped, first_ts FROM errors WHERE company_id = ? AND key = ?", [cid, key])
     if (length(r) == 0) { nil } else { hd(r) }

@@ -719,7 +719,7 @@ fun reflect_each(db, dbpath, port, cands, now) {
 # Sole DB writer for a completed reflection: account the (real) spend — which
 # may trip the budget guard — and log reflect.done. Workers never write.
 fun handle_reflect_done(db, company_id, cost) {
-    account_cost(db, company_id, cost)
+    account_cost_k(db, company_id, cost, "reflect", "")
     _a = Store.log_activity(db, company_id, "orchestrator", "reflect.done", company_id)
     ""
 }
@@ -822,7 +822,7 @@ fun sweep_stalls(db, ids, running, retry, now) {
                 est = run_cost_est(124, 0, spath)
                 _f = Store.run_finish(db, run_id, "Stalled", est)
                 _v = Store.run_set_verify(db, run_id, "red_agent", crash_summary(124, spath))
-                account_cost(db, company_id, est)
+                account_cost_k(db, company_id, est, "agent", "")
             } else {
                 Store.run_set_state(db, run_id, "Stalled")
             }
@@ -1846,7 +1846,7 @@ fun handle_done(db, running, retry, run_id, issue_id, outcome, cost, session_id)
         if (outcome == 'needs_human') {
             # The task needs a protected path: park it for a human with the
             # change the builder asked for. Not a failed attempt.
-            account_cost(db, company_id, cost)
+            account_cost_k(db, company_id, cost, "agent", issue_id)
             ws = map_get(info, "workspace")
             ask = if (file_exists(f"{ws}/NEEDS_HUMAN.txt") == 'true') { file_read(f"{ws}/NEEDS_HUMAN.txt") } else { "NEEDS_HUMAN" }
             _m = Store.run_finish(db, run_id, "InReview", cost)
@@ -1862,7 +1862,7 @@ fun handle_done(db, running, retry, run_id, issue_id, outcome, cost, session_id)
             } else { "" }
             %{running: map_remove(running, issue_id), retry: map_remove(retry, issue_id)}
         } else { if (outcome == 'succeeded' && map_get(info, "phase") == 'repro') {
-            account_cost(db, company_id, cost)
+            account_cost_k(db, company_id, cost, "agent", issue_id)
             company = Store.company_row(db, company_id)
             repo = str_or(map_get(company, "repo"), "")
             _m = Store.run_finish(db, run_id, "Reproducing", cost)
@@ -1871,7 +1871,7 @@ fun handle_done(db, running, retry, run_id, issue_id, outcome, cost, session_id)
             %{running: map_put(running, issue_id, info2), retry: retry}
         } else { if (outcome == 'succeeded') {
             # Spend is real whichever path we take, so account it immediately.
-            account_cost(db, company_id, cost)
+            account_cost_k(db, company_id, cost, "agent", issue_id)
             company = Store.company_row(db, company_id)
             repo = str_or(map_get(company, "repo"), "")
             verify_cmd = str_or(map_get(company, "verify_cmd"), "")
@@ -1900,7 +1900,7 @@ fun handle_done(db, running, retry, run_id, issue_id, outcome, cost, session_id)
         } else {
             attempt = map_get(info, "attempt")
             _m = Store.run_finish(db, run_id, "Failed", cost)
-            account_cost(db, company_id, cost)
+            account_cost_k(db, company_id, cost, "agent", issue_id)
             # the worker's account of how it died becomes the retry's verdict
             cf = str_or(map_get(info, "workspace"), "") ++ ".crash.txt"
             _cr = if (file_exists(cf) == 'true') {
@@ -1924,6 +1924,13 @@ fun handle_done(db, running, retry, run_id, issue_id, outcome, cost, session_id)
 
 # The cost hook: accumulate run cost onto the company, then let the
 # budget guard hard-stop the company if it has hit its cap.
+# Spend by role (o#7): every cost is also written to the spend ledger with
+# its kind (agent, reviewer, gate, planner, reflect, persona) and issue.
+fun account_cost_k(db, company_id, cost, kind, iid) {
+    _l = Store.spend_add(db, company_id, kind, cost, iid)
+    account_cost(db, company_id, cost)
+}
+
 fun account_cost(db, company_id, cost) {
     _s = Store.company_add_spend(db, company_id, cost)
     if (Store.enforce_budget(db, company_id) == 'paused') {
@@ -2465,7 +2472,7 @@ fun handle_review_done(db, running, retry, run_id, issue_id, approved, reason, c
     } else {
         now = timestamp()
         company_id = map_get(info, "company_id")
-        account_cost(db, company_id, cost)
+        account_cost_k(db, company_id, cost, "reviewer", issue_id)
         _rc = Store.run_add_cost(db, run_id, cost)
         if (approved == 'true') {
             _a = Store.log_activity(db, company_id, "reviewer", "review.pass", issue_id)
@@ -2693,6 +2700,7 @@ fun reopen_closed_pr(gh_repo, branch) {
 # may just mean CI hasn't registered yet, so it only counts as "no CI, green"
 # after O_CI_SETTLE_S (default 30).
 fun ci_poll(orch, run_id, issue_id, gh_repo, branch, num, base, required, pushed_at, deadline) {
+    _pn = file_write(pr_file(issue_id), to_string(num))
     pr = gh_json(f"repos/{gh_repo}/pulls/{num}")
     merged = if (pr == nil) { 'false' } else { if (map_get(pr, "merged") == 'true') { 'true' } else { 'false' } }
     mstate = if (pr == nil) { "" } else { str_or(map_get(pr, "mergeable_state"), "") }
@@ -3919,6 +3927,53 @@ fun focus_review(job, rv, diff, lists) {
     %{verdict: verdict, text: text, cost: run_cost(elem(_r, 0), if (usd == nil) { 0 } else { usd * 100 })}
 }
 
+# ---- the board's view of each issue (o#6, o#5, o#8) ------------------
+fun pr_file(iid) { getenv("HOME") ++ "/.o/pr-" ++ iid }
+
+fun gate_file(cid, iid) { getenv("HOME") ++ "/.o/maintainer/" ++ cid ++ "/" ++ iid ++ "/gate.json" }
+
+# Per open issue: its PR number, CI state, the gate's last decision and, In
+# Review, why it waits. GET /api/companies/:id/board
+fun board(db, cid) {
+    [board_row(db, cid, i) for i in Store.issues_board(db, cid)]
+}
+
+fun board_row(db, cid, i) {
+    iid = map_get(i, "id")
+    pp = pr_file(iid)
+    pr = if (file_exists(pp) == 'true') { to_int_or(string_trim(file_read(pp)), 0) } else { 0 }
+    gp = gate_file(cid, iid)
+    g = if (file_exists(gp) == 'true') { json_decode(file_read(gp)) } else { nil }
+    gv = if (g == nil) { "" } else { str_or(map_get(g, "verdict"), "") }
+    last = Store.last_run_for_issue(db, iid)
+    vo = if (last == nil) { "" } else { str_or(map_get(last, "verify_output"), "") }
+    ci = Store.last_verb_of(db, iid, ["ci.fail", "ci.awaiting_review", "gate.start", "ci.merged", "pr.merged", "gate.approve", "gate.reject", "gate.human", "gate.unverified"])
+    cistate = if (ci == "ci.fail") { "red" } else { if (string_length(ci) > 0) { "green" } else { if (pr > 0) { "pending" } else { "" } } }
+    %{id: iid, pr: pr, ci: cistate, gate: (if (string_length(gv) == 0) { "" } else { hd(string_split(gv, ":")) }), gate_reason: string_truncate(gv, 300), gate_model: (if (g == nil) { "" } else { str_or(map_get(g, "model"), "") }),
+      waiting: (if (str_or(map_get(i, "status"), "") == "In Review") { first_line(vo) } else { "" })}
+}
+
+# Spend by kind per day, the last `days` days, and cost per merge.
+# GET /api/companies/:id/spend?days=14
+fun spend_view(db, cid, days) {
+    since = (timestamp() / 86400000 - days + 1) * 86400000
+    rows = Store.spend_by_day(db, cid, since)
+    merges = Store.merges_since(db, cid, since)
+    total = Store.spend_total(db, cid, since)
+    %{days: days, today: timestamp() / 86400000, rows: rows, merges: merges, total_cents: total, cost_per_merge_cents: (if (merges > 0) { total / merges } else { 0 })}
+}
+
+# The gate's effective config for a company (o#8): .o-review.json on base,
+# the maintainer session, and whether the config is protected from agents.
+fun gate_info(db, cid) {
+    co = Store.company_row(db, cid)
+    repo = str_or(map_get(co, "repo"), "")
+    cfg = if (string_length(repo) == 0) { %{} } else { review_config(repo, company_base(co, repo)) }
+    prot = str_or(map_get(co, "protected_paths"), "")
+    %{config: cfg, maintainer_session: str_or(map_get(co, "maintainer_session"), ""), maintainer_reviews: map_get(co, "maintainer_reviews"),
+      config_protected: (if (string_contains(prot, ".o-review.json") == 'true') { 1 } else { 0 }), merge_gate: (if (merge_gate_enabled() == 'true') { 1 } else { 0 }), ship: str_or(map_get(co, "ship"), "merge"), github_repo: str_or(map_get(co, "github_repo"), "")}
+}
+
 # Post the decision with its evidence on the PR, and hand it back.
 fun gate_result(job, verdict, text, evidence, cmd_md, session, cost) {
     dir = map_get(job, "dir")
@@ -4037,7 +4092,7 @@ fun handle_gate_done(db, running, retry, run_id, issue_id, verdict, text, sessio
         now = timestamp()
         company_id = map_get(info, "company_id")
         company = Store.company_row(db, company_id)
-        account_cost(db, company_id, cost)
+        account_cost_k(db, company_id, cost, "gate", issue_id)
         _rc = Store.run_add_cost(db, run_id, cost)
         home = getenv("HOME")
         _n = append_notes(f"{home}/.o/maintainer/{company_id}/NOTES.md", text)
@@ -4227,7 +4282,7 @@ fun plan_file(gh_repo, dir, l) {
 
 # Sole DB writer: account the planner's spend and record what it decided.
 fun handle_plan_done(db, cid, cost, taken, filed) {
-    account_cost(db, cid, cost)
+    account_cost_k(db, cid, cost, "planner", "")
     _t = [Store.log_activity(db, cid, "planner", "plan.take", t) for t in taken]
     _f = [Store.log_activity(db, cid, "planner", "plan.file", f) for f in filed]
     print("[orch] planning pass: took " ++ Std.join(taken, " ") ++ "; filed " ++ Std.join(filed, " "))
@@ -5166,6 +5221,7 @@ fun handle_persona_done(db, run_id, cost, code, text, verdicts) {
     if (run0 == nil) { "" } else {
         cid = map_get(run0, "company_id")
         _s = Store.company_add_persona_spend(db, cid, cost)
+        _sl = Store.spend_add(db, cid, "persona", cost, "")
         quiet = if (code == 0) { "clean" } else { "error" }
         run = Store.persona_run_finish(db, run_id, cost, quiet)
         persona = Store.persona_row(db, map_get(run, "persona_id"))

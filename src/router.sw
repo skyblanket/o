@@ -234,6 +234,7 @@ fun route(db, dbpath, conn, method, path, body) {
         p when string_starts_with(p, "/api/approvals/") == 'true' -> decide_approval(db, conn, method, p, body)
         p when string_starts_with(p, "/api/runs/") == 'true' -> run_result(db, conn, p)
         p when string_starts_with(p, "/api/issues/") == 'true' && string_ends_with(p, "/retry") == 'true' -> route_retry(db, conn, method, p, body)
+        p when string_starts_with(p, "/api/issues/") == 'true' && string_ends_with(p, "/activity") == 'true' -> respond(conn, 200, json_encode(Store.activity_for_target(db, string_sub(p, 12, string_length(p) - 12 - 9))))
         p when string_starts_with(p, "/api/issues/") == 'true' -> route_issue(db, conn, method, p, body)
         p when string_starts_with(p, "/api/agents/") == 'true' -> route_agent(db, dbpath, conn, method, p, body)
         p when string_starts_with(p, "/api/personas/") == 'true' -> update_persona(db, conn, method, p, body)
@@ -378,6 +379,26 @@ fun route_company(db, conn, method, p, body) {
           if (string_ends_with(rest, "/persona_reports") == 'true') {
             persona_report(db, conn, method, string_sub(rest, 0, string_length(rest) - 16), body)
           } else {
+          if (string_ends_with(rest, "/board") == 'true') {
+            respond(conn, 200, json_encode(Orchestrator.board(db, string_sub(rest, 0, string_length(rest) - 6))))
+          } else {
+          if (string_contains(rest, "/spend") == 'true') {
+            parts = string_split(rest, "/spend")
+            q = Std.last(parts)
+            dq = if (string_contains(q, "days=") == 'true') { to_int(Std.last(string_split(q, "days="))) } else { nil }
+            respond(conn, 200, json_encode(Orchestrator.spend_view(db, hd(parts), if (dq == nil) { 14 } else { dq })))
+          } else {
+          if (string_ends_with(rest, "/gate/rotate") == 'true') {
+            gcid = string_sub(rest, 0, string_length(rest) - 12)
+            if (method != 'POST') { respond(conn, 405, err_json("POST to rotate")) } else {
+                _c = Store.company_clear_maintainer(db, gcid)
+                _l = Store.log_activity(db, gcid, "operator", "gate.rotated", gcid)
+                respond(conn, 200, json_encode(Orchestrator.gate_info(db, gcid)))
+            }
+          } else {
+          if (string_ends_with(rest, "/gate") == 'true') {
+            respond(conn, 200, json_encode(Orchestrator.gate_info(db, string_sub(rest, 0, string_length(rest) - 5))))
+          } else {
           if (string_ends_with(rest, "/errors") == 'true') {
             ecid = string_sub(rest, 0, string_length(rest) - 7)
             data = if (string_length(body) > 0) { json_decode(body) } else { nil }
@@ -400,7 +421,7 @@ fun route_company(db, conn, method, p, body) {
                     respond(conn, 405, err_json("method not allowed"))
                 }
             }
-          }}}}
+          }}}}}}}}
         }
       }
     }

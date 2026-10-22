@@ -603,7 +603,15 @@ curl -X POST http://localhost:4100/api/companies/<id>/issues \
 curl http://localhost:4100/api/orchestrator   # live scheduler snapshot
 curl http://localhost:4100/api/runs           # run history
 curl http://localhost:4100/api/activity       # activity log
+curl http://localhost:4100/api/companies/<id>/board   # per open issue: PR, CI, gate decision, why it waits
+curl http://localhost:4100/api/companies/<id>/spend?days=14   # spend by role per day, cost per merge
+curl http://localhost:4100/api/companies/<id>/gate    # the gate's .o-review.json and session
+curl http://localhost:4100/api/issues/<id>/activity   # one issue's pipeline, in order
+curl http://localhost:4100/api/waiting        # everything waiting on a person, oldest first
+curl http://localhost:4100/api/proof          # the track record
 ```
+
+The UI (`cd ui && npm run dev`) shows each issue's pipeline by attempt (agent, verify, review, PR + CI, gate, merge). Cards carry their PR, CI state and gate decision, and In Review cards say why they wait. The company header shows 14 days of spend by role (agent, reviewer, gate, planner, reflect, persona) with the cost per merge. Manage sets the GitHub repo and ship mode, and shows the gate's config.
 
 ## Known limitations
 
