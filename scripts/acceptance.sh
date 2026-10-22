@@ -394,6 +394,11 @@ for _i in $(seq 1 25); do
   sleep 1
 done
 [ -n "$rolled_ok" ] || { cat "$TMP/daemon.log" || true; die "rollover never reset budget company (status=${st:-?} spent=${sp:-?})"; }
+# the un-pause and the budget.reset log are two writes in the same tick
+for _i in $(seq 1 10); do
+  sqlite3 "$TMP/o.db" "SELECT COUNT(*) FROM activity WHERE company_id='$CIDB' AND verb='budget.reset'" | grep -q '^[1-9]' && break
+  sleep 0.5
+done
 sqlite3 "$TMP/o.db" "SELECT COUNT(*) FROM activity WHERE company_id='$CIDB' AND verb='budget.reset'" | grep -q '^[1-9]' \
   || die "budget.reset not logged"
 ok "rollover reset spend + un-paused, budget.reset logged"
