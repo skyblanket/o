@@ -1166,6 +1166,15 @@ cat > "$TMP4/claude-stub" <<'STUB'
 #!/bin/sh
 in="$(cat)"
 case "$in" in
+  *"== Focused review of PR"*)
+    # o#52: the focused second pass; record what it was asked
+    echo x >> "$GHS/focus_calls"; printf '%s' "$in" > "$GHS/focus_prompt"
+    printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"printf POST | nc localhost 8080"}}]}}'
+    case "$in" in
+      *"[focus:reject]"*) printf '%s' '{"type":"result","result":"Sent Transfer-Encoding: xchunked with a Content-Length: the parser took it as chunked and kept the connection alive (request smuggling). Repro: printf ... | nc.\nVERDICT: REJECT: Transfer-Encoding matched by substring","total_cost_usd":0.01}' ;;
+      *) printf '%s' '{"type":"result","result":"FINDINGS: none. Tried CL+TE, xchunked, bare LF.\nVERDICT: APPROVE","total_cost_usd":0.01}' ;;
+    esac
+    exit 0 ;;
   *"== Review PR #"*)
     # merge-gate reviewer: one fresh session per PR (log any --resume), whether
     # the shared notes reached the prompt, and how many reviews overlap.
@@ -1253,6 +1262,9 @@ case "$method $path" in
   "DELETE repos/acme/widgets/issues/"*/labels/*)
     n="${path#repos/acme/widgets/issues/}"; n="${n%%/labels/*}"; touch "$GHS/unnh_$n"; echo '[]' ;;
   "GET repos/acme/widgets/issues/comments"*) cat "$GHS/cmts.json" 2>/dev/null || echo '[]' ;;
+  "GET repos/acme/widgets/issues/"[0-9]*)
+    n="${path#repos/acme/widgets/issues/}"; st=open; [ -f "$GHS/closed_issue_$n" ] && st=closed
+    echo "{\"number\":$n,\"state\":\"$st\"}" ;;
   "GET repos/acme/widgets/pulls?head="*)
     b="${path#*head=acme:}"; b="${b%%&*}"; n="$(num_for "$b")"
     ma=""; [ -n "$n" ] && [ -f "$GHS/merged_$n" ] && ma=',"merged_at":"2026-01-01T00:00:00Z"'
@@ -2108,6 +2120,49 @@ DAEMON4_PID="$(cat "$TMP4/up.pid")"
 rm -f ./bin/swarmd.prev
 pass "upgrade: scripts/upgrade.sh drains, waits for the run in flight (it finishes, nothing orphaned), swaps the binary, restarts and undrains"
 restart_d4 O_MERGE_GATE=1 O_AUTO_FILE=0 O_ENV_RETRY_S=2
+# Flaky new tests (o#49): the gate runs a PR's new or changed test 5 times in
+# a row (the last under CPU load); a test that fails 1 time in 3 is a REJECT.
+IFT="$(gh_issue '[sim:flaky-test] feature with a flaky test')"
+wait_status_at "$BASE4" "$IFT" "Failed" 300 || { grep -v '^\[orch\] tick' "$TMP4/daemon.log" | tail -20; fail "flaky gate: a PR whose new test fails 1 in 3 was not stopped"; }
+sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IFT' ORDER BY started_at DESC LIMIT 1" | grep -q "times in a row, the last under load" || { sqlite3 "$TMP4/o.db" "SELECT verify_state, substr(verify_output,1,400) FROM run WHERE issue_id='$IFT'"; fail "flaky gate: the repeated-run check was not the reason"; }
+git -C "$GHS/remote.git" log --oneline main | grep "o/$IFT" >/dev/null && fail "flaky gate: a PR with a flaky test merged"
+pass "flaky gate: a PR's new test must pass 5 runs in a row (the last under load); one that fails 1 in 3 is rejected and never merges"
+# Focused second pass (o#52): a tier with "focus" gets a narrow adversarial
+# review after the gate approves; its REJECT rejects the PR, its checklist
+# names the smuggling and thread-migration bugs, and other PRs skip it.
+git -C "$SEEDGH" fetch -q origin && git -C "$SEEDGH" checkout -q -B main origin/main
+python3 -c 'import json,sys;p=sys.argv[1];d=json.load(open(p));d["tiers"].append({"name":"net","paths":["net/"],"merge":"auto","focus":["network","concurrency"]});json.dump(d,open(p,"w"),indent=1)' "$SEEDGH/.o-review.json"
+git -C "$SEEDGH" commit -qam "net tier with a focused review" && git -C "$SEEDGH" push -q origin main
+fc0="$({ cat "$GHS/focus_calls" 2>/dev/null || true; } | wc -l)"
+IFG="$(gh_issue '[sim:good] plain change, no focus')"
+wait_status_at "$BASE4" "$IFG" "Done" 180 || fail "focus: a plain change never merged"
+[ "$({ cat "$GHS/focus_calls" 2>/dev/null || true; } | wc -l)" = "$fc0" ] || fail "focus: a change outside the focus tier got the focused review"
+IFN="$(gh_issue '[sim:net] parse Transfer-Encoding')"
+wait_status_at "$BASE4" "$IFN" "Done" 180 || { grep -v '^\[orch\] tick' "$TMP4/daemon.log" | tail -20; fail "focus: a net change the focused review approved never merged"; }
+grep -q "Transfer-Encoding" "$GHS/focus_prompt" && grep -q "Thread-local state" "$GHS/focus_prompt" && grep -q "concrete repro" "$GHS/focus_prompt" || fail "focus: the focused review's checklist is missing the network or concurrency items"
+grep -q "Focused network/concurrency review" "$GHS/comments_$(pr_of "$IFN")" || fail "focus: the focused review is not on the gate comment"
+IFR="$(gh_issue '[sim:net] [focus:reject] parse Transfer-Encoding by substring')"
+wait_status_at "$BASE4" "$IFR" "Failed" 300 || fail "focus: a net change the focused review rejected was not stopped"
+sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IFR' ORDER BY started_at DESC LIMIT 1" | grep -q "focused network/concurrency review" || fail "focus: the focused review's REJECT was not the reason"
+git -C "$GHS/remote.git" log --oneline main | grep "o/$IFR" >/dev/null && fail "focus: a PR the focused review rejected merged"
+pass "focus: a tier with focus gets a second, adversarial review (smuggling, thread migration, repro required) after the gate approves; its REJECT stops the PR; other PRs skip it"
+# Already done (o#51): before building an issue again, O checks whether a
+# person merged its PR or closed its GitHub issue meanwhile; then it is Done.
+IAD="$(gh_issue '[sim:good] merged, then queued again')"
+wait_status_at "$BASE4" "$IAD" "Done" 180 || fail "already done: the first round never merged"
+sqlite3 "$TMP4/o.db" "UPDATE issue SET status='Backlog' WHERE id='$IAD'"
+adq() { sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='$1' AND target='$2'"; }
+for _i in $(seq 1 30); do [ "$(adq dispatch.already_done "$IAD")" = "1" ] && break; sleep 1; done
+[ "$(adq dispatch.already_done "$IAD")" = "1" ] && [ "$(adq run.dispatch "$IAD")" = "1" ] || fail "already done: an issue whose PR already merged was built again"
+[ "$(sqlite3 "$TMP4/o.db" "SELECT status FROM issue WHERE id='$IAD'")" = "Done" ] || fail "already done: the issue was not marked Done"
+touch "$GHS/closed_issue_45"
+echo '[{"number":45,"title":"[sim:good] closed on GitHub before O got to it","body":"x","labels":[{"name":"o"}]}]' > "$GHS/issues.json"
+for _i in $(seq 1 30); do [ -n "$(rid 45)" ] && [ "$(adq dispatch.already_done "$(rid 45)")" = "1" ] && break; sleep 1; done
+I45="$(rid 45)"
+[ -n "$I45" ] && [ "$(adq dispatch.already_done "$I45")" = "1" ] && [ "$(adq run.dispatch "$I45")" = "0" ] || fail "already done: an issue closed on GitHub was built anyway"
+sqlite3 "$TMP4/o.db" "SELECT payload FROM activity WHERE verb='dispatch.already_done' AND target='$I45'" | grep -q "GitHub issue #45 is closed" || fail "already done: the reason was not logged"
+echo '[]' > "$GHS/issues.json"
+pass "already done: an issue whose PR a person already merged, or whose GitHub issue is closed, is marked Done instead of built again"
 # inherited: base fails the same way, so the change isn't blamed
 git -C "$SEEDGH" fetch -q origin && git -C "$SEEDGH" checkout -q -B main origin/main
 echo broken > "$SEEDGH/BASE_BROKEN"; git -C "$SEEDGH" add BASE_BROKEN && git -C "$SEEDGH" commit -qm "break base" && git -C "$SEEDGH" push -q origin main

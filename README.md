@@ -156,6 +156,10 @@ O edits real repositories on its own. The guard rails are the point.
   company / agent / approval writes (filing issues and feedback stays open);
   agent subprocesses never receive the token, so an agent can't rewrite its own
   `verify_cmd` or `protected_paths` through the API.
+- **No duplicate work.** Before building an issue again, O checks whether a
+  person already merged its PR or closed its GitHub issue. If so, it marks
+  the issue Done (`dispatch.already_done`, with the reason) instead of
+  rebuilding it.
 - **Everything on a branch.** Each issue runs on `o/<issue>` in its own worktree.
   Green work lands with a `--no-ff` merge that names the branch. If the merge
   regresses the base (post-merge verify goes red, and stays red on a re-run so a
@@ -212,6 +216,22 @@ O edits real repositories on its own. The guard rails are the point.
   carries an **O merge record**: the commit, the gate's verdict and model,
   the risks found, O's checks and their results, attempts, failures on the
   way, and cost.
+- **New tests must pass every time.** The gate runs each test a PR adds or
+  changes `O_GATE_FLAKE_RUNS` (5) times in a row, the last one under CPU load
+  with the repo's `"flake_load_env"` set (e.g. `SW_SCHEDULERS=1`). A test that
+  fails on any of those runs rejects the PR as flaky.
+- **A focused second review for risky code.** A tier with
+  `"focus": ["network", "concurrency"]` gets a second, narrow review after the
+  gate approves. It works from an adversarial checklist:
+  - request smuggling and framing ambiguity (CL/TE, exact token matching,
+    duplicate headers);
+  - size overflow and buffer limits;
+  - thread-local state across a yield or migration, memory ordering, lost
+    wakeups, shutdown and slot reuse.
+
+  Every finding needs a repro the reviewer ran, or it must say
+  `FINDINGS: none`. A REJECT here rejects the PR, and no verdict at all counts
+  as UNVERIFIED.
 - **Risk by what a change does.** Some risks don't live in one path. A change
   gets the strictest gate (`O_MERGE_MODEL` plus every tier's extra checks)
   when it does any of these, and the gate comment names each risk found:
@@ -541,6 +561,7 @@ The daemon reads its configuration from the environment. All are optional.
 | `O_POLICY` | _(off)_ | `1`: keep `docs/O-POLICY.md` current in each GitHub repo, landed through O's own pipeline. |
 | `O_POLICY_S` | `3600` | how often O compares the repo's policy with the one it generates. |
 | `O_ADAPT` | `1` | adaptive starting model: when haiku passed verify in at most 25% of 3+ runs on a tier over 7 days (environment, inherited, CI-timeout and agent-crash failures don't count), new work on that tier starts one rung up. Each choice is logged as `model.adapt` with its numbers. `0` turns it off. |
+| `O_GATE_FLAKE_RUNS` | `5` | how many runs in a row a PR's new or changed test must pass at the gate (the last under load); `1` turns it off. |
 | `O_VERIFY_RETRY` | `1` | a failed verify is re-run once before it counts. Fail-then-pass is logged `verify.flaky` and ships with no retry. `0` turns it off. |
 | `O_REVIEW_MODEL` | `sonnet` | model for the pre-PR reviewer. |
 | `O_GH_BIN` | `gh` on `PATH` | GitHub CLI used for issue import and PRs. |
