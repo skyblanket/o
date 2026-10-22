@@ -701,7 +701,9 @@ pass "ci rerun: a failed check is re-run once; passing on re-run merges with no 
 touch "$GHS/no_actions"
 IID_FL2="$(gh_issue '[sim:good] ci flakes, no rerun permission')"
 echo "o/$IID_FL2" >> "$GHS/flaky_ci"; echo "o/$IID_FL2" >> "$GHS/hold_ci"
-for _i in $(seq 1 60); do [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='ci.start' AND target='$IID_FL2'")" -ge 1 ] && break; sleep 1; done
+# Base must move AFTER the PR's branch is pushed, or the PR is never behind it.
+for _i in $(seq 1 180); do [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='ci.start' AND target='$IID_FL2'")" -ge 1 ] && [ -n "$(pr_of "$IID_FL2" 2>/dev/null)" ] && break; sleep 1; done
+[ -n "$(pr_of "$IID_FL2" 2>/dev/null)" ] || { tail -30 "$TMP4/daemon.log"; fail "ci rerun: the no-permission PR never opened (no CI to hold)"; }
 tmpf="$(mktemp -d)"; git clone -q "$GHS/remote.git" "$tmpf/c"
 echo fix > "$tmpf/c/base-fix.txt"; git -C "$tmpf/c" add base-fix.txt
 git -C "$tmpf/c" -c user.email=h@x -c user.name=human commit -q -m "base moves on"
