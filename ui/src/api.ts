@@ -65,6 +65,25 @@ export interface PersonaRun {
   cost_cents: number; issue_id: string; for_issue_id: string;
 }
 
+// one entry of an issue's activity log (GET /issues/:id/activity)
+export interface IssueEvent { actor: string; verb: string; ts: number; payload: string | null; }
+// the board's view of an open issue: its PR, CI, the gate's decision and,
+// In Review, why it waits (GET /companies/:id/board)
+export interface BoardRow {
+  id: string; pr: number; ci: "" | "pending" | "green" | "red";
+  gate: string; gate_reason: string; gate_model: string; waiting: string;
+}
+// spend by kind per day (GET /companies/:id/spend?days=N)
+export interface SpendView {
+  days: number; today: number; rows: { day: number; kind: string; cents: number }[];
+  merges: number; total_cents: number; cost_per_merge_cents: number;
+}
+// the gate's effective config (GET /companies/:id/gate)
+export interface GateInfo {
+  config: Record<string, unknown>; maintainer_session: string; maintainer_reviews: number | null;
+  config_protected: number; merge_gate: number; ship: string; github_repo: string;
+}
+
 async function req<T>(path: string, opts?: RequestInit): Promise<T> {
   const r = await fetch(BASE + path, {
     ...opts,
@@ -109,6 +128,11 @@ export const api = {
     post(`/personas/${id}`, b) as Promise<Persona>,
   personaRuns: (cid: string) => req<PersonaRun[]>(`/companies/${cid}/persona_runs`),
   agentMessages: (id: string) => req<Message[]>(`/agents/${id}/messages`),
+  issueActivity: (id: string) => req<IssueEvent[]>(`/issues/${id}/activity`),
+  board: (cid: string) => req<BoardRow[]>(`/companies/${cid}/board`),
+  spend: (cid: string, days = 14) => req<SpendView>(`/companies/${cid}/spend?days=${days}`),
+  gate: (cid: string) => req<GateInfo>(`/companies/${cid}/gate`),
+  rotateGate: (cid: string) => post(`/companies/${cid}/gate/rotate`, {}) as Promise<GateInfo>,
   agentChat: (id: string, message: string) => post(`/agents/${id}/chat`, { message }),
 };
 

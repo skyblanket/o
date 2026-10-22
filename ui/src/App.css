@@ -182,3 +182,34 @@
     border-right-color: var(--border);
   }
 }
+
+/* pipeline (o#5) */
+.pipe { display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
+.pipe-row { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; font-size: 12px; }
+.pipe-n { color: var(--faint); width: 26px; }
+.pstep { padding: 2px 7px; border-radius: 4px; border: 1px solid var(--line, #333); color: var(--dim); }
+.pstep em { font-style: normal; margin-left: 4px; color: var(--faint); }
+.pstep.done { border-color: var(--green); color: var(--green); }
+.pstep.red { border-color: var(--red); color: var(--red); }
+.pstep.wait { border-color: #c9a227; color: #c9a227; }
+.pstep.running { border-color: var(--dim); color: var(--text, inherit); }
+.pstep.skip { opacity: .35; }
+/* PR / CI / gate on cards (o#6) */
+.prline { display: flex; align-items: center; gap: 6px; margin-top: 6px; font-size: 11px; }
+.prchip { padding: 1px 6px; border-radius: 4px; border: 1px solid var(--line, #333); color: var(--dim); text-decoration: none; }
+.cidot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); display: inline-block; }
+.cidot.green { background: var(--green); } .cidot.red { background: var(--red); } .cidot.pending { background: #c9a227; }
+.gchip { padding: 1px 6px; border-radius: 4px; font-weight: 600; }
+.gchip.approve { color: var(--green); } .gchip.reject { color: var(--red); }
+.gchip.human, .gchip.unverified, .gchip.shadow { color: #c9a227; }
+.waiting { margin-top: 4px; font-size: 11px; color: #c9a227; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* spend (o#7) */
+.spend { margin-top: 10px; }
+.spend .bars { display: flex; align-items: flex-end; gap: 3px; height: 46px; }
+.spend .bar { flex: 1; height: 100%; display: flex; flex-direction: column-reverse; background: rgba(127,127,127,.08); border-radius: 2px; }
+.spend .legend { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 5px; font-size: 11px; color: var(--dim); }
+.spend .legend i { display: inline-block; width: 8px; height: 8px; margin-right: 4px; border-radius: 2px; }
+.seg.agent { background: #4c8bf5; } .seg.reviewer { background: #9b6ef3; } .seg.gate { background: #e8833a; }
+.seg.planner { background: #3fb68b; } .seg.reflect { background: #8a8a8a; } .seg.persona { background: #d14d72; }
+/* gate panel (o#8) */
+.gatepanel { margin-top: 10px; }

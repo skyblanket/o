@@ -93,6 +93,9 @@ fun migrate(db) {
     _ix_les   = db_exec(db, "CREATE INDEX IF NOT EXISTS ix_lesson_sig ON lesson (company_id, sig)")
     # o#63: tests that failed and then passed on an identical re-run
     _flaky    = db_exec(db, "CREATE TABLE IF NOT EXISTS flaky (company_id TEXT, key TEXT, count INTEGER DEFAULT 0, last_ts INTEGER, PRIMARY KEY (company_id, key))")
+    # o#7: every cost by kind (agent, reviewer, gate, planner, reflect, persona)
+    _spend    = db_exec(db, "CREATE TABLE IF NOT EXISTS spend (company_id TEXT, kind TEXT, cents REAL, issue_id TEXT, ts INTEGER)")
+    _ix_spend = db_exec(db, "CREATE INDEX IF NOT EXISTS ix_spend_ts ON spend (company_id, ts)")
     # o#70: production errors, one row per tracker id / fingerprint
     _errors   = db_exec(db, "CREATE TABLE IF NOT EXISTS errors (company_id TEXT, key TEXT, issue_id TEXT, count INTEGER DEFAULT 0, users INTEGER DEFAULT 0, fresh INTEGER DEFAULT 0, escaped INTEGER DEFAULT 0, first_ts INTEGER, last_ts INTEGER, PRIMARY KEY (company_id, key))")
     # o#69: per tier, how many shadow PRs people merged unchanged in a row

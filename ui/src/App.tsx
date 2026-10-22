@@ -3,6 +3,7 @@ import {
   api, money, ago, dur, initials,
   type Company, type Issue, type Agent, type Run, type Activity, type Orchestrator, type Message,
   type Persona, type PersonaRun, type PersonaReport,
+  type IssueEvent, type BoardRow, type SpendView, type GateInfo,
 } from "./api";
 
 const LANES = ["Backlog", "In Progress", "Verifying", "In Review", "Done", "Failed"];
@@ -211,15 +212,28 @@ function Manage({ company, onClose, done }: { company: Company; onClose: () => v
   const [repo, setRepo] = useState(company.repo || "");
   const [verifyCmd, setVerifyCmd] = useState(company.verify_cmd || "");
   const [protectedPaths, setProtectedPaths] = useState(company.protected_paths || "");
+  const [ghRepo, setGhRepo] = useState(company.github_repo || "");
+  const [ship, setShip] = useState(company.ship || "merge");
+  const [err, setErr] = useState("");
+  const [gate, setGate] = useState<GateInfo | null>(null);
   const [picking, setPicking] = useState(false);
+  useEffect(() => { api.gate(company.id).then(setGate).catch(() => {}); }, [company.id]);
   const save = async () => {
-    await api.updateCompany(company.id, {
-      budget_monthly_cents: Math.round((parseFloat(budget) || 0) * 100),
-      budget_daily_cents: Math.round((parseFloat(daily) || 0) * 100),
-      status, repo: repo.trim(), verify_cmd: verifyCmd.trim(),
-      protected_paths: protectedPaths.trim(),
-    });
-    done();
+    setErr("");
+    try {
+      await api.updateCompany(company.id, {
+        budget_monthly_cents: Math.round((parseFloat(budget) || 0) * 100),
+        budget_daily_cents: Math.round((parseFloat(daily) || 0) * 100),
+        status, repo: repo.trim(), verify_cmd: verifyCmd.trim(),
+        protected_paths: protectedPaths.trim(),
+        github_repo: ghRepo.trim(), ship,
+      });
+      done();
+    } catch (e) {
+      setErr(ship === "pr" && !ghRepo.includes("/")
+        ? "PR mode needs a GitHub repo as owner/name."
+        : "The daemon refused this change (" + String((e as Error).message) + ").");
+    }
   };
   return (
     <>
@@ -247,9 +261,46 @@ function Manage({ company, onClose, done }: { company: Company; onClose: () => v
           </Field>
         </div>
         <p className="hint">Set status to <b>active</b> to resume a company that was budget- or no-signal-paused.</p>
+        <div className="row3">
+          <Field label="GitHub repo (owner/name)"><input value={ghRepo} onChange={e => setGhRepo(e.target.value)} placeholder="acme/widgets" /></Field>
+          <Field label="Ship">
+            <select value={ship} onChange={e => setShip(e.target.value)}>
+              <option value="merge">merge (local branch merge)</option><option value="pr">pr (GitHub PR + gate)</option>
+            </select>
+          </Field>
+        </div>
+        {err && <div className="warn">{err}</div>}
+        {gate && <GatePanel cid={company.id} g={gate} onRotated={setGate} />}
       </Modal>
       {picking && <FolderPicker onClose={() => setPicking(false)} onPick={p => { setRepo(p); setPicking(false); }} />}
     </>
+  );
+}
+
+// The merge gate as the daemon sees it: .o-review.json on base, read-only (o#8)
+function GatePanel({ cid, g, onRotated }: { cid: string; g: GateInfo; onRotated: (g: GateInfo) => void }) {
+  type Tier = { name?: string; paths?: string[]; merge?: string; gate_model?: string; focus?: string[]; extra?: string[] };
+  const cfg = g.config as { build?: string; suite?: string; required_checks?: string[]; test_runners?: { paths?: string[] }[]; tiers?: Tier[] };
+  const tiers: Tier[] = Array.isArray(cfg.tiers) ? cfg.tiers : [];
+  return (
+    <div className="gatepanel">
+      <h4 className="sec">Merge gate {g.merge_gate ? "· on" : "· off (O_MERGE_GATE)"}</h4>
+      {!g.config_protected && g.ship === "pr" &&
+        <div className="warn">.o-review.json isn't in protected paths: an agent could edit the gate's own config. Add it.</div>}
+      {Object.keys(cfg).length === 0
+        ? <div className="hint">No .o-review.json on the base branch.</div>
+        : <div className="mono box">
+            <div>build: {String(cfg.build || "—")}</div>
+            <div>suite: {String(cfg.suite || "—")}</div>
+            <div>required checks: {(cfg.required_checks || []).join(", ") || "—"}</div>
+            <div>test runners: {(cfg.test_runners || []).map(t => (t.paths || []).join(",")).join("; ") || "—"}</div>
+            {tiers.map((t, n) => <div key={n}>tier {t.name}: {(t.paths || []).join(", ")} · {t.merge || "auto"}{t.gate_model ? " · gate " + t.gate_model : ""}{t.focus ? " · focus " + t.focus.join("/") : ""}{t.extra ? " · extra: " + t.extra.join("; ") : ""}</div>)}
+          </div>}
+      <div className="runrow">
+        <span>maintainer session: <code>{g.maintainer_session ? g.maintainer_session.slice(0, 12) : "none"}</code> · {g.maintainer_reviews || 0} reviews</span>
+        <button className="sm" style={{ marginLeft: "auto" }} onClick={() => api.rotateGate(cid).then(onRotated).catch(() => {})}>Rotate now</button>
+      </div>
+    </div>
   );
 }
 
@@ -301,6 +352,59 @@ function Activity({ e }: { e: AnyEvent }) {
     return <div className="evt done">✓ done · ${usd.toFixed(4)}</div>;
   }
   return null;
+}
+
+// ---- an issue's pipeline, one row per attempt (o#5) -----------------
+// Each step's state comes from the activity verbs logged inside that attempt's
+// time window (from its run's start to the next run's start).
+const STEPS: { k: string; label: string; start: string[]; ok: string[]; red: string[]; wait?: string[] }[] = [
+  { k: "agent", label: "agent", start: ["run.dispatch", "run.resume"], ok: ["run.succeeded", "verify.start"], red: ["run.failed", "run.stalled", "run.needs_human"] },
+  { k: "verify", label: "verify", start: ["verify.start"], ok: ["verify.pass", "verify.flaky", "verify.inherited"], red: ["verify.fail"] },
+  { k: "review", label: "review", start: ["review.start"], ok: ["review.pass"], red: ["review.reject"] },
+  { k: "ci", label: "PR + CI", start: ["ci.start"], ok: ["gate.start", "ci.awaiting_review"], red: ["ci.fail"] },
+  { k: "gate", label: "merge gate", start: ["gate.start"], ok: ["gate.approve"], red: ["gate.reject"], wait: ["gate.human", "gate.unverified", "shadow.park"] },
+  { k: "merge", label: "merge", start: ["merge.queued"], ok: ["ci.merged", "merge.done", "pr.merged"], red: ["merge.conflict", "merge.revert"] },
+];
+
+function Pipeline({ issue, runs }: { issue: Issue; runs: Run[] }) {
+  const [evs, setEvs] = useState<IssueEvent[]>([]);
+  const live = runs.some(r => r.state === "Running" || r.state === "Verifying");
+  useEffect(() => {
+    let off = false;
+    const load = () => api.issueActivity(issue.id).then(e => { if (!off) setEvs(e); }).catch(() => {});
+    load();
+    const t = live ? setInterval(load, 2000) : undefined;
+    return () => { off = true; if (t) clearInterval(t); };
+  }, [issue.id, live]);
+  if (runs.length === 0) return null;
+  const ordered = [...runs].sort((a, b) => a.started_at - b.started_at);
+  return <>
+    <h4 className="sec">Pipeline</h4>
+    <div className="pipe">
+      {ordered.map((r, n) => {
+        const end = n + 1 < ordered.length ? ordered[n + 1].started_at : Infinity;
+        const mine = evs.filter(e => e.ts >= r.started_at - 1000 && e.ts < end);
+        const at = (vs: string[]) => mine.find(e => vs.includes(e.verb))?.ts;
+        return (
+          <div className="pipe-row" key={r.id}>
+            <span className="pipe-n">#{r.attempt}</span>
+            {STEPS.map(s => {
+              const t0 = at(s.start), tr = at(s.red), tok = at(s.ok), tw = s.wait ? at(s.wait) : undefined;
+              const st = tr ? "red" : tok ? "done" : tw ? "wait" : t0 ? "running" : "skip";
+              const t1 = tr || tok || tw;
+              return (
+                <span key={s.k} className={"pstep " + st}
+                  title={st === "red" ? (r.verify_state || s.label + " failed") : st}>
+                  {s.label}{t0 && t1 ? <em>{dur(t0, t1)}</em> : null}
+                </span>
+              );
+            })}
+            <span className={"vchip " + verifyClass(r.verify_state || "")} style={{ marginLeft: "auto" }}>{r.verify_state || r.state}</span>
+          </div>
+        );
+      })}
+    </div>
+  </>;
 }
 
 // ---- issue detail (editable + live agent activity) ----------------
@@ -371,6 +475,7 @@ function IssueModal({ issue, agents, runs, onClose, done }: {
       {issue.body
         ? <div className="box">{issue.body}</div>
         : <div className="hint">No details provided.</div>}
+      <Pipeline issue={issue} runs={mine} />
       <h4 className="sec">Runs ({mine.length})</h4>
       {mine.length ? mine.map(r => (
         <div className="runrow" key={r.id}>
@@ -554,6 +659,18 @@ function CompanyView({ company, issues, agents, onIssue, onNewIssue, onHire, onM
   };
   const pauseLabel = PAUSE_LABEL[company.pause_reason] || company.pause_reason;
   const [tab, setTab] = useState<"board" | "personas">("board");
+  const [board, setBoard] = useState<Record<string, BoardRow>>({});
+  const [spend, setSpend] = useState<SpendView | null>(null);
+  useEffect(() => {
+    let off = false;
+    const load = () => {
+      api.board(company.id).then(b => { if (!off) setBoard(Object.fromEntries(b.map(r => [r.id, r]))); }).catch(() => {});
+      api.spend(company.id, 14).then(s => { if (!off) setSpend(s); }).catch(() => {});
+    };
+    load();
+    const t = setInterval(load, 5000);
+    return () => { off = true; clearInterval(t); };
+  }, [company.id]);
   return (
     <div className="main">
       <div className="cohead">
@@ -582,6 +699,7 @@ function CompanyView({ company, issues, agents, onIssue, onNewIssue, onHire, onM
           <div><div className="k">Agents</div><div className="vv">{agents.length}</div></div>
           {over && <div className="warn">⚠ budget cap reached — paused</div>}
         </div>
+        {spend && <SpendBars s={spend} />}
       </div>
       <div className="tabs">
         <button className={tab === "board" ? "on" : ""} onClick={() => setTab("board")}>Board</button>
@@ -618,6 +736,7 @@ function CompanyView({ company, issues, agents, onIssue, onNewIssue, onHire, onM
                         {origin && <span className="ochip" style={{ marginLeft: 6 }}>{origin}</span>}
                       </div>
                       <div className="ti">{i.title}</div>
+                      {board[i.id] && <CardPr row={board[i.id]} repo={company.github_repo} lane={lane} />}
                       <div className="ft">
                         <span className="pri">{i.priority || "medium"}</span>
                         {ag && <span className="av" style={{ marginLeft: "auto" }} title={ag.name}>{initials(ag.name)}</span>}
@@ -631,6 +750,47 @@ function CompanyView({ company, issues, agents, onIssue, onNewIssue, onHire, onM
         })}
       </div>
       </>}
+    </div>
+  );
+}
+
+// PR chip, CI dot and gate chip on a card; In Review, why it waits (o#6)
+function CardPr({ row, repo, lane }: { row: BoardRow; repo: string; lane: string }) {
+  if (!row.pr && !row.gate && !row.waiting) return null;
+  return <>
+    <div className="prline" onClick={e => e.stopPropagation()}>
+      {row.pr > 0 && (repo
+        ? <a className="prchip" href={`https://github.com/${repo}/pull/${row.pr}`} target="_blank" rel="noreferrer">#{row.pr}</a>
+        : <span className="prchip">#{row.pr}</span>)}
+      {row.ci && <span className={"cidot " + row.ci} title={"CI " + row.ci} />}
+      {row.gate && <span className={"gchip " + row.gate.toLowerCase()} title={row.gate_reason}>{row.gate}</span>}
+    </div>
+    {lane === "In Review" && row.waiting && <div className="waiting" title={row.waiting}>{row.waiting}</div>}
+  </>;
+}
+
+// Spend by kind for the last 14 days, a bar per day (o#7)
+const KINDS = ["agent", "reviewer", "gate", "planner", "reflect", "persona"];
+function SpendBars({ s }: { s: SpendView }) {
+  const today = s.today;
+  const days = Array.from({ length: s.days }, (_, n) => today - s.days + 1 + n);
+  const of = (d: number, k: string) => s.rows.find(r => r.day === d && r.kind === k)?.cents || 0;
+  const tot = (d: number) => KINDS.reduce((a, k) => a + of(d, k), 0);
+  const max = Math.max(1, ...days.map(tot));
+  const week = (k: string) => days.slice(-7).reduce((a, d) => a + of(d, k), 0);
+  return (
+    <div className="spend">
+      <div className="bars">
+        {days.map(d => (
+          <div className="bar" key={d} title={new Date(d * 86400000).toISOString().slice(0, 10) + " · " + money(tot(d))}>
+            {KINDS.map(k => of(d, k) > 0 && <div key={k} className={"seg " + k} style={{ height: (100 * of(d, k) / max) + "%" }} />)}
+          </div>
+        ))}
+      </div>
+      <div className="legend">
+        {KINDS.map(k => <span key={k}><i className={"seg " + k} />{k} {money(week(k))}</span>)}
+        <span>· 7 days · {money(s.cost_per_merge_cents)} per merge ({s.merges} merges in {s.days} days)</span>
+      </div>
     </div>
   );
 }
