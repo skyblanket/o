@@ -542,6 +542,7 @@ The daemon reads its configuration from the environment. All are optional.
 | `O_PORT` | `4100` | HTTP port. |
 | `O_BROKEN_RUNS` | `3` | agent-broken breaker: when a company's last N finished runs, on at least two issues, all ended with no commit or a crash, the company is paused `agent-broken`, one diagnostic issue carries the agent's last words and `err.log`, and the issues go back to Backlog. `0` turns it off. |
 | `O_PREFLIGHT` | on when a claude-code agent exists | `1`/`0` forces the boot probe on or off: one sandboxed agent run (`O_PREFLIGHT_MODEL`, default `haiku`) must write `probe.txt` in a scratch repo before anything is dispatched. If it can't, dispatch stays held and `GET /api/orchestrator` shows `preflight` with what the CLI said; fix the cause and restart. |
+| `O_WS_TRIES` | `5` | a run whose git worktree can't be created (its branch held by another worktree, say) never started: it is retried at the same attempt with git's error on the run, and the issue fails only after this many. A parent waits while its "Fix failing verification" follow-up is open. |
 | `O_PUBLIC_READONLY` | unset | `1` serves GET routes only, for exposing the UI through a tunnel: every write, issue filing included, and `/api/fs` get 403. |
 | `O_CLAUDE_BIN` | `claude` on `PATH` | claude-code binary for the `claude-code` runtime. |
 | `O_SWARM_BIN` | `swarm-code` on `PATH` | binary for the `swarm-code` runtime. |

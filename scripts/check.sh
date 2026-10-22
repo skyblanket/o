@@ -2070,6 +2070,24 @@ sleep 3
 nr="$(sqlite3 "$TMPT/o.db" "SELECT COUNT(*) FROM run r JOIN issue i ON i.id = r.issue_id WHERE i.company_id='$CIDB'")"
 [ "$nr" -le 4 ] || thr_fail "breaker: $nr runs before it tripped (want it to stop after 3, at most one more in flight)"
 pass "breaker: 3 no-commit runs across issues pause the company agent-broken, file one diagnostic, and put the issues back in Backlog ($nr runs spent)"
+# No workspace (o#33): another worktree holds the issue's branch, so git
+# can't create the run's worktree. That run never started: it is retried
+# without spending an attempt and git's error is recorded; once the branch is
+# free the issue ships.
+CIDW="$(jget "$(ocurl -s -X POST "$BASET/api/companies" -H 'Content-Type: application/json' \
+  -d "{\"name\":\"Ws Co\",\"issue_prefix\":\"WSC\",\"budget_monthly_cents\":1000000,\"repo\":\"$SCRT\",\"verify_cmd\":\"true\"}")" 'd["id"]')"
+IIDW="$(jget "$(ocurl -s -X POST "$BASET/api/companies/$CIDW/issues" -H 'Content-Type: application/json' -d '{"title":"[sim:good] branch held elsewhere"}')" 'd["id"]')"
+git -C "$SCRT" worktree add -q "$TMPT/holder" -b "o/$IIDW"
+ocurl -s -X POST "$BASET/api/companies/$CIDW/agents" -H 'Content-Type: application/json' -d '{"name":"Ws","runtime":"sim"}' >/dev/null
+for _i in $(seq 1 60); do [ "$(sqlite3 "$TMPT/o.db" "SELECT COUNT(*) FROM activity WHERE verb='run.no_workspace' AND target='$IIDW'")" -ge 2 ] && break; sleep 0.5; done
+[ "$(sqlite3 "$TMPT/o.db" "SELECT COUNT(*) FROM activity WHERE verb='run.no_workspace' AND target='$IIDW'")" -ge 2 ] || thr_fail "no workspace: run.no_workspace not logged twice"
+[ "$(sqlite3 "$TMPT/o.db" "SELECT status FROM issue WHERE id='$IIDW'")" != "Failed" ] || thr_fail "no workspace: the issue failed although no run ever started"
+sqlite3 "$TMPT/o.db" "SELECT verify_output FROM run WHERE issue_id='$IIDW' AND verify_state='no_workspace' LIMIT 1" | grep -q "already" || thr_fail "no workspace: git's error is not recorded on the run"
+git -C "$SCRT" worktree remove --force "$TMPT/holder"
+for _i in $(seq 1 90); do [ "$(sqlite3 "$TMPT/o.db" "SELECT status FROM issue WHERE id='$IIDW'")" = "Done" ] && break; sleep 0.5; done
+[ "$(sqlite3 "$TMPT/o.db" "SELECT status FROM issue WHERE id='$IIDW'")" = "Done" ] || thr_fail "no workspace: once the branch was free the issue did not ship"
+[ "$(sqlite3 "$TMPT/o.db" "SELECT MAX(attempt) FROM run WHERE issue_id='$IIDW'")" = "1" ] || thr_fail "no workspace: runs that never started spent attempts"
+pass "no workspace: a branch held by another worktree is retried at the same attempt with git's error recorded; freed, the issue ships"
 stop_daemon "$DT"; rmtmp "$TMPT"
 pass "thread room: SW_SCHEDULERS=4 runs at most $maxf worker(s) at once, logs dispatch.throttled, the API answers within 1s throughout"
 
