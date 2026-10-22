@@ -613,6 +613,7 @@ curl http://localhost:4100/api/companies/<id>/spend?days=14   # spend by role pe
 curl http://localhost:4100/api/companies/<id>/gate    # the gate's .o-review.json and session
 curl http://localhost:4100/api/issues/<id>/activity   # one issue's pipeline, in order
 curl http://localhost:4100/api/companies/<id>/maintainer  # the merge gate's shared notes, session and review count
+curl http://localhost:4100/api/issues/<id>/costs   # spend by stage (agent, review, gate, ...); also /api/runs/<id>/costs
 curl http://localhost:4100/api/waiting        # everything waiting on a person, oldest first
 curl http://localhost:4100/api/proof          # the track record
 ```

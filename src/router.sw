@@ -271,6 +271,7 @@ fun route(db, dbpath, conn, method, path, body) {
         p when string_starts_with(p, "/api/approvals/") == 'true' -> decide_approval(db, conn, method, p, body)
         p when string_starts_with(p, "/api/runs/") == 'true' -> run_result(db, conn, p)
         p when string_starts_with(p, "/api/issues/") == 'true' && string_ends_with(p, "/retry") == 'true' -> route_retry(db, conn, method, p, body)
+        p when string_starts_with(p, "/api/issues/") == 'true' && string_ends_with(p, "/costs") == 'true' -> respond(conn, 200, json_encode(Store.costs_by_stage(db, "issue_id", string_sub(p, 12, string_length(p) - 12 - 6))))
         p when string_starts_with(p, "/api/issues/") == 'true' && string_ends_with(p, "/activity") == 'true' -> respond(conn, 200, json_encode(Store.activity_for_target(db, string_sub(p, 12, string_length(p) - 12 - 9))))
         p when string_starts_with(p, "/api/issues/") == 'true' -> route_issue(db, conn, method, p, body)
         p when string_starts_with(p, "/api/agents/") == 'true' -> route_agent(db, dbpath, conn, method, p, body)
@@ -884,9 +885,11 @@ fun run_result(db, conn, p) {
             errlog = read_first(f"{ws}/err.log", f"{arc}/err.log")
             respond(conn, 200, json_encode(%{workspace: ws, result: res, stream: stream, error: errlog, verify_state: default_str(map_get(run, "verify_state"), ""), verify_output: default_str(map_get(run, "verify_output"), ""), merge_sha: default_str(map_get(run, "merge_sha"), "")}))
         }
+    } else { if (string_ends_with(rest, "/costs") == 'true') {
+        respond(conn, 200, json_encode(Store.costs_by_stage(db, "run_id", string_sub(rest, 0, string_length(rest) - 6))))
     } else {
         respond(conn, 404, err_json("not found"))
-    }
+    }}
 }
 
 # Read the first of two paths that exists, else "". Lets a run's artifacts be

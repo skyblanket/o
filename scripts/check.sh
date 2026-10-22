@@ -1207,6 +1207,13 @@ gi="$(ocurl -s "$BASE4/api/companies/$CIDG/gate")"
 gr="$(ocurl -s -X POST "$BASE4/api/companies/$CIDG/gate/rotate" -H 'Content-Type: application/json' -d '{}')"
 [ "$(jget "$gr" 'd["maintainer_session"] == ""')" = "True" ] || fail "ui: rotating the maintainer session did not clear it"
 pass "ui: the board (PR, CI, gate, why waiting), spend by role with cost per merge, an issue's activity and the gate's config are served; rotate clears the maintainer session"
+# o#39: an issue's cost and its run's cost, by stage
+ic="$(ocurl -s "$BASE4/api/issues/$IS3/costs")"
+[ "$(jget "$ic" '{r["kind"] for r in d["by_stage"]} >= {"agent", "gate"} and d["total_cents"] > 0')" = "True" ] || { echo "$ic"; fail "costs: an issue's cost is not broken down by stage (agent, gate)"; }
+rid3="$(sqlite3 "$TMP4/o.db" "SELECT id FROM run WHERE issue_id='$IS3' ORDER BY started_at DESC LIMIT 1")"
+rc="$(ocurl -s "$BASE4/api/runs/$rid3/costs")"
+[ "$(jget "$rc" '"gate" in {r["kind"] for r in d["by_stage"]} and d["total_cents"] > 0')" = "True" ] || { echo "$rc"; fail "costs: the run's gate cost is not attributed to the run"; }
+pass "costs: GET /api/issues/:id/costs and /api/runs/:id/costs break spend down by stage (agent, gate, ...)"
 # inherited: base fails the same way, so the change isn't blamed
 git -C "$SEEDGH" fetch -q origin && git -C "$SEEDGH" checkout -q -B main origin/main
 echo broken > "$SEEDGH/BASE_BROKEN"; git -C "$SEEDGH" add BASE_BROKEN && git -C "$SEEDGH" commit -qm "break base" && seed_push
