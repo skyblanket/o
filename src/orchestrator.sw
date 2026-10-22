@@ -1655,6 +1655,7 @@ fun sim_marker_base(title) {
     else { if (string_contains(title, "[sim:regress]") == 'true') { "regress" }
     else { if (string_contains(title, "[sim:real-test]") == 'true') { "real-test" }
     else { if (string_contains(title, "[sim:vacuous-test]") == 'true') { "vacuous-test" }
+    else { if (string_contains(title, "[sim:flaky-test]") == 'true') { "flaky-test" }
     else { if (string_contains(title, "[sim:risky]") == 'true') { "risky" }
     else { if (string_contains(title, "[sim:docs]") == 'true') { "docs" }
     else { if (string_contains(title, "[sim:unskip-test]") == 'true') { "unskip-test" }
@@ -1670,7 +1671,7 @@ fun sim_marker_base(title) {
     else { if (string_contains(title, "[sim:env]") == 'true') { "env" }
     else { if (string_contains(title, "[sim:migrate-docs]") == 'true') { "migrate-docs" }
     else { if (string_contains(title, "[sim:loosen]") == 'true') { "loosen" }
-    else { "good" }}}}}}}}}}}}}}}}}}}}}}
+    else { "good" }}}}}}}}}}}}}}}}}}}}}}}
 }
 
 # Carry out the marker's action in the worktree. Every case except no-commit
@@ -1710,6 +1711,10 @@ fun sim_act_base(workspace, issue_id, marker, protected) {
                     # a feature plus a test that needs it: fails without the change
                     _f = file_write(f"{workspace}/feat_{issue_id}", "on")
                     sim_commit(workspace, f"tests/t_{issue_id}.sh", f"[ -f feat_{issue_id} ]")
+                } else { if (marker == "flaky-test") {
+                    # a real test that also fails every third run
+                    _f = file_write(f"{workspace}/feat_{issue_id}", "on")
+                    sim_commit(workspace, f"tests/t_{issue_id}.sh", f"[ -f feat_{issue_id} ] || exit 1; c=/tmp/o-flake-{issue_id}; n=$(( $(cat $c 2>/dev/null || echo 0) + 1 )); echo $n > $c; [ $((n % 3)) -ne 0 ]")
                 } else { if (marker == "vacuous-test") {
                     # a "test" that passes whether or not the change exists
                     _f = file_write(f"{workspace}/feat_{issue_id}", "on")
@@ -1752,7 +1757,7 @@ fun sim_act_base(workspace, issue_id, marker, protected) {
                     sh(f"cd {workspace} && git rm -q sim_{issue_id}.txt && git commit -q -m sim-undo")
                 } else {
                     sim_commit(workspace, f"sim_{issue_id}.txt", "ok")
-                }}}}}}}}}}}}}}}}}}
+                }}}}}}}}}}}}}}}}}}}
                 }
             }
         }
@@ -3168,6 +3173,10 @@ fun mechanical_steps(cfg, rv, rvb, added, new_files, tier, tpr, tbase) {
     runners = cfg_list(cfg, "test_runners")
     tests = Std.filter([test_for(runners, f) for f in added], fn(t) { t != nil })
     on_pr = [%{label: "new/changed test passes on the PR: " ++ map_get(t, "file"), dir: rv, cmd: map_get(t, "cmd"), want: "pass", key: ckey(kpr, map_get(t, "cmd"))} for t in tests]
+    # o#49: a flaky test passes once; it has to pass K times in a row, the
+    # last one under CPU load (most flakes are timing), to count
+    k = env_int("O_GATE_FLAKE_RUNS", 5)
+    again = if (k <= 1) { [] } else { [%{label: "new/changed test passes " ++ to_string(k) ++ " times in a row, the last under load (a flaky test fails here): " ++ map_get(t, "file"), dir: rv, cmd: flake_cmd(map_get(t, "cmd"), k, cfg_str(cfg, "flake_load_env")), want: "pass", key: ckey(kpr, "flake" ++ to_string(k) ++ "|" ++ map_get(t, "cmd"))} for t in tests] }
     prove = Std.filter(tests, fn(t) { map_get(t, "prove") == 'true' })
     setup = base_setup_cmd(rvb, build)
     base_setup = if (length(prove) > 0) { [%{label: "base checkout (without the change)", dir: rv, cmd: setup, want: "pass", key: ""}] } else { [] }
@@ -3177,7 +3186,16 @@ fun mechanical_steps(cfg, rv, rvb, added, new_files, tier, tpr, tbase) {
     suite = if (length(cfg_list(cfg, "required_checks")) > 0) { "" } else { cfg_str(cfg, "suite") }
     s = if (string_length(suite) > 0) { [%{label: "suite (PR merged with base)", dir: rv, cmd: suite, want: "pass", key: ckey(kpr, suite)}] } else { [] }
     x = [%{label: "tier check: " ++ c, dir: rv, cmd: c, want: "pass", key: ckey(kpr, c), base_retry: 'true', base_dir: rvb, base_setup: setup, base_key: ckey(kb, c)} for c in map_get(tier, "extra")]
-    b ++ on_pr ++ base_setup ++ on_base ++ s ++ x
+    b ++ on_pr ++ again ++ base_setup ++ on_base ++ s ++ x
+}
+
+# Runs 2..k of a test: k-2 plain, then one with four CPU hogs running (and
+# the repo's "flake_load_env", e.g. SW_SCHEDULERS=1, set). Says which run failed.
+fun flake_cmd(cmd, k, load_env) {
+    "i=2; while [ $i -lt " ++ to_string(k) ++ " ]; do ( " ++ cmd ++ " ) || { echo \"FLAKY: failed on run $i of " ++ to_string(k) ++ "\"; exit 1; }; i=$((i+1)); done; " ++
+    "hogs=''; for j in 1 2 3 4; do sh -c 'while :; do :; done' & hogs=\"$hogs $!\"; done; " ++
+    "( " ++ (if (string_length(load_env) > 0) { "export " ++ load_env ++ "; " } else { "" }) ++ cmd ++ " ); rc=$?; kill $hogs 2>/dev/null; " ++
+    "[ $rc = 0 ] || { echo \"FLAKY: failed on run " ++ to_string(k) ++ " of " ++ to_string(k) ++ " (under load)\"; exit 1; }"
 }
 
 fun ckey(prefix, cmd) { if (string_length(prefix) > 0) { prefix ++ cmd } else { "" } }

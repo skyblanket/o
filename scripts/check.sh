@@ -2108,6 +2108,13 @@ DAEMON4_PID="$(cat "$TMP4/up.pid")"
 rm -f ./bin/swarmd.prev
 pass "upgrade: scripts/upgrade.sh drains, waits for the run in flight (it finishes, nothing orphaned), swaps the binary, restarts and undrains"
 restart_d4 O_MERGE_GATE=1 O_AUTO_FILE=0 O_ENV_RETRY_S=2
+# Flaky new tests (o#49): the gate runs a PR's new or changed test 5 times in
+# a row (the last under CPU load); a test that fails 1 time in 3 is a REJECT.
+IFT="$(gh_issue '[sim:flaky-test] feature with a flaky test')"
+wait_status_at "$BASE4" "$IFT" "Failed" 300 || { grep -v '^\[orch\] tick' "$TMP4/daemon.log" | tail -20; fail "flaky gate: a PR whose new test fails 1 in 3 was not stopped"; }
+sqlite3 "$TMP4/o.db" "SELECT verify_output FROM run WHERE issue_id='$IFT' ORDER BY started_at DESC LIMIT 1" | grep -q "times in a row, the last under load" || { sqlite3 "$TMP4/o.db" "SELECT verify_state, substr(verify_output,1,400) FROM run WHERE issue_id='$IFT'"; fail "flaky gate: the repeated-run check was not the reason"; }
+git -C "$GHS/remote.git" log --oneline main | grep "o/$IFT" >/dev/null && fail "flaky gate: a PR with a flaky test merged"
+pass "flaky gate: a PR's new test must pass 5 runs in a row (the last under load); one that fails 1 in 3 is rejected and never merges"
 # inherited: base fails the same way, so the change isn't blamed
 git -C "$SEEDGH" fetch -q origin && git -C "$SEEDGH" checkout -q -B main origin/main
 echo broken > "$SEEDGH/BASE_BROKEN"; git -C "$SEEDGH" add BASE_BROKEN && git -C "$SEEDGH" commit -qm "break base" && git -C "$SEEDGH" push -q origin main
