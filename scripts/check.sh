@@ -1216,6 +1216,9 @@ rid3="$(sqlite3 "$TMP4/o.db" "SELECT id FROM run WHERE issue_id='$IS3' ORDER BY 
 rc="$(ocurl -s "$BASE4/api/runs/$rid3/costs")"
 [ "$(jget "$rc" '"gate" in {r["kind"] for r in d["by_stage"]} and d["total_cents"] > 0')" = "True" ] || { echo "$rc"; fail "costs: the run's gate cost is not attributed to the run"; }
 pass "costs: GET /api/issues/:id/costs and /api/runs/:id/costs break spend down by stage (agent, gate, ...)"
+sn="$(ocurl -s "$BASE4/api/snapshot")"
+[ "$(jget "$sn" '"tick" in d["orchestrator"] and any(c["id"] == "'"$CIDG"'" for c in d["companies"]) and "waiting" in d and "proof" in d and len(d["activity"]) > 0')" = "True" ] || { echo "$sn" | head -c 600; fail "snapshot: GET /api/snapshot is missing a part"; }
+pass "snapshot: GET /api/snapshot serves the scheduler, companies, waiting list, proof and activity in one call"
 # inherited: base fails the same way, so the change isn't blamed
 git -C "$SEEDGH" fetch -q origin && git -C "$SEEDGH" checkout -q -B main origin/main
 echo broken > "$SEEDGH/BASE_BROKEN"; git -C "$SEEDGH" add BASE_BROKEN && git -C "$SEEDGH" commit -qm "break base" && seed_push

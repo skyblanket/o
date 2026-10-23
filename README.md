@@ -615,6 +615,7 @@ curl http://localhost:4100/api/companies/<id>/gate    # the gate's .o-review.jso
 curl http://localhost:4100/api/issues/<id>/activity   # one issue's pipeline, in order
 curl http://localhost:4100/api/companies/<id>/maintainer  # the merge gate's shared notes, session and review count
 curl http://localhost:4100/api/issues/<id>/costs   # spend by stage (agent, review, gate, ...); also /api/runs/<id>/costs
+curl http://localhost:4100/api/snapshot       # one call for a control room: scheduler, companies, waiting, proof, activity
 curl http://localhost:4100/api/waiting        # everything waiting on a person, oldest first
 curl http://localhost:4100/api/proof          # the track record
 ```
