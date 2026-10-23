@@ -9,7 +9,7 @@
 
 module Store
 
-export [next_id, claude_agents_n, finished_runs_since, last_verb_ts, company_pause, idem_get, idem_put, notes_latest, notes_save, companies, company_row, company_create, company_update,
+export [next_id, costs_by_stage, claude_agents_n, finished_runs_since, last_verb_ts, company_pause, idem_get, idem_put, notes_latest, notes_save, companies, company_row, company_create, company_update,
         company_add_spend, enforce_budget, rollover_day, company_mark_green, global_spent_today,
         company_touch_reflect, companies_to_reflect, company_set_github, companies_with_github, company_set_maintainer, issues_in_review,
         issues_for, issue_row, issue_create, issue_create_auto, issue_create_with_origin, issue_open_fp_count, issue_import_github,
@@ -881,9 +881,19 @@ fun count_verbs(db, verbs) {
     if (length(r) == 0) { 0 } else { map_get(hd(r), "n") }
 }
 
+# Each spend row names the run it was for (o#39): the issue's latest run,
+# which is the one in flight when its builder, review or gate cost arrives.
 fun spend_add(db, cid, kind, cents, iid) {
-    _u = db_query(db, "INSERT INTO spend (company_id, kind, cents, issue_id, ts) VALUES (?, ?, ?, ?, ?)", [cid, kind, cents, iid, timestamp()])
+    rid = if (iid == nil || iid == "") { "" } else { r = db_query(db, "SELECT id FROM run WHERE issue_id = ? ORDER BY started_at DESC LIMIT 1", [iid]); if (length(r) == 0) { "" } else { map_get(hd(r), "id") } }
+    _u = db_query(db, "INSERT INTO spend (company_id, kind, cents, issue_id, ts, run_id) VALUES (?, ?, ?, ?, ?, ?)", [cid, kind, cents, iid, timestamp(), rid])
     kind
+}
+
+# Cost by stage (agent, review, gate, ...) for one run or one issue.
+fun costs_by_stage(db, col, id) {
+    rows = db_query(db, "SELECT kind, SUM(cents) AS cents FROM spend WHERE " ++ col ++ " = ? GROUP BY kind ORDER BY kind", [id])
+    total = Std.sum([map_get(r, "cents") for r in rows])
+    %{by_stage: rows, total_cents: total}
 }
 
 fun spend_by_day(db, cid, since) {
