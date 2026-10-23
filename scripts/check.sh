@@ -2100,6 +2100,21 @@ for _i in $(seq 1 90); do [ "$(sqlite3 "$TMPT/o.db" "SELECT status FROM issue WH
 [ "$(sqlite3 "$TMPT/o.db" "SELECT status FROM issue WHERE id='$IIDW'")" = "Done" ] || thr_fail "no workspace: once the branch was free the issue did not ship"
 [ "$(sqlite3 "$TMPT/o.db" "SELECT MAX(attempt) FROM run WHERE issue_id='$IIDW'")" = "1" ] || thr_fail "no workspace: runs that never started spent attempts"
 pass "no workspace: a branch held by another worktree is retried at the same attempt with git's error recorded; freed, the issue ships"
+# Shared memory (o#18): a merged run's LEARNED line is kept for its repo and
+# shows up in the next builder's prompt; a duplicate bumps it; a secret-shaped
+# lesson is refused.
+CIDM="$(jget "$(ocurl -s -X POST "$BASET/api/companies" -H 'Content-Type: application/json' \
+  -d "{\"name\":\"Mem Co\",\"issue_prefix\":\"MEM\",\"budget_monthly_cents\":1000000,\"repo\":\"$SCRT\",\"verify_cmd\":\"true\"}")" 'd["id"]')"
+ocurl -s -X POST "$BASET/api/companies/$CIDM/agents" -H 'Content-Type: application/json' -d '{"name":"Mem","runtime":"sim"}' >/dev/null
+IIDM="$(jget "$(ocurl -s -X POST "$BASET/api/companies/$CIDM/issues" -H 'Content-Type: application/json' -d '{"title":"[sim:good] [sim:learn] learns something"}')" 'd["id"]')"
+for _i in $(seq 1 60); do [ "$(sqlite3 "$TMPT/o.db" "SELECT status FROM issue WHERE id='$IIDM'")" = "Done" ] && break; sleep 0.5; done
+mem="$(ocurl -s "$BASET/api/memory?scope=$SCRT")"
+[ "$(jget "$mem" 'any(m["text"].startswith("the sim suite passes") and m["source"].startswith("builder:") for m in d)')" = "True" ] || thr_fail "memory: a merged run's LEARNED line was not kept ($mem)"
+IIDM2="$(jget "$(ocurl -s -X POST "$BASET/api/companies/$CIDM/issues" -H 'Content-Type: application/json' -d '{"title":"next task"}')" 'd["id"]')"
+ocurl -s "$BASET/api/issues/$IIDM2/prompt" | grep -q "the sim suite passes with sh verify.sh" || thr_fail "memory: the lesson is not in the next builder's prompt"
+[ "$(ocurl -s -X POST "$BASET/api/memory" -H 'Content-Type: application/json' -d "{\"scope\":\"$SCRT\",\"kind\":\"test\",\"text\":\"the sim suite passes with sh verify.sh from the repo root\"}")" = '{"result":"dup"}' ] || thr_fail "memory: a duplicate lesson was not folded into the existing one"
+[ "$(ocurl -s -o /dev/null -w '%{http_code}' -X POST "$BASET/api/memory" -H 'Content-Type: application/json' -d '{"scope":"global","kind":"env","text":"use token ghp_abcdefghijklmnopqrstuvwxyz0123456789AB"}')" = "400" ] || thr_fail "memory: a token-shaped lesson was accepted"
+pass "memory: a merged run's LEARNED line is kept and reaches the next builder's prompt; duplicates fold, secret-shaped lessons are refused"
 stop_daemon "$DT"; rmtmp "$TMPT"
 pass "thread room: SW_SCHEDULERS=4 runs at most $maxf worker(s) at once, logs dispatch.throttled, the API answers within 1s throughout"
 
