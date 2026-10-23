@@ -203,6 +203,7 @@ case "$in" in
     # the shared notes reached the prompt, and how many reviews overlap.
     case " $* " in *" --resume "*) echo "resume" >> "$GHS/gate_calls" ;; *) echo "fresh" >> "$GHS/gate_calls" ;; esac
     case "$in" in *"lesson from an earlier review"*) echo seen >> "$GHS/gate_notes_seen" ;; esac
+    printf '%s' "$in" > "$GHS/gate_prompt"
     sid="gate-$$"
     ( flock 9; n=$(( $(cat "$GHS/gate_inflight" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$GHS/gate_inflight"
       [ "$n" -gt "$(cat "$GHS/gate_peak" 2>/dev/null || echo 0)" ] && echo "$n" > "$GHS/gate_peak" ) 9>"$GHS/gate.lock"
@@ -556,6 +557,7 @@ nres="$(grep -c '^resume' "$GHS/gate_calls" || true)"
 [ "$(cat "$GHS/gate_peak")" -ge 2 ] || fail "gate: reviews never overlapped (peak $(cat "$GHS/gate_peak")); they should run in parallel"
 grep "lesson from an earlier review" "$TMP4/.o/maintainer/$CIDG/NOTES.md" >/dev/null || fail "gate: a review's NOTE line was not added to the shared notes"
 [ -s "$GHS/gate_notes_seen" ] || fail "gate: later reviews did not get the shared notes in their prompt"
+grep -q "Time budget: about 15 minutes" "$GHS/gate_prompt" || fail "gate: the review prompt has no time budget (o#40)"
 pass "gate: APPROVE merged, REJECT -> red_merge_gate -> Failed, UNVERIFIED/no-verdict -> In Review; reviews posted"
 pass "gate: one fresh session per PR, reviews in parallel (peak $(cat "$GHS/gate_peak")), shared notes carried to later reviews"
 
