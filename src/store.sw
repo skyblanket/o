@@ -9,7 +9,7 @@
 
 module Store
 
-export [next_id, costs_by_stage, claude_agents_n, finished_runs_since, last_verb_ts, company_pause, idem_get, idem_put, notes_latest, notes_save, companies, company_row, company_create, company_update,
+export [next_id, mem_open, mem_add, mem_list, mem_recall, costs_by_stage, claude_agents_n, finished_runs_since, last_verb_ts, company_pause, idem_get, idem_put, notes_latest, notes_save, companies, company_row, company_create, company_update,
         company_add_spend, enforce_budget, rollover_day, company_mark_green, global_spent_today,
         company_touch_reflect, companies_to_reflect, company_set_github, companies_with_github, company_set_maintainer, issues_in_review,
         issues_for, issue_row, issue_create, issue_create_auto, issue_create_with_origin, issue_open_fp_count, issue_import_github,
@@ -1006,3 +1006,94 @@ fun proof(db) {
       cents_per_merge: (if (merges > 0) { cents / merges } else { 0 })}
 }
 
+
+# ---- shared memory (o#18) -------------------------------------------------
+# Lessons learned across runs and across O daemons on one host, in their own
+# SQLite file (O_MEMORY_DB, default ~/.o/memory.db). Callers open a handle per
+# use and close it (db_close). scope is "global" or a repo; kind is env,
+# gotcha, convention, test or decision. Text reaches other agents' prompts, so
+# it is filtered on the way in (mem_add) and quoted on the way out.
+fun mem_path() {
+    p = getenv("O_MEMORY_DB")
+    if (p == nil || p == "") { getenv("HOME") ++ "/.o/memory.db" } else { p }
+}
+
+fun mem_open() {
+    path = mem_path()
+    parts = string_split(path, "/")
+    _m = shell("mkdir -p '" ++ Std.join(Std.take(parts, length(parts) - 1), "/") ++ "'")
+    m = db_open(path)
+    _b = db_exec(m, "PRAGMA busy_timeout=5000")
+    _t = db_exec(m, "CREATE TABLE IF NOT EXISTS memory (id INTEGER PRIMARY KEY AUTOINCREMENT, scope TEXT, kind TEXT, text TEXT, norm TEXT, source TEXT, created_at INTEGER, uses INTEGER DEFAULT 0, last_used INTEGER DEFAULT 0, status TEXT DEFAULT 'active')")
+    _i = db_exec(m, "CREATE INDEX IF NOT EXISTS ix_memory_scope ON memory (scope, status)")
+    r = db_query(m, "SELECT COUNT(*) AS n FROM memory", [])
+    _s = if (map_get(hd(r), "n") == 0) { mem_seed(m) } else { "" }
+    m
+}
+
+fun mem_seed(m) {
+    seeds = [["global", "env", "Under O_SANDBOX=bwrap the claude CLI's Bash needs /sys/fs/cgroup writable (O_SANDBOX_RW=/sys/fs/cgroup); without it every Bash call fails with EROFS."],
+             ["global", "env", "shell_managed pins a swarmrt scheduler thread while its command runs: keep SW_SCHEDULERS above twice the number of concurrent workers."],
+             ["global", "gotcha", "Plain shell() caps at 120 s and orphans the child; use shell_managed for anything long."],
+             ["global", "gotcha", "Never leave commands running in the background before you finish: the final message is read the moment you stop."],
+             ["global", "convention", "sw: no early return and no loops (use recursion); Std.nth, Std.last, Std.join, Std.unique and Std.reverse live in Std; spawn can't target a module-qualified call (wrap it); booleans are the atoms 'true' and 'false'."],
+             ["skyblanket/swarmrt", "test", "tests/sw/test_*.sw are compiled with swc build and run by tests/sw/run_tests.sh, which judges by exit code; tests/sw/conform/*.sw must print identically interpreted and compiled."],
+             ["skyblanket/swarmrt", "test", "A new test must fail on main without the change (the gate checks); never use a check that passes when a tool or file is missing, such as /proc on macOS."],
+             ["skyblanket/o", "test", "make check-fast (about 10 s) before pushing; make check is the full suite. Never edit scripts/check.sh while it runs."],
+             ["skyblanket/o", "gotcha", "Under set -o pipefail, cmd | grep -q can fail with SIGPIPE; use grep ... >/dev/null instead."]]
+    [mem_add(m, Std.nth(e, 0), Std.nth(e, 1), Std.nth(e, 2), "seed") for e in seeds]
+}
+
+fun mem_norm(t) { string_trim(string_lower(string_replace(string_replace(t, "\t", " "), "  ", " "))) }
+
+# "added", "dup" (an existing entry's uses bumped) or "rejected: <why>".
+fun mem_add(m, scope, kind, text0, source) {
+    text = string_truncate(string_trim(mem_clean(text0)), 240)
+    kinds = ["env", "gotcha", "convention", "test", "decision"]
+    tok = getenv("O_API_TOKEN")
+    secretish = string_contains(elem(shell("printf '%s' '" ++ string_replace(text, "'", "") ++ "' | grep -Eq '[A-Za-z0-9_-]{32,}' && echo SECRETISH"), 1), "SECRETISH") == 'true'
+    if (string_length(text) < 8) { "rejected: too short" }
+    else { if (Std.any(kinds, fn(k) { k == kind }) == 'false') { "rejected: unknown kind " ++ kind }
+    else { if (secretish || (tok != nil && string_length(tok) > 0 && string_contains(text, tok) == 'true')) { "rejected: looks like a secret" }
+    else {
+        norm = mem_norm(text)
+        have = db_query(m, "SELECT id FROM memory WHERE scope = ? AND norm = ? AND status = 'active'", [scope, norm])
+        if (length(have) > 0) {
+            _u = db_query(m, "UPDATE memory SET uses = uses + 1 WHERE id = ?", [map_get(hd(have), "id")])
+            "dup"
+        } else {
+            _i = db_query(m, "INSERT INTO memory (scope, kind, text, norm, source, created_at) VALUES (?, ?, ?, ?, ?, ?)", [scope, kind, text, norm, source, timestamp()])
+            # at most 60 active per scope: the least used, oldest retire first
+            _r = db_query(m, "UPDATE memory SET status = 'retired' WHERE scope = ? AND status = 'active' AND id NOT IN (SELECT id FROM memory WHERE scope = ? AND status = 'active' ORDER BY uses DESC, created_at DESC LIMIT 60)", [scope, scope])
+            "added"
+        }
+    }}}
+}
+
+# Control characters out (memory text is untrusted data in later prompts).
+fun mem_clean(t) {
+    string_replace(string_replace(string_replace(string_replace(t, "\r", " "), "\n", " "), "\t", " "), "`", "'")
+}
+
+fun mem_list(m, scope) {
+    if (scope == "") { db_query(m, "SELECT id, scope, kind, text, source, created_at, uses, last_used, status FROM memory WHERE status = 'active' ORDER BY scope, id", []) }
+    else { db_query(m, "SELECT id, scope, kind, text, source, created_at, uses, last_used, status FROM memory WHERE status = 'active' AND scope IN ('global', ?) ORDER BY id", [scope]) }
+}
+
+# Entries for a prompt: global plus the repo's (optionally only some kinds),
+# most recently used first, up to `cap` characters; each one used is bumped.
+fun mem_recall(m, scope, kinds, cap) {
+    rows = db_query(m, "SELECT id, kind, text FROM memory WHERE status = 'active' AND scope IN ('global', ?) ORDER BY last_used DESC, uses DESC, id DESC", [scope])
+    picked = mem_take([r for r in rows when length(kinds) == 0 || Std.any(kinds, fn(k) { k == map_get(r, "kind") }) == 'true'], cap, [])
+    now = timestamp()
+    _b = [db_query(m, "UPDATE memory SET uses = uses + 1, last_used = ? WHERE id = ?", [now, map_get(r, "id")]) for r in picked]
+    picked
+}
+
+fun mem_take(rows, cap, acc) {
+    if (length(rows) == 0) { acc } else {
+        r = hd(rows)
+        n = string_length(map_get(r, "text")) + 16
+        if (n > cap) { acc } else { mem_take(tl(rows), cap - n, acc ++ [r]) }
+    }
+}

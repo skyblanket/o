@@ -264,6 +264,24 @@ fun maintainer_info(db, conn, cid) {
     else { respond(conn, 200, json_encode(%{notes: Store.notes_latest(db, cid), session: default_str(map_get(c, "maintainer_session"), ""), reviews: default_num(map_get(c, "maintainer_reviews"), 0)})) }
 }
 
+# GET /api/memory[?scope=<repo>]: active lessons (global plus that repo's, or
+# all). POST /api/memory {"scope", "kind", "text"}: add one (token-guarded
+# like every write; filtered like an agent's).
+fun route_memory(conn, method, p, body) {
+    m = Store.mem_open()
+    _r = if (method == 'GET') {
+        scope = if (string_contains(p, "scope=") == 'true') { Std.last(string_split(p, "scope=")) } else { "" }
+        respond(conn, 200, json_encode(Store.mem_list(m, scope)))
+    } else {
+        d = if (string_length(body) > 0) { json_decode(body) } else { nil }
+        if (d == nil) { respond(conn, 400, err_json("send {\"scope\", \"kind\", \"text\"}")) } else {
+            res = Store.mem_add(m, default_str(map_get(d, "scope"), "global"), default_str(map_get(d, "kind"), ""), default_str(map_get(d, "text"), ""), "operator")
+            if (string_starts_with(res, "rejected") == 'true') { respond(conn, 400, err_json(res)) } else { respond(conn, 201, json_encode(%{result: res})) }
+        }
+    }
+    db_close(m)
+}
+
 fun max_rounds() { Orchestrator.env_int("O_MAX_ROUNDS", 3) }
 
 
@@ -275,6 +293,7 @@ fun route(db, dbpath, conn, method, path, body) {
         "/api/activity" -> respond(conn, 200, json_encode(Store.activity_recent(db)))
         "/api/proof" -> respond(conn, 200, json_encode(Store.proof(db)))
         "/api/waiting" -> respond(conn, 200, json_encode(Orchestrator.waiting_list(db)))
+        p when string_starts_with(p, "/api/memory") == 'true' -> route_memory(conn, method, p, body)
         "/api/orchestrator" -> orch_snapshot(conn)
         "/api/snapshot" -> control_snapshot(db, conn)
         "/api/orchestrator/drain" -> route_drain(dbpath, conn, method, body)
@@ -286,6 +305,7 @@ fun route(db, dbpath, conn, method, path, body) {
         p when string_starts_with(p, "/api/approvals/") == 'true' -> decide_approval(db, conn, method, p, body)
         p when string_starts_with(p, "/api/runs/") == 'true' -> run_result(db, conn, p)
         p when string_starts_with(p, "/api/issues/") == 'true' && string_ends_with(p, "/retry") == 'true' -> route_retry(db, conn, method, p, body)
+        p when string_starts_with(p, "/api/issues/") == 'true' && string_ends_with(p, "/prompt") == 'true' -> respond(conn, 200, json_encode(%{prompt: Orchestrator.issue_prompt(db, string_sub(p, 12, string_length(p) - 12 - 7))}))
         p when string_starts_with(p, "/api/issues/") == 'true' && string_ends_with(p, "/costs") == 'true' -> respond(conn, 200, json_encode(Store.costs_by_stage(db, "issue_id", string_sub(p, 12, string_length(p) - 12 - 6))))
         p when string_starts_with(p, "/api/issues/") == 'true' && string_ends_with(p, "/activity") == 'true' -> respond(conn, 200, json_encode(Store.activity_for_target(db, string_sub(p, 12, string_length(p) - 12 - 9))))
         p when string_starts_with(p, "/api/issues/") == 'true' -> route_issue(db, conn, method, p, body)
