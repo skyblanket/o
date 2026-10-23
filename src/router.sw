@@ -12,6 +12,7 @@
 #   GET  /api/health                        liveness
 #   GET  /api/runs                          run history
 #   GET  /api/orchestrator                  live scheduler snapshot
+#   GET  /api/snapshot                      control room: scheduler, companies, waiting, proof, activity
 #   GET  /api/approvals                     pending approvals
 #   POST /api/approvals/:id                 decide an approval
 #   GET  /api/companies                     list companies
@@ -111,10 +112,23 @@ fun route_drain(dbpath, conn, method, body) {
 }
 
 fun orch_snapshot(conn) {
+    respond(conn, 200, json_encode(orch_snap()))
+}
+
+fun orch_snap() {
     send(whereis('orchestrator'), {'snapshot', self()})
     receive {
-        {'snapshot_reply', d} -> respond(conn, 200, json_encode(d))
+        {'snapshot_reply', d} -> d
     }
+}
+
+# GET /api/snapshot (o#42): everything a control room shows, in one call, so
+# a dashboard can poll O instead of asking a model to summarize it: the
+# scheduler, each company's state and spend today, what waits on a person,
+# the track record and the latest activity.
+fun control_snapshot(db, conn) {
+    cos = [%{id: map_get(c, "id"), name: map_get(c, "name"), status: map_get(c, "status"), pause_reason: default_str(map_get(c, "pause_reason"), ""), spent_today_cents: default_num(map_get(c, "spent_today_cents"), 0), github_repo: default_str(map_get(c, "github_repo"), "")} for c in Store.companies(db)]
+    respond(conn, 200, json_encode(%{ts: timestamp(), orchestrator: orch_snap(), companies: cos, waiting: Orchestrator.waiting_list(db), proof: Store.proof(db), activity: Store.activity_recent(db)}))
 }
 
 # ---- dispatch ------------------------------------------------
@@ -262,6 +276,7 @@ fun route(db, dbpath, conn, method, path, body) {
         "/api/proof" -> respond(conn, 200, json_encode(Store.proof(db)))
         "/api/waiting" -> respond(conn, 200, json_encode(Orchestrator.waiting_list(db)))
         "/api/orchestrator" -> orch_snapshot(conn)
+        "/api/snapshot" -> control_snapshot(db, conn)
         "/api/orchestrator/drain" -> route_drain(dbpath, conn, method, body)
         "/api/fs" -> route_fs(conn, method, body)
         "/api/approvals" -> route_approvals(db, conn, method)
