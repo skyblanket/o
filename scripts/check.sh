@@ -2026,7 +2026,19 @@ pass "recovery: a restart is not an attempt (same attempt, same model); interrup
 TMPT="$(mktemp -d)"
 PORTT="$(free_port 4950 300)"
 BASET="http://127.0.0.1:${PORTT}"
+cat > "$TMPT/swarm-stub" <<'STUB'
+#!/bin/sh
+# swarm-code -p --json stand-in: records its args, then commits or asks a human
+in="$(cat)"; echo "$*" >> "$HOME/swarm_args"
+case "$in" in
+  *"[swarm:needs-human]"*) printf '%s\n' '{"status":"ok","summary":"I could not do this.\nNEEDS_HUMAN: protected/ci.yml needs one line added"}' ;;
+  *) echo change > swarm_change.txt; git add swarm_change.txt; git commit -qm "swarm change"
+     printf '%s\n' '{"status":"ok","summary":"Done.\nLEARNED(convention): the swarm stub commits with git commit -qm"}' ;;
+esac
+STUB
+chmod +x "$TMPT/swarm-stub"
 HOME="$TMPT" O_DB="$TMPT/o.db" O_PORT="$PORTT" O_NO_OPEN=1 SW_SCHEDULERS=4 O_MAX_CONCURRENT=3 O_AUTO_FILE=0 O_BROKEN_RUNS=3 \
+  O_SWARM_BIN="$TMPT/swarm-stub" O_SWARM_PROFILES="haiku=kimi,opus=kimi-pro" O_SWARM_FLAT_CENTS=0 \
   ./bin/swarmd >"$TMPT/daemon.log" 2>&1 &
 DT=$!
 thr_fail() { stop_daemon "$DT"; tail -20 "$TMPT/daemon.log" || true; rmtmp "$TMPT"; fail "$1"; }
@@ -2115,6 +2127,19 @@ ocurl -s "$BASET/api/issues/$IIDM2/prompt" | grep -q "the sim suite passes with 
 [ "$(ocurl -s -X POST "$BASET/api/memory" -H 'Content-Type: application/json' -d "{\"scope\":\"$SCRT\",\"kind\":\"test\",\"text\":\"the sim suite passes with sh verify.sh from the repo root\"}")" = '{"result":"dup"}' ] || thr_fail "memory: a duplicate lesson was not folded into the existing one"
 [ "$(ocurl -s -o /dev/null -w '%{http_code}' -X POST "$BASET/api/memory" -H 'Content-Type: application/json' -d '{"scope":"global","kind":"env","text":"use token ghp_abcdefghijklmnopqrstuvwxyz0123456789AB"}')" = "400" ] || thr_fail "memory: a token-shaped lesson was accepted"
 pass "memory: a merged run's LEARNED line is kept and reaches the next builder's prompt; duplicates fold, secret-shaped lessons are refused"
+# swarm-code runtime (dogfood on Kimi): the rung's profile is passed, the
+# final summary's LEARNED and NEEDS_HUMAN lines work as with claude-code.
+CIDS="$(jget "$(ocurl -s -X POST "$BASET/api/companies" -H 'Content-Type: application/json' \
+  -d "{\"name\":\"Swarm Co\",\"issue_prefix\":\"SWC\",\"budget_monthly_cents\":1000000,\"repo\":\"$SCRT\",\"verify_cmd\":\"true\"}")" 'd["id"]')"
+ocurl -s -X POST "$BASET/api/companies/$CIDS/agents" -H 'Content-Type: application/json' -d '{"name":"Swarm","runtime":"swarm-code"}' >/dev/null
+IIDS="$(jget "$(ocurl -s -X POST "$BASET/api/companies/$CIDS/issues" -H 'Content-Type: application/json' -d '{"title":"a swarm-code change"}')" 'd["id"]')"
+IIDSN="$(jget "$(ocurl -s -X POST "$BASET/api/companies/$CIDS/issues" -H 'Content-Type: application/json' -d '{"title":"[swarm:needs-human] touch ci"}')" 'd["id"]')"
+for _i in $(seq 1 60); do [ "$(sqlite3 "$TMPT/o.db" "SELECT status FROM issue WHERE id='$IIDS'")" = "Done" ] && [ "$(sqlite3 "$TMPT/o.db" "SELECT status FROM issue WHERE id='$IIDSN'")" = "In Review" ] && break; sleep 0.5; done
+[ "$(sqlite3 "$TMPT/o.db" "SELECT status FROM issue WHERE id='$IIDS'")" = "Done" ] || thr_fail "swarm-code: a swarm-code change did not ship"
+grep -q -- "--profile kimi" "$TMPT/swarm_args" || thr_fail "swarm-code: the builder rung's profile was not passed ($(cat "$TMPT/swarm_args"))"
+ocurl -s "$BASET/api/memory?scope=$SCRT" | grep -q "swarm stub commits" || thr_fail "swarm-code: the summary's LEARNED line was not kept"
+[ "$(sqlite3 "$TMPT/o.db" "SELECT status FROM issue WHERE id='$IIDSN'")" = "In Review" ] && sqlite3 "$TMPT/o.db" "SELECT verify_output FROM run WHERE issue_id='$IIDSN'" | grep -q "protected/ci.yml needs one line" || thr_fail "swarm-code: NEEDS_HUMAN in the summary did not park the issue with the ask"
+pass "swarm-code: runs get the rung's profile (O_SWARM_PROFILES); the final summary's LEARNED and NEEDS_HUMAN lines work as with claude-code"
 stop_daemon "$DT"; rmtmp "$TMPT"
 pass "thread room: SW_SCHEDULERS=4 runs at most $maxf worker(s) at once, logs dispatch.throttled, the API answers within 1s throughout"
 

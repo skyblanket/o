@@ -555,6 +555,8 @@ The daemon reads its configuration from the environment. All are optional.
 | `O_SELF_FILE_CAP` | `10` | max auto/reflect issues one company may file per day. |
 | `O_NO_SIGNAL_DAYS` | `2` | consecutive no-signal days before the breaker pauses a company. |
 | `O_SWARM_FLAT_CENTS` | `25` | flat per-run cost charged for a swarm-code run (it reports no telemetry yet). |
+| `O_SWARM_PROFILES` | unset | maps O's builder rungs to swarm-code profiles, e.g. `haiku=kimi,sonnet=kimi,opus=kimi-pro`; an escalation then moves to the stronger profile. `O_SWARM_PROFILE` is the fallback. |
+| `O_PREFLIGHT_RUNTIME` | the agents' runtime | which CLI the boot preflight probes (`claude-code` or `swarm-code`). |
 | `O_REFLECT` | unset | set `1` to enable the daily reflection pass. |
 | `O_REQUIRE_APPROVALS` | unset | set `1` to route agent hiring through `/api/approvals`. |
 | `O_API_TOKEN` | unset | when set, company / agent / approval writes need `Authorization: Bearer <token>`. The UI reads `VITE_O_TOKEN`, the MCP server `O_API_TOKEN`. |
@@ -624,6 +626,16 @@ curl http://localhost:4100/api/proof          # the track record
 Every write that creates something takes an optional `Idempotency-Key` header. A repeated key (same method and path, within 24h) gets the first 2xx answer back and writes nothing, so a client that retries after a dropped response can't file the same issue, report or feedback twice. O's own reflection and persona prompts and `feedback/o-feedback.js` send one.
 
 The UI (`cd ui && npm run dev`) shows each issue's pipeline by attempt (agent, verify, review, PR + CI, gate, merge). Cards carry their PR, CI state and gate decision, and In Review cards say why they wait. The company header shows 14 days of spend by role (agent, reviewer, gate, planner, reflect, persona) with the cost per merge. Manage sets the GitHub repo and ship mode, and shows the gate's config.
+
+## Running builders on swarm-code with Kimi
+
+swarm-code (our own agent, on swarmrt) talks to any OpenAI-compatible endpoint, so O's builders can run on it with a Kimi Code subscription or the Moonshot API:
+
+1. In `~/.swarm-code/settings.json` of the user O runs as, add profiles for the Kimi endpoint (`https://api.kimi.ai/coding/v1/chat/completions` for a Kimi Code membership key, or the Moonshot platform URL for a pay-as-you-go key), each with its `model` and `api_key`. Use the model ids your plan lists in the Kimi Code console.
+2. Run O with `SWARM_CODE_ALLOW_REMOTE=1` (swarm-code dials only the local network otherwise), `O_SWARM_PROFILES=haiku=<fast profile>,sonnet=<profile>,opus=<strongest profile>`, and `O_SWARM_FLAT_CENTS=0` on a flat-fee plan.
+3. Hire the company's agent with `"runtime": "swarm-code"`. The boot preflight then probes swarm-code.
+
+The review and the merge gate still run through the `claude` CLI. To keep them off Anthropic tokens too, point that CLI at Kimi's Anthropic-compatible endpoint (`ANTHROPIC_BASE_URL=https://api.kimi.ai/coding/`, `ANTHROPIC_API_KEY=<key>`) and set `O_REVIEW_MODEL` / `O_MERGE_MODEL` to Kimi model ids. Kimi's terms ask third-party tools to keep their own client identifier; both CLIs do.
 
 ## Known limitations
 

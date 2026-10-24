@@ -9,7 +9,7 @@
 
 module Store
 
-export [next_id, mem_open, mem_add, mem_list, mem_recall, costs_by_stage, claude_agents_n, finished_runs_since, last_verb_ts, company_pause, idem_get, idem_put, notes_latest, notes_save, companies, company_row, company_create, company_update,
+export [next_id, runtime_agents_n, mem_open, mem_add, mem_list, mem_recall, costs_by_stage, claude_agents_n, finished_runs_since, last_verb_ts, company_pause, idem_get, idem_put, notes_latest, notes_save, companies, company_row, company_create, company_update,
         company_add_spend, enforce_budget, rollover_day, company_mark_green, global_spent_today,
         company_touch_reflect, companies_to_reflect, company_set_github, companies_with_github, company_set_maintainer, issues_in_review,
         issues_for, issue_row, issue_create, issue_create_auto, issue_create_with_origin, issue_open_fp_count, issue_import_github,
@@ -95,8 +95,10 @@ fun issues_with_workspace(db) {
     db_query(db, "SELECT i.id, i.company_id, c.repo FROM issue i JOIN company c ON c.id = i.company_id WHERE i.status NOT IN ('Done', 'Canceled', 'Reverted') AND c.repo != ''", [])
 }
 
-fun claude_agents_n(db) {
-    r = db_query(db, "SELECT COUNT(*) AS n FROM agent WHERE runtime = 'claude-code' AND status = 'active'", [])
+fun claude_agents_n(db) { runtime_agents_n(db, "claude-code") }
+
+fun runtime_agents_n(db, rt) {
+    r = db_query(db, "SELECT COUNT(*) AS n FROM agent WHERE runtime = ? AND status = 'active'", [rt])
     if (length(r) == 0) { 0 } else { map_get(hd(r), "n") }
 }
 
