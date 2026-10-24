@@ -652,14 +652,17 @@ fun draining(dbpath) { file_exists(dbpath ++ ".drain") }
 # after fixing the cause to probe again.
 fun preflight_on(db) {
     v = getenv("O_PREFLIGHT")
-    if (v == "0") { 'false' } else { if (v == "1") { 'true' } else { if (Store.claude_agents_n(db) > 0) { 'true' } else { 'false' } } }
+    if (v == "0") { 'false' } else { if (v == "1") { 'true' } else { if (Store.claude_agents_n(db) + Store.runtime_agents_n(db, "swarm-code") > 0) { 'true' } else { 'false' } } }
 }
 
 fun start_preflight(db, dbpath, orch) {
     _rm = sh(f"rm -f {sq(dbpath)}.preflight {sq(dbpath)}.preflight-on")
     if (preflight_on(db) == 'true') {
         _m = file_write(dbpath ++ ".preflight-on", "1")
-        spawn(preflight_worker(orch))
+        # the runtime to probe: O_PREFLIGHT_RUNTIME, else swarm-code when only
+        # swarm-code agents exist, else claude-code
+        rt = str_or(getenv("O_PREFLIGHT_RUNTIME"), (if (Store.claude_agents_n(db) == 0 && Store.runtime_agents_n(db, "swarm-code") > 0) { "swarm-code" } else { "claude-code" }))
+        spawn(preflight_worker(orch, rt))
     } else { "" }
 }
 
@@ -681,15 +684,19 @@ fun preflight_state(dbpath) {
     } }
 }
 
-fun preflight_worker(orch) {
+fun preflight_worker(orch, rt) {
     dir = "/tmp/o-preflight-" ++ to_string(timestamp())
     _i = sh(f"mkdir -p {sq(dir)} && git -C {sq(dir)} init -q && git -C {sq(dir)} -c user.email=o@localhost -c user.name=O commit -q --allow-empty -m probe")
     _w = file_write(f"{dir}/PROMPT.txt", "This is a health check. Run exactly this shell command and nothing else: echo ok > probe.txt\nThen reply DONE.")
     m = getenv("O_PREFLIGHT_MODEL")
-    r = claude_once(dir, claude_bin(), "", sandbox_prefix(dir, dir), (if (m == nil) { "haiku" } else { m }))
+    r = if (rt == "swarm-code") {
+        prof = swarm_profile(if (m == nil) { "haiku" } else { m })
+        pflag = if (string_length(prof) > 0) { " --profile " ++ sq(prof) } else { "" }
+        shell_managed(f"cd {sq(dir)} && cat PROMPT.txt | {agent_env()} SWARM_CODE_CWD={sq(dir)} {sandbox_prefix(dir, dir)}{swarm_bin()} -p --json{pflag} > stream.jsonl 2> err.log", stall_timeout())
+    } else { claude_once(dir, claude_bin(), "", sandbox_prefix(dir, dir), (if (m == nil) { "haiku" } else { m })) }
     got = if (file_exists(f"{dir}/probe.txt") == 'true') { string_trim(file_read(f"{dir}/probe.txt")) } else { "" }
     ok = if (got == "ok") { 'true' } else { 'false' }
-    said = str_or(map_get(parse_stream_result(f"{dir}/stream.jsonl"), "result"), "")
+    said = if (rt == "swarm-code") { swarm_summary(f"{dir}/stream.jsonl") } else { str_or(map_get(parse_stream_result(f"{dir}/stream.jsonl"), "result"), "") }
     errt = if (file_exists(f"{dir}/err.log") == 'true') { tail_text(file_read(f"{dir}/err.log"), 1500) } else { "" }
     detail = if (ok == 'true') { "ok" } else { "the agent CLI could not write probe.txt in a sandboxed scratch repo (exit " ++ to_string(elem(r, 0)) ++ "). It said: " ++ string_truncate(said, 1500) ++ "\nerr.log tail:\n" ++ errt }
     _rm = sh(f"rm -rf {sq(dir)}")
@@ -1420,7 +1427,7 @@ fun run_worker(orch, run_id, issue_id, runtime, prompt, workspace, repo, session
         run_sim(orch, run_id, issue_id, sim_outcome, workspace, repo, title, protected, start)
     } else {
         if (runtime == "swarm-code") {
-            run_swarm_code(orch, run_id, issue_id, prompt, workspace, repo, start)
+            run_swarm_code(orch, run_id, issue_id, prompt, workspace, repo, start, model)
         } else {
             run_claude_code(orch, run_id, issue_id, prompt, workspace, repo, session_id, start, model)
         }
@@ -1593,7 +1600,7 @@ fun parse_stream_session(path) {
 # swarm-code-native equivalent of the claude-code session resume. No
 # cost or session id flows back: swarm-code reports neither, and its
 # continuity is the journal, not an id O has to thread.
-fun run_swarm_code(orch, run_id, issue_id, prompt, workspace, repo, start) {
+fun run_swarm_code(orch, run_id, issue_id, prompt, workspace, repo, start, model) {
     if (string_length(repo) > 0) {
         prepare_worktree(repo, workspace, issue_id, start)
     } else {
@@ -1602,23 +1609,53 @@ fun run_swarm_code(orch, run_id, issue_id, prompt, workspace, repo, start) {
     if (ws_missing(repo, workspace)) {
         send(orch, {'run_done', run_id, issue_id, 'no_workspace', 0, ""})
     } else {
-        run_swarm_code_in(orch, run_id, issue_id, prompt, workspace, repo)
+        run_swarm_code_in(orch, run_id, issue_id, prompt, workspace, repo, model)
     }
 }
 
-fun run_swarm_code_in(orch, run_id, issue_id, prompt, workspace, repo) {
+fun run_swarm_code_in(orch, run_id, issue_id, prompt, workspace, repo, model) {
     _w = file_write(f"{workspace}/PROMPT.txt", prompt)
     bin = swarm_bin()
-    cmd = f"cd {workspace} && cat PROMPT.txt | {agent_env()} SWARM_CODE_CWD={workspace} {sandbox_prefix(workspace, repo)}{bin} -p --json > result.json 2> err.log"
+    prof = swarm_profile(model)
+    pflag = if (string_length(prof) > 0) { " --profile " ++ sq(prof) } else { "" }
+    cmd = f"cd {workspace} && cat PROMPT.txt | {agent_env()} SWARM_CODE_CWD={workspace} {sandbox_prefix(workspace, repo)}{bin} -p --json{pflag} > result.json 2> err.log"
     # shell_managed: see run_claude_code — plain shell() caps at 120s + orphans.
     result = shell_managed(cmd, stall_timeout())
     code = elem(result, 0)
     cost = if (code == 124) { timeout_flat_cents() } else { swarm_flat_cents() }
-    if (code == 0) {
+    # The last line is {"status", "summary"}: the agent's final message, read
+    # for the same ESCALATE / NEEDS_HUMAN / LEARNED lines as claude-code's.
+    final = swarm_summary(f"{workspace}/result.json")
+    esc = escalation_in(final)
+    _e = if (string_length(esc) > 0) { record_escalation(issue_id, esc) } else { "" }
+    _ln = learned_save(issue_id, final)
+    nh = needs_human_in(final)
+    if (string_length(nh) > 0) {
+        _n = file_write(f"{workspace}/NEEDS_HUMAN.txt", nh)
+        send(orch, {'run_done', run_id, issue_id, 'needs_human', cost, ""})
+    } else { if (code == 0) {
         send(orch, {'run_done', run_id, issue_id, 'succeeded', cost, ""})
     } else {
         send(orch, {'run_done', run_id, issue_id, 'crashed', cost, ""})
+    }}
+}
+
+fun swarm_summary(path) {
+    if (file_exists(path) == 'false') { "" } else {
+        ls = [l for l in string_split(file_read(path), "\n") when string_length(string_trim(l)) > 0]
+        d = if (length(ls) == 0) { nil } else { json_decode(Std.last(ls)) }
+        if (d == nil) { "" } else { str_or(map_get(d, "summary"), "") }
     }
+}
+
+# The swarm-code profile for the model rung O picked (haiku < sonnet < opus,
+# or an explicit model id): O_SWARM_PROFILES maps rungs to profiles in
+# ~/.swarm-code/settings.json, e.g. "haiku=kimi,sonnet=kimi,opus=kimi-pro".
+# Unmapped rungs use O_SWARM_PROFILE, else swarm-code's default model.
+fun swarm_profile(model) {
+    pairs = [string_split(string_trim(p), "=") for p in string_split(str_or(getenv("O_SWARM_PROFILES"), ""), ",") when string_contains(p, "=") == 'true']
+    hit = [Std.nth(kv, 1) for kv in pairs when string_trim(hd(kv)) == model || (string_length(model) > 0 && string_contains(model, string_trim(hd(kv))) == 'true')]
+    if (length(hit) > 0) { string_trim(hd(hit)) } else { str_or(getenv("O_SWARM_PROFILE"), "") }
 }
 
 # swarm-code reports neither cost nor tokens today, so a real run
