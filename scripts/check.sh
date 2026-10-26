@@ -709,6 +709,28 @@ grep -F "O merge gate** (sonnet)" "$GHS/comments_$(pr_of "$IID_DOC")" >/dev/null
 grep -F "O merge gate** (sonnet)" "$GHS/comments_$(pr_of "$IID_GM")" >/dev/null && fail "gate model: a PR outside the docs tier used the docs tier's lighter gate"
 pass "tiered CI: a docs-only PR needs only its tier's required checks (lint, not build; a failing macos it doesn't need is ignored)"
 pass "gate model: a docs-only PR is gated by its tier's gate_model; other PRs keep O_MERGE_MODEL"
+# Telemetry: every model call O made for the issue is on record (llm_call).
+calls_doc="$(ocurl -s "$BASE4/api/issues/$IID_DOC/calls")"
+echo "$calls_doc" | python3 -c '
+import json,sys
+rows=json.load(sys.stdin)
+kinds={r["kind"] for r in rows}
+assert "gate" in kinds, kinds
+g=[r for r in rows if r["kind"]=="gate"][0]
+assert g["model_req"]=="sonnet", g
+assert g["run_id"] and g["company_id"] and g["attempt"]>=1, g
+assert g["wall_ms"]>=0 and g["outcome"] in ("ok","error","timeout"), g
+' || { echo "$calls_doc" | head -c 2000; fail "telemetry: the docs PR's gate call is not on record with its model, run and company"; }
+summ="$(ocurl -s "$BASE4/api/calls/summary?days=1")"
+echo "$summ" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+assert any(r["kind"]=="gate" for r in d["by_step_model"]), d
+assert d["merged_issues"]>=1, d
+' || { echo "$summ" | head -c 2000; fail "telemetry: /api/calls/summary lacks the gate calls or merged issues"; }
+csvh="$(ocurl -s "$BASE4/api/calls.csv?days=1" | head -1)"
+[ "$csvh" = "id,ts,company_id,issue_id,run_id,attempt,tier,kind,runtime,model_req,model,outcome,exit_code,turns,tool_calls,tools,tokens_in,tokens_out,cache_read,cache_write,cost_cents,wall_ms,api_ms,detail" ] || fail "telemetry: /api/calls.csv header is '$csvh'"
+pass "telemetry: each model call is recorded (step, model asked for, run, company, time); /api/calls/summary and /api/calls.csv serve them"
 IID_FLK="$(gh_issue '[sim:good] ci flakes once')"
 echo "o/$IID_FLK" >> "$GHS/flaky_ci"
 wait_status_at "$BASE4" "$IID_FLK" "Done" 120 || { tail -30 "$TMP4/daemon.log"; fail "ci rerun: a check that passes on re-run should merge"; }
@@ -2612,6 +2634,12 @@ IID_MO="$(jget "$(ocurl -s -X POST "$BASE5/api/companies/$CIDS/issues" -H 'Conte
 wait_status_at "$BASE5" "$IID_MO" "Done" 90 || { grep -v '^\[orch\] tick' "$TMP5/daemon.log" | tail -20; fail "model only: the issue never Done"; }
 grep -- "--model opus " "$TMP5/agent-args" >/dev/null || { cat "$TMP5/agent-args"; fail "model only: with O_MODEL_ONLY=opus a builder=sonnet tier's issue should run on opus"; }
 pass "model only: O_MODEL_ONLY=opus runs builders on opus, over the ladder and a tier's builder"
+ocurl -s "$BASE5/api/issues/$IID_MO/calls" | python3 -c '
+import json,sys
+b=[r for r in json.load(sys.stdin) if r["kind"]=="builder"]
+assert b and b[-1]["model_req"]=="opus" and b[-1]["runtime"]=="claude-code" and b[-1]["exit_code"]==0 and abs(b[-1]["cost_cents"]-1)<0.01, b
+' || fail "telemetry: the builder call is not on record with model opus, its runtime, exit code and cost"
+pass "telemetry: the builder call is recorded with the model asked for, runtime, exit code and cost"
 else
   echo "SKIP: agent sandbox stage (unprivileged bwrap unavailable here)"
 fi

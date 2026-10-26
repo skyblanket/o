@@ -306,6 +306,8 @@ fun route(db, dbpath, conn, method, path, body) {
         p when string_starts_with(p, "/api/runs/") == 'true' -> run_result(db, conn, p)
         p when string_starts_with(p, "/api/issues/") == 'true' && string_ends_with(p, "/retry") == 'true' -> route_retry(db, conn, method, p, body)
         p when string_starts_with(p, "/api/issues/") == 'true' && string_ends_with(p, "/prompt") == 'true' -> respond(conn, 200, json_encode(%{prompt: Orchestrator.issue_prompt(db, string_sub(p, 12, string_length(p) - 12 - 7))}))
+        p when string_starts_with(p, "/api/calls") == 'true' -> route_calls(db, conn, p)
+        p when string_starts_with(p, "/api/issues/") == 'true' && string_ends_with(p, "/calls") == 'true' -> respond(conn, 200, json_encode(Store.calls_for(db, "issue_id", string_sub(p, 12, string_length(p) - 12 - 6))))
         p when string_starts_with(p, "/api/issues/") == 'true' && string_ends_with(p, "/costs") == 'true' -> respond(conn, 200, json_encode(Store.costs_by_stage(db, "issue_id", string_sub(p, 12, string_length(p) - 12 - 6))))
         p when string_starts_with(p, "/api/issues/") == 'true' && string_ends_with(p, "/activity") == 'true' -> respond(conn, 200, json_encode(Store.activity_for_target(db, string_sub(p, 12, string_length(p) - 12 - 9))))
         p when string_starts_with(p, "/api/issues/") == 'true' -> route_issue(db, conn, method, p, body)
@@ -922,9 +924,48 @@ fun run_result(db, conn, p) {
         }
     } else { if (string_ends_with(rest, "/costs") == 'true') {
         respond(conn, 200, json_encode(Store.costs_by_stage(db, "run_id", string_sub(rest, 0, string_length(rest) - 6))))
+    } else { if (string_ends_with(rest, "/calls") == 'true') {
+        respond(conn, 200, json_encode(Store.calls_for(db, "run_id", string_sub(rest, 0, string_length(rest) - 6))))
     } else {
         respond(conn, 404, err_json("not found"))
-    }}
+    }}}
+}
+
+# Every model call O made (llm_call), for tuning:
+#   /api/calls/summary?company=<id>&days=7   totals by step and model, builder
+#                                            outcomes by model, cost per merged issue
+#   /api/calls?company=<id>&days=7           the rows, as JSON
+#   /api/calls.csv?company=<id>&days=7       the rows, as CSV
+# company is optional (all companies); days defaults to 7.
+fun route_calls(db, conn, p) {
+    q = if (string_contains(p, "?") == 'true') { Std.last(string_split(p, "?")) } else { "" }
+    cid = query_val(q, "company")
+    dq = to_int(query_val(q, "days"))
+    days = if (dq == nil || dq <= 0) { 7 } else { dq }
+    since = timestamp() - days * 86400000
+    if (string_starts_with(p, "/api/calls/summary") == 'true') { respond(conn, 200, json_encode(Store.call_summary(db, cid, since))) }
+    else { if (string_starts_with(p, "/api/calls.csv") == 'true') { calls_csv(conn, Store.calls_since(db, cid, since)) }
+    else { respond(conn, 200, json_encode(Store.calls_since(db, cid, since))) } }
+}
+
+fun query_val(q, k) {
+    hits = [string_sub(kv, string_length(k) + 1, string_length(kv) - string_length(k) - 1) for kv in string_split(q, "&") when string_starts_with(kv, k ++ "=") == 'true']
+    if (length(hits) == 0) { "" } else { hd(hits) }
+}
+
+fun calls_cols() { ["id", "ts", "company_id", "issue_id", "run_id", "attempt", "tier", "kind", "runtime", "model_req", "model", "outcome", "exit_code", "turns", "tool_calls", "tools", "tokens_in", "tokens_out", "cache_read", "cache_write", "cost_cents", "wall_ms", "api_ms", "detail"] }
+
+fun csv_cell(v) {
+    t = if (v == nil) { "" } else { to_string(v) }
+    if (string_contains(t, ",") == 'true' || string_contains(t, "\"") == 'true' || string_contains(t, "\n") == 'true') { "\"" ++ string_replace(t, "\"", "\"\"") ++ "\"" } else { t }
+}
+
+fun calls_csv(conn, rows) {
+    cols = calls_cols()
+    body = Std.join(cols, ",") ++ "\n" ++ Std.join([Std.join([csv_cell(map_get(r, c)) for c in cols], ",") ++ "\n" for r in rows], "")
+    c = case conn { {'idem', c0, k, d} -> c0
+                    _ -> conn }
+    http_respond(c, 200, "Content-Type: text/csv\r\nContent-Disposition: attachment; filename=o-calls.csv\r\nAccess-Control-Allow-Origin: *\r\n", body)
 }
 
 # Read the first of two paths that exists, else "". Lets a run's artifacts be
