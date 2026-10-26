@@ -9,7 +9,7 @@
 
 module Store
 
-export [next_id, runtime_agents_n, mem_open, mem_add, mem_list, mem_recall, costs_by_stage, claude_agents_n, finished_runs_since, last_verb_ts, company_pause, idem_get, idem_put, notes_latest, notes_save, companies, company_row, company_create, company_update,
+export [next_id, call_add, calls_for, calls_since, call_summary, runtime_agents_n, mem_open, mem_add, mem_list, mem_recall, costs_by_stage, claude_agents_n, finished_runs_since, last_verb_ts, company_pause, idem_get, idem_put, notes_latest, notes_save, companies, company_row, company_create, company_update,
         company_add_spend, enforce_budget, rollover_day, company_mark_green, global_spent_today,
         company_touch_reflect, companies_to_reflect, company_set_github, companies_with_github, company_set_maintainer, issues_in_review,
         issues_for, issue_row, issue_create, issue_create_auto, issue_create_with_origin, issue_open_fp_count, issue_import_github,
@@ -889,6 +889,54 @@ fun spend_add(db, cid, kind, cents, iid) {
     rid = if (iid == nil || iid == "") { "" } else { r = db_query(db, "SELECT id FROM run WHERE issue_id = ? ORDER BY started_at DESC LIMIT 1", [iid]); if (length(r) == 0) { "" } else { map_get(hd(r), "id") } }
     _u = db_query(db, "INSERT INTO spend (company_id, kind, cents, issue_id, ts, run_id) VALUES (?, ?, ?, ?, ?, ?)", [cid, kind, cents, iid, timestamp(), rid])
     kind
+}
+
+# ---- per-call telemetry (llm_call) ------------------------------
+# rec: kind, runtime, model_req, model, outcome, exit_code, turns, tool_calls,
+# tools, tokens_in, tokens_out, cache_read, cache_write, cost_cents, wall_ms,
+# api_ms, detail, and optionally company_id / issue_id / run_id. A call tied to
+# an issue but no run is filed under the issue's latest run; the company,
+# attempt and tier come from the issue and run.
+fun call_add(db, rec) {
+    g = fn(k, d) { v = map_get(rec, k); if (v == nil) { d } else { v } }
+    iid = g("issue_id", "")
+    rid0 = g("run_id", "")
+    rid = if (string_length(rid0) > 0 || string_length(iid) == 0) { rid0 } else { r = db_query(db, "SELECT id FROM run WHERE issue_id = ? ORDER BY started_at DESC LIMIT 1", [iid]); if (length(r) == 0) { "" } else { map_get(hd(r), "id") } }
+    cid0 = g("company_id", "")
+    cid = if (string_length(cid0) > 0 || string_length(iid) == 0) { cid0 } else { r = db_query(db, "SELECT company_id FROM issue WHERE id = ?", [iid]); if (length(r) == 0) { "" } else { map_get(hd(r), "company_id") } }
+    rr = if (string_length(rid) == 0) { [] } else { db_query(db, "SELECT attempt, tier FROM run WHERE id = ?", [rid]) }
+    att = if (length(rr) == 0) { 0 } else { str_or_zero(map_get(hd(rr), "attempt")) }
+    tier = if (length(rr) == 0) { "" } else { str_or_empty(map_get(hd(rr), "tier")) }
+    _i = db_query(db, "INSERT INTO llm_call (ts, company_id, issue_id, run_id, kind, runtime, model_req, model, outcome, exit_code, turns, tool_calls, tools, tokens_in, tokens_out, cache_read, cache_write, cost_cents, wall_ms, api_ms, attempt, tier, detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [timestamp(), cid, iid, rid, g("kind", ""), g("runtime", ""), g("model_req", ""), g("model", ""), g("outcome", ""), g("exit_code", 0), g("turns", 0), g("tool_calls", 0), g("tools", ""), g("tokens_in", 0), g("tokens_out", 0), g("cache_read", 0), g("cache_write", 0), g("cost_cents", 0), g("wall_ms", 0), g("api_ms", 0), att, tier, g("detail", "")])
+    g("kind", "")
+}
+
+fun str_or_zero(v) { if (v == nil) { 0 } else { v } }
+
+# col: "issue_id" or "run_id".
+fun calls_for(db, col, id) {
+    db_query(db, "SELECT * FROM llm_call WHERE " ++ col ++ " = ? ORDER BY id", [id])
+}
+
+fun calls_since(db, cid, since) {
+    if (string_length(cid) == 0) { db_query(db, "SELECT * FROM llm_call WHERE ts >= ? ORDER BY id", [since]) }
+    else { db_query(db, "SELECT * FROM llm_call WHERE company_id = ? AND ts >= ? ORDER BY id", [cid, since]) }
+}
+
+# Totals by step and model since `since` (cid "" = every company), plus how
+# the builder runs on each model ended and what each merged issue cost.
+fun call_summary(db, cid, since) {
+    w = if (string_length(cid) == 0) { "ts >= ?" } else { "company_id = ? AND ts >= ?" }
+    ps = if (string_length(cid) == 0) { [since] } else { [cid, since] }
+    by = db_query(db, "SELECT kind, model, COUNT(*) AS calls, ROUND(SUM(cost_cents), 2) AS cents, ROUND(AVG(turns), 1) AS avg_turns, ROUND(AVG(tool_calls), 1) AS avg_tool_calls, SUM(tokens_in) AS tokens_in, SUM(tokens_out) AS tokens_out, SUM(cache_read) AS cache_read, SUM(cache_write) AS cache_write, ROUND(AVG(wall_ms)) AS avg_wall_ms, SUM(CASE WHEN exit_code <> 0 THEN 1 ELSE 0 END) AS errors FROM llm_call WHERE " ++ w ++ " GROUP BY kind, model ORDER BY kind, model", ps)
+    wr = if (string_length(cid) == 0) { "r.started_at >= ?" } else { "i.company_id = ? AND r.started_at >= ?" }
+    runs = db_query(db, "SELECT r.model AS model, COUNT(*) AS runs, SUM(CASE WHEN r.vpass = 1 THEN 1 ELSE 0 END) AS verify_pass, SUM(CASE WHEN r.merge_sha <> '' THEN 1 ELSE 0 END) AS merged, ROUND(AVG(r.cost_cents), 1) AS avg_cents FROM run r JOIN issue i ON i.id = r.issue_id WHERE " ++ wr ++ " GROUP BY r.model ORDER BY r.model", ps)
+    wm = if (string_length(cid) == 0) { "c.ts >= ?" } else { "c.company_id = ? AND c.ts >= ?" }
+    merged = db_query(db, "SELECT c.issue_id AS issue_id, ROUND(SUM(c.cost_cents), 2) AS cents, COUNT(*) AS calls, MAX(c.attempt) AS attempts, GROUP_CONCAT(DISTINCT c.model) AS models FROM llm_call c WHERE " ++ wm ++ " AND c.issue_id IN (SELECT issue_id FROM run WHERE merge_sha <> '') GROUP BY c.issue_id ORDER BY c.issue_id", ps)
+    n = length(merged)
+    tot = Std.sum([map_get(m, "cents") for m in merged])
+    %{since: since, by_step_model: by, builder_runs_by_model: runs, merged_issues: n, cents_per_merged_issue: (if (n == 0) { 0 } else { tot / n }), merged: merged}
 }
 
 # Cost by stage (agent, review, gate, ...) for one run or one issue.

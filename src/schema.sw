@@ -100,6 +100,12 @@ fun migrate(db) {
     _spend    = db_exec(db, "CREATE TABLE IF NOT EXISTS spend (company_id TEXT, kind TEXT, cents REAL, issue_id TEXT, ts INTEGER)")
     _ix_spend = db_exec(db, "CREATE INDEX IF NOT EXISTS ix_spend_ts ON spend (company_id, ts)")
     _sp_run   = db_exec(db, "ALTER TABLE spend ADD COLUMN run_id TEXT DEFAULT ''")
+    # One row per model call O makes (builder, review, gate, planner, persona,
+    # judge, reflect, preflight): what was asked for, what answered, and what
+    # it took. The raw material for tuning models and prompts.
+    _llm      = db_exec(db, "CREATE TABLE IF NOT EXISTS llm_call (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, company_id TEXT DEFAULT '', issue_id TEXT DEFAULT '', run_id TEXT DEFAULT '', kind TEXT, runtime TEXT DEFAULT '', model_req TEXT DEFAULT '', model TEXT DEFAULT '', outcome TEXT DEFAULT '', exit_code INTEGER DEFAULT 0, turns INTEGER DEFAULT 0, tool_calls INTEGER DEFAULT 0, tools TEXT DEFAULT '', tokens_in INTEGER DEFAULT 0, tokens_out INTEGER DEFAULT 0, cache_read INTEGER DEFAULT 0, cache_write INTEGER DEFAULT 0, cost_cents REAL DEFAULT 0, wall_ms INTEGER DEFAULT 0, api_ms INTEGER DEFAULT 0, attempt INTEGER DEFAULT 0, tier TEXT DEFAULT '', detail TEXT DEFAULT '')")
+    _ix_llm_i = db_exec(db, "CREATE INDEX IF NOT EXISTS ix_llm_issue ON llm_call (issue_id)")
+    _ix_llm_t = db_exec(db, "CREATE INDEX IF NOT EXISTS ix_llm_ts ON llm_call (company_id, ts)")
     _ix_sprun = db_exec(db, "CREATE INDEX IF NOT EXISTS ix_spend_run ON spend (run_id)")
     _ix_spiss = db_exec(db, "CREATE INDEX IF NOT EXISTS ix_spend_issue ON spend (issue_id)")
     # o#70: production errors, one row per tracker id / fingerprint
