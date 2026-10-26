@@ -2602,6 +2602,16 @@ hc="$(sqlite3 "$TMP5/.o/o.db" "SELECT cost_cents FROM run WHERE issue_id='$IID_H
 last="$(ls "$TMP5/agent-args".prompt.* | sort -t. -k3 -n | tail -1)"
 grep -q "time limit" "$last" && grep -q "sleep 240" "$last" || { cat "$last"; fail "timeout: the retry prompt lacks the time-limit note"; }
 pass "timeout: a killed run costs what it streamed (not a flat \$3) and its retry is told why it stopped"
+# O_MODEL_ONLY pins builders to one model: no ladder, no tier `builder`.
+stop_daemon "$DAEMON5_PID"
+HOME="$TMP5" O_DB="$TMP5/.o/o.db" O_PORT="$PORT5" O_NO_OPEN=1 O_SANDBOX=bwrap O_API_TOKEN="$TOK" GH_TOKEN=fake-gh-token O_MODEL_ONLY=opus \
+  O_CLAUDE_BIN="$TMP5/agent-stub" SBX_REPO="$SCRATCHS" SBX_ARGS="$TMP5/agent-args" ./bin/swarmd >>"$TMP5/daemon.log" 2>&1 &
+DAEMON5_PID=$!
+for _i in $(seq 1 30); do [ "$(ocurl -s -o /dev/null -w '%{http_code}' "$BASE5/api/health" 2>/dev/null || true)" = "200" ] && break; sleep 0.5; done
+IID_MO="$(jget "$(ocurl -s -X POST "$BASE5/api/companies/$CIDS/issues" -H 'Content-Type: application/json' -d '{"title":"tidy the scheduler","body":"In core/sched.c."}')" 'd["id"]')"
+wait_status_at "$BASE5" "$IID_MO" "Done" 90 || { grep -v '^\[orch\] tick' "$TMP5/daemon.log" | tail -20; fail "model only: the issue never Done"; }
+grep -- "--model opus " "$TMP5/agent-args" >/dev/null || { cat "$TMP5/agent-args"; fail "model only: with O_MODEL_ONLY=opus a builder=sonnet tier's issue should run on opus"; }
+pass "model only: O_MODEL_ONLY=opus runs builders on opus, over the ladder and a tier's builder"
 else
   echo "SKIP: agent sandbox stage (unprivileged bwrap unavailable here)"
 fi
