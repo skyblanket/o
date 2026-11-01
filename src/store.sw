@@ -9,7 +9,7 @@
 
 module Store
 
-export [next_id, call_add, calls_for, calls_since, call_summary, runtime_agents_n, mem_open, mem_add, mem_list, mem_recall, costs_by_stage, claude_agents_n, finished_runs_since, last_verb_ts, company_pause, idem_get, idem_put, notes_latest, notes_save, companies, company_row, company_create, company_update,
+export [train_put, trains, next_id, call_add, calls_for, calls_since, call_summary, runtime_agents_n, mem_open, mem_add, mem_list, mem_recall, costs_by_stage, claude_agents_n, finished_runs_since, last_verb_ts, company_pause, idem_get, idem_put, notes_latest, notes_save, companies, company_row, company_create, company_update,
         company_add_spend, enforce_budget, rollover_day, company_mark_green, global_spent_today,
         company_touch_reflect, companies_to_reflect, company_set_github, companies_with_github, company_set_maintainer, issues_in_review,
         issues_for, issue_row, issue_create, issue_create_auto, issue_create_with_origin, issue_open_fp_count, issue_import_github,
@@ -1017,6 +1017,19 @@ fun shadow_needed_of(db, cid, tier) { r = shadow_row(db, cid, tier); if (r == ni
 fun shadow_set(db, cid, tier, streak, promoted, needed) {
     _u = db_query(db, "INSERT INTO shadow (company_id, tier, streak, promoted, needed, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (company_id, tier) DO UPDATE SET streak = excluded.streak, promoted = excluded.promoted, needed = excluded.needed, updated_at = excluded.updated_at", [cid, tier, streak, promoted, needed, timestamp()])
     tier
+}
+
+# Merge trains (o#22): one row per train, its members as JSON.
+fun train_put(db, cid, n, parent, state, members, pr, detail) {
+    now = timestamp()
+    _u = db_query(db, "INSERT INTO train (company_id, n, parent, state, members, pr, detail, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (company_id, n) DO UPDATE SET state = excluded.state, members = excluded.members, pr = CASE WHEN excluded.pr = 0 THEN train.pr ELSE excluded.pr END, detail = excluded.detail, updated_at = excluded.updated_at", [cid, n, (if (parent == nil) { 0 } else { parent }), state, members, (if (pr == nil) { 0 } else { pr }), detail, now, now])
+    n
+}
+
+# The latest trains, newest first ("" = every company), members decoded.
+fun trains(db, cid) {
+    rows = if (string_length(cid) == 0) { db_query(db, "SELECT company_id, n, parent, state, members, pr, detail, created_at, updated_at FROM train ORDER BY n DESC LIMIT 50", []) } else { db_query(db, "SELECT company_id, n, parent, state, members, pr, detail, created_at, updated_at FROM train WHERE company_id = ? ORDER BY n DESC LIMIT 50", [cid]) }
+    [map_put(r, "members", json_decode(map_get(r, "members"))) for r in rows]
 }
 
 fun proof(db) {

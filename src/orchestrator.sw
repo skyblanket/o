@@ -716,7 +716,7 @@ fun tick_loop(db, dbpath, port, tick_n, running, retry) {
     receive {
         'tick' ->
             r = do_tick(db, dbpath, port, tick_n, running, retry)
-            nr = map_get(r, "running")
+            nr = maybe_train(db, map_get(r, "running"))
             nq = map_get(r, "retry")
             rc = map_size(nr)
             qc = map_size(nq)
@@ -739,6 +739,12 @@ fun tick_loop(db, dbpath, port, tick_n, running, retry) {
             tick_loop(db, dbpath, port, tick_n, map_get(r, "running"), map_get(r, "retry"))
         {'ci_done', run_id, issue_id, outcome, sha, tail} ->
             r = handle_ci_done(db, running, retry, run_id, issue_id, outcome, sha, tail)
+            tick_loop(db, dbpath, port, tick_n, map_get(r, "running"), map_get(r, "retry"))
+        {'train_event', cid, verb, n, target, data} ->
+            _te = handle_train_event(db, cid, verb, n, target, data)
+            tick_loop(db, dbpath, port, tick_n, running, retry)
+        {'train_member', issue_id, outcome, sha, tail, n} ->
+            r = handle_train_member(db, running, retry, issue_id, outcome, sha, tail, n)
             tick_loop(db, dbpath, port, tick_n, map_get(r, "running"), map_get(r, "retry"))
         {'human_cmd', issue_id, m} ->
             r = handle_human_cmd(db, running, retry, issue_id, m)
@@ -1005,7 +1011,8 @@ fun phase_timeout(phase) {
     if (phase == 'verify') { verify_timeout_ms() }
     else { if (phase == 'merge') { 1200000 }
     else { if (phase == 'ci') { ci_timeout_s() * 1000 + 120000 }
-    else { if (phase == 'gate') { gate_timeout_ms() * 2 + 120000 } else { stall_timeout() + 60000 } }}}
+    else { if (phase == 'gate') { gate_timeout_ms() * 2 + 120000 }
+    else { if (phase == 'train') { (train_interval_s() + ci_timeout_s() * 8) * 1000 + 120000 } else { stall_timeout() + 60000 } }}}}
 }
 
 # Slots are for agent work (build, verify, review). An issue waiting on
@@ -4504,6 +4511,363 @@ fun merge_worker(orch, run_id, issue_id, gh_repo, branch, num, sha) {
     ci_merge(orch, run_id, issue_id, gh_repo, branch, num, sha)
 }
 
+# ============================================================
+# Merge train (O_TRAIN=1)
+# ============================================================
+#
+# Without a train every approved PR merges on its own, which leaves every other
+# open PR behind main: each is updated and runs CI again, so N waiting PRs cost
+# about N^2 CI runs. With O_TRAIN=1 a PR the merge gate approved (so its review,
+# its tier's required_checks and the gate are all green) whose tier merges
+# automatically boards a train instead of merging. Every O_TRAIN_INTERVAL_S
+# (default 900), or once O_TRAIN_MAX (default 6) PRs wait, O builds
+# o/train-<n> from current main, merges the PRs into it in approval order,
+# opens ONE PR for it and runs the full top-level required_checks once.
+#   green -> the train merges with a merge commit; each member PR is closed
+#            ("merged in train #n") and its issue goes Done
+#   red   -> bisect: each half runs as its own train, recursively; the PR whose
+#            one-PR train goes red gets red_ci and goes back to its builder
+#   a PR that conflicts with the train is dropped from it (train.evict),
+#   rebased onto main once the train is done, and put back in line
+# A runtime-tier PR, or one with any `merge: human` tier, never boards: it
+# keeps the single-PR path and its human sign-off. One train runs per company
+# at a time. Activity: train.board, train.start, train.evict, train.split,
+# train.merged, train.red; GET /api/trains lists each train and its members.
+fun train_enabled() { if (getenv("O_TRAIN") == "1") { 'true' } else { 'false' } }
+fun train_interval_s() { env_int("O_TRAIN_INTERVAL_S", 900) }
+fun train_max() { max2(env_int("O_TRAIN_MAX", 6), 1) }
+
+# 'true' when this gate-approved PR may ride: no tier of its files is the
+# runtime tier or merges by hand (tiers.json is what the gate saw).
+fun train_eligible(cid, repo, base, iid) {
+    if (train_enabled() == 'false') { 'false' } else {
+        cfg = review_config(repo, base)
+        p = getenv("HOME") ++ "/.o/maintainer/" ++ cid ++ "/" ++ iid ++ "/tiers.json"
+        names = if (file_exists(p) == 'true') { list_or_empty(json_decode(file_read(p))) } else { ["default"] }
+        tiers = cfg_list(cfg, "tiers")
+        bad = Std.any(names, fn(nm) { nm == "runtime" || tier_merge_named(cfg, tiers, nm) == "human" })
+        if (bad == 'true') { 'false' } else { 'true' }
+    }
+}
+
+fun tier_merge_named(cfg, tiers, nm) {
+    t = Std.find(tiers, fn(x) { str_or(map_get(x, "name"), "") == nm })
+    if (t == nil) { (if (cfg_str(cfg, "default_merge") == "human") { "human" } else { "auto" }) } else { str_or(map_get(t, "merge"), "auto") }
+}
+
+# Board: the run stays open in phase 'train' (worker_pid nil: the train worker
+# is shared, never killed by the stall sweep). "train" is 0 while it waits in
+# line and 1 once a train carries it.
+fun train_board(db, running, retry, info, issue_id, num, head, now) {
+    _a = Store.log_activity_payload(db, map_get(info, "company_id"), "orchestrator", "train.board", issue_id, "PR #" ++ to_string(num))
+    i1 = map_put(map_put(map_put(info, "phase", 'train'), "started_at", now), "worker_pid", nil)
+    i2 = map_put(map_put(map_put(map_put(i1, "pr", num), "head", head), "boarded_at", now), "train", 0)
+    %{running: map_put(running, issue_id, i2), retry: map_remove(retry, issue_id)}
+}
+
+fun is_rider(running, k) {
+    info = map_get(running, k)
+    if (info == nil) { 'false' } else { if (map_get(info, "phase") == 'train') { 'true' } else { 'false' } }
+}
+
+# Every tick: per company, start a train when none is running and the line is
+# full (O_TRAIN_MAX) or its first rider has waited O_TRAIN_INTERVAL_S.
+fun maybe_train(db, running) {
+    if (train_enabled() == 'false') { running } else {
+        riders = [k for k in map_keys(running) when is_rider(running, k) == 'true']
+        cids = Std.unique([map_get(map_get(running, k), "company_id") for k in riders])
+        train_each(db, running, cids, timestamp())
+    }
+}
+
+fun train_each(db, running, cids, now) {
+    if (length(cids) == 0) { running } else {
+        cid = hd(cids)
+        mine = [k for k in map_keys(running) when is_rider(running, k) == 'true' && map_get(map_get(running, k), "company_id") == cid]
+        busy = Std.any(mine, fn(k) { map_get(map_get(running, k), "train") != 0 })
+        waiting = Std.sort_by([k for k in mine when map_get(map_get(running, k), "train") == 0], fn(k) { map_get(map_get(running, k), "boarded_at") })
+        oldest = if (length(waiting) == 0) { now } else { map_get(map_get(running, hd(waiting)), "boarded_at") }
+        due = length(waiting) > 0 && (length(waiting) >= train_max() || now - oldest >= train_interval_s() * 1000)
+        r2 = if (busy == 'false' && due) { start_train(db, running, cid, Std.take(waiting, train_max()), now) } else { running }
+        train_each(db, r2, tl(cids), now)
+    }
+}
+
+fun start_train(db, running, cid, ids, now) {
+    company = Store.company_row(db, cid)
+    repo = str_or(map_get(company, "repo"), "")
+    base = detect_base(repo)
+    members = [train_member_of(db, running, k) for k in ids]
+    job = %{company_id: cid, repo: repo, gh_repo: str_or(map_get(company, "github_repo"), ""), base: base,
+            required: cfg_list(review_config(repo, "origin/" ++ base), "required_checks"), members: members}
+    _s = spawn(train_worker(self(), job))
+    mark_riders(running, ids, now)
+}
+
+fun train_member_of(db, running, k) {
+    info = map_get(running, k)
+    issue = Store.issue_row(db, k)
+    fp = if (issue == nil) { "" } else { str_or(map_get(issue, "fingerprint"), "") }
+    closes = if (string_starts_with(fp, "gh:") == 'true') { "Closes #" ++ string_sub(fp, 3, string_length(fp) - 3) } else { "" }
+    ident = if (issue == nil) { k } else { str_or(map_get(issue, "identifier"), k) }
+    %{issue_id: k, num: map_get(info, "pr"), head: str_or(map_get(info, "head"), ""), ident: ident, closes: closes}
+}
+
+fun mark_riders(running, ids, now) {
+    if (length(ids) == 0) { running } else {
+        k = hd(ids)
+        info = map_get(running, k)
+        mark_riders(map_put(running, k, map_put(map_put(info, "train", 1), "started_at", now)), tl(ids), now)
+    }
+}
+
+# The worker that runs a train and its splits, start to end. It never touches
+# the DB: it reports {'train_event', ...} and {'train_member', ...}.
+fun train_worker(orch, job) {
+    evicted = run_train(orch, job, map_get(job, "members"), 0, [])
+    reboard_each(orch, job, evicted)
+}
+
+# Train numbers are global and increasing, kept in ~/.o/train-seq.
+fun train_seq() {
+    h = sq(getenv("HOME") ++ "/.o")
+    r = sh(f"mkdir -p {h} && exec 9>>{h}/train-seq.lock && flock 9 && n=$(( $(cat {h}/train-seq 2>/dev/null || echo 0) + 1 )) && echo $n > {h}/train-seq && echo $n")
+    v = to_int(string_trim(elem(r, 1)))
+    if (v == nil) { timestamp() } else { v }
+}
+
+fun train_dir(cid, n) { getenv("HOME") ++ "/.o/trains/" ++ cid ++ "/train-" ++ to_string(n) }
+
+fun pr_list_text(ms) { Std.join(["#" ++ to_string(map_get(m, "num")) for m in ms], ", ") }
+
+fun train_info(n, parent, state, ms, pr) {
+    %{n: n, parent: parent, state: state, pr: pr, members: [%{issue_id: map_get(m, "issue_id"), pr: map_get(m, "num"), ident: map_get(m, "ident")} for m in ms]}
+}
+
+# One train over `members` (approval order); returns the evicted members so far.
+fun run_train(orch, job, members, parent, evicted) {
+    cid = map_get(job, "company_id")
+    repo = map_get(job, "repo")
+    base = map_get(job, "base")
+    n = train_seq()
+    branch = "o/train-" ++ to_string(n)
+    dir = train_dir(cid, n)
+    fetches = Std.join([sq("+refs/heads/o/" ++ map_get(m, "issue_id") ++ ":refs/o-train/" ++ map_get(m, "issue_id")) for m in members], " ")
+    _p = sh(f"git -C {sq(repo)} worktree remove --force {sq(dir)} 2>/dev/null; rm -rf {sq(dir)}; mkdir -p {sq(dirname(dir))}; git -C {sq(repo)} worktree prune; git -C {sq(repo)} fetch -q origin {sq("+refs/heads/" ++ base ++ ":refs/remotes/origin/" ++ base)} 2>&1; for r in {fetches}; do git -C {sq(repo)} fetch -q origin \"$r\" 2>&1; done; git -C {sq(repo)} worktree add -q -f -B {sq(branch)} {sq(dir)} {sq("origin/" ++ base)} 2>&1")
+    m = train_merge_each(orch, cid, dir, n, members, [], [])
+    on = map_get(m, "riding")
+    out = map_get(m, "dropped")
+    r = if (length(on) == 0) { "" } else { train_ci(orch, job, on, parent, n, branch, dir) }
+    _c = sh(f"git -C {sq(repo)} worktree remove --force {sq(dir)} 2>/dev/null; rm -rf {sq(dir)}; git -C {sq(repo)} branch -D {sq(branch)} 2>/dev/null; git -C {sq(repo)} worktree prune")
+    if (r == "split") {
+        half = length(on) / 2
+        e1 = run_train(orch, job, Std.take(on, half), n, evicted ++ out)
+        run_train(orch, job, Std.drop(on, half), n, e1)
+    } else {
+        evicted ++ out
+    }
+}
+
+# Merge each member's approved head into the train, in order. A member that
+# doesn't merge cleanly is dropped from this train (train.evict).
+fun train_merge_each(orch, cid, dir, n, members, on, out) {
+    if (length(members) == 0) { %{riding: on, dropped: out} } else {
+        m = hd(members)
+        iid = map_get(m, "issue_id")
+        head = map_get(m, "head")
+        rev = if (string_length(head) > 0) { head } else { "refs/o-train/" ++ iid }
+        msg = "Merge PR #" ++ to_string(map_get(m, "num")) ++ " (o/" ++ iid ++ ") into merge train #" ++ to_string(n)
+        r = sh(f"git -C {sq(dir)} merge -q --no-ff --no-edit -m {sq(msg)} {sq(rev)} 2>&1")
+        if (elem(r, 0) == 0) {
+            train_merge_each(orch, cid, dir, n, tl(members), on ++ [m], out)
+        } else {
+            _ab = sh(f"git -C {sq(dir)} merge --abort 2>/dev/null; git -C {sq(dir)} reset -q --hard HEAD")
+            _e = send(orch, {'train_event', cid, "train.evict", n, iid, %{detail: "PR #" ++ to_string(map_get(m, "num")) ++ " conflicts with merge train #" ++ to_string(n) ++ "; it is rebased and put back in line"}})
+            train_merge_each(orch, cid, dir, n, tl(members), on, out ++ [m])
+        }
+    }
+}
+
+# Push the train, open its PR and run CI once. "split" when a train of several
+# goes red (the caller bisects); otherwise every member has its outcome sent.
+fun train_ci(orch, job, on, parent, n, branch, dir) {
+    cid = map_get(job, "company_id")
+    gh_repo = map_get(job, "gh_repo")
+    base = map_get(job, "base")
+    title = "O merge train #" ++ to_string(n) ++ ": PRs " ++ pr_list_text(on)
+    bodyf = dirname(dir) ++ "/train-" ++ to_string(n) ++ ".md"
+    closes = [map_get(m, "closes") for m in on when string_length(map_get(m, "closes")) > 0]
+    _w = file_write(bodyf, "Merge train #" ++ to_string(n) ++ " by O: these approved PRs, merged in approval order, run the full CI once.\n\n" ++ Std.join(["- #" ++ to_string(map_get(m, "num")) ++ " " ++ map_get(m, "ident") for m in on], "\n") ++ "\n\n" ++ Std.join(closes, "\n"))
+    push = sh(f"git -C {sq(dir)} push -q -f origin HEAD:refs/heads/{branch} 2>&1")
+    made = if (elem(push, 0) != 0) { nil } else { gh_json(f"-X POST repos/{gh_repo}/pulls -f {sq("title=" ++ title)} -f head={branch} -f {sq("base=" ++ base)} -F body=@{sq(bodyf)}") }
+    num = if (made == nil) { nil } else { map_get(made, "number") }
+    if (num == nil) {
+        why = "merge train #" ++ to_string(n) ++ " could not be pushed or opened as a PR: " ++ string_trim(elem(push, 1))
+        _e = send(orch, {'train_event', cid, "train.failed", n, branch, map_put(train_info(n, parent, "failed", on, 0), "detail", why)})
+        train_tell_each(orch, on, "in_review", "", "HUMAN: " ++ why, n)
+    } else {
+        _s = send(orch, {'train_event', cid, "train.start", n, branch, map_put(train_info(n, parent, "ci", on, num), "detail", title)})
+        p = train_poll(gh_repo, num, base, map_get(job, "required"), n, timestamp(), timestamp() + ci_timeout_s() * 1000)
+        v = map_get(p, "verdict")
+        if (v == "success") {
+            train_merge(orch, job, on, parent, n, branch, num, map_get(p, "sha"))
+        } else {
+            _cl = gh_api(f"-X PATCH repos/{gh_repo}/pulls/{num} -f state=closed")
+            _db = gh_api(f"-X DELETE repos/{gh_repo}/git/refs/heads/{branch}")
+            if (string_starts_with(v, "failed") == 'true') {
+                names = string_sub(v, 7, string_length(v) - 7)
+                if (length(on) == 1) {
+                    _e = send(orch, {'train_event', cid, "train.red", n, branch, map_put(train_info(n, parent, "red", on, num), "detail", names)})
+                    train_tell_each(orch, on, "red_ci", "", "CI checks failed on merge train #" ++ to_string(n) ++ " (PR #" ++ to_string(num) ++ "), which carried only this change (PR #" ++ to_string(map_get(hd(on), "num")) ++ "): " ++ names ++ "\nSee `gh pr checks " ++ to_string(num) ++ " -R " ++ gh_repo ++ "` and `gh run view --log-failed` for the logs.", n)
+                } else {
+                    _e = send(orch, {'train_event', cid, "train.split", n, branch, map_put(train_info(n, parent, "split", on, num), "detail", names)})
+                    "split"
+                }
+            } else { if (v == "conflict") {
+                # main moved under the train: every member is rebased and rides again
+                _e = send(orch, {'train_event', cid, "train.failed", n, branch, map_put(train_info(n, parent, "failed", on, num), "detail", "conflicts with " ++ base)})
+                train_tell_each(orch, on, "reboard_rebase", "", "", n)
+            } else {
+                _e = send(orch, {'train_event', cid, "train.failed", n, branch, map_put(train_info(n, parent, "failed", on, num), "detail", "CI did not finish within O_CI_TIMEOUT_S")})
+                train_tell_each(orch, on, "red_timeout", "", "CI on merge train #" ++ to_string(n) ++ " (PR #" ++ to_string(num) ++ ") did not finish within O_CI_TIMEOUT_S.", n)
+            }}
+        }
+    }
+}
+
+fun train_tell_each(orch, on, outcome, sha, tail, n) {
+    if (length(on) == 0) { "" } else {
+        _s = send(orch, {'train_member', map_get(hd(on), "issue_id"), outcome, sha, tail, n})
+        train_tell_each(orch, tl(on), outcome, sha, tail, n)
+    }
+}
+
+# Merge the green train with a merge commit (each PR's commits stay visible),
+# pinned to the head CI checked; then close each member PR as merged in it.
+fun train_merge(orch, job, on, parent, n, branch, num, sha) {
+    cid = map_get(job, "company_id")
+    gh_repo = map_get(job, "gh_repo")
+    pin = if (string_length(sha) > 0) { " -f sha=" ++ sha } else { "" }
+    mr = gh_api(f"-X PUT repos/{gh_repo}/pulls/{num}/merge -f merge_method=merge{pin}")
+    d = if (elem(mr, 0) == 0) { json_decode(elem(mr, 1)) } else { nil }
+    if (d != nil && map_get(d, "merged") == 'true') {
+        msha = str_or(map_get(d, "sha"), "")
+        _db = gh_api(f"-X DELETE repos/{gh_repo}/git/refs/heads/{branch}")
+        _cm = train_close_each(gh_repo, cid, n, num, on)
+        _e = send(orch, {'train_event', cid, "train.merged", n, branch, map_put(train_info(n, parent, "merged", on, num), "detail", msha)})
+        train_tell_each(orch, on, "merged", msha, "", n)
+    } else {
+        # GitHub won't merge it for O (required reviews, a merge queue, ...)
+        why = "merge train #" ++ to_string(n) ++ " (PR #" ++ to_string(num) ++ ") is green but GitHub refused to merge it: " ++ string_trim(elem(mr, 1))
+        _cl = gh_api(f"-X PATCH repos/{gh_repo}/pulls/{num} -f state=closed")
+        _e = send(orch, {'train_event', cid, "train.failed", n, branch, map_put(train_info(n, parent, "failed", on, num), "detail", why)})
+        train_tell_each(orch, on, "in_review", "", why, n)
+    }
+}
+
+fun train_close_each(gh_repo, cid, n, num, on) {
+    if (length(on) == 0) { "" } else {
+        m = hd(on)
+        iid = map_get(m, "issue_id")
+        f = train_dir(cid, n) ++ "-" ++ iid ++ ".md"
+        _w = file_write(f, "merged in train #" ++ to_string(n) ++ " (PR #" ++ to_string(num) ++ ")")
+        _c = gh_api(f"-X POST repos/{gh_repo}/issues/{map_get(m, "num")}/comments -F body=@{sq(f)}")
+        _x = gh_api(f"-X PATCH repos/{gh_repo}/pulls/{map_get(m, "num")} -f state=closed")
+        _d = gh_api(f"-X DELETE repos/{gh_repo}/git/refs/heads/o/{iid}")
+        _r = sh(f"rm -f {sq(f)}")
+        train_close_each(gh_repo, cid, n, num, tl(on))
+    }
+}
+
+# Poll the train PR until CI settles, like ci_poll: %{verdict, sha} with
+# verdict success | failed:<names> | conflict | timeout.
+fun train_poll(gh_repo, num, base, required, n, pushed_at, deadline) {
+    pr = gh_json(f"repos/{gh_repo}/pulls/{num}")
+    mstate = if (pr == nil) { "" } else { str_or(map_get(pr, "mergeable_state"), "") }
+    head = if (pr == nil) { nil } else { map_get(pr, "head") }
+    sha = if (head == nil) { "" } else { str_or(map_get(head, "sha"), "") }
+    checks = pr_checks(gh_repo, sha)
+    req = required_only(checks, required)
+    verdict = classify_checks(req, "success", "")
+    settled = timestamp() - pushed_at >= env_int("O_CI_SETTLE_S", 30) * 1000
+    req_ok = Std.all(required, fn(nm) { Std.any(checks, fn(c) { str_or(map_get(c, "name"), str_or(map_get(c, "context"), "")) == nm && (string_lower(str_or(map_get(c, "conclusion"), "")) == "success" || string_lower(str_or(map_get(c, "state"), "")) == "success") }) })
+    cmpd = if (string_length(sha) > 0 && verdict == "success") { gh_json(f"repos/{gh_repo}/compare/{base}...{sha}") } else { nil }
+    behind = if (cmpd == nil) { 0 } else { b = map_get(cmpd, "behind_by"); if (b == nil) { 0 } else { b } }
+    poll = env_int("O_CI_POLL_S", 30) * 1000
+    if (mstate == "dirty") { %{verdict: "conflict", sha: sha} }
+    else { if (string_starts_with(verdict, "failed") == 'true' && ci_rerun(gh_repo, num, base, "train-" ++ to_string(n), sha, req) == 'true') {
+        _s = sleep(poll)
+        train_poll(gh_repo, num, base, required, n, timestamp(), deadline)
+    } else { if (string_starts_with(verdict, "failed") == 'true') { %{verdict: verdict, sha: sha} }
+    else { if (timestamp() > deadline) { %{verdict: "timeout", sha: sha} }
+    else { if (pr != nil && verdict == "success" && behind > 0) {
+        _u = gh_api(f"-X PUT repos/{gh_repo}/pulls/{num}/update-branch")
+        _s = sleep(poll)
+        train_poll(gh_repo, num, base, required, n, timestamp(), deadline)
+    } else { if (pr != nil && verdict == "success" && req_ok == 'true' && (length(checks) > 0 || settled)) { %{verdict: "success", sha: sha} }
+    else {
+        _s = sleep(poll)
+        train_poll(gh_repo, num, base, required, n, pushed_at, deadline)
+    }}}}}}
+}
+
+# Evicted members, once their train is done: rebase the approved head onto
+# current main and push it, then put the PR back in line. One that doesn't
+# rebase cleanly goes back to its builder as a conflict.
+fun reboard_each(orch, job, ms) {
+    if (length(ms) == 0) { "" } else {
+        _r = reboard_one(orch, job, hd(ms))
+        reboard_each(orch, job, tl(ms))
+    }
+}
+
+fun reboard_one(orch, job, m) {
+    repo = map_get(job, "repo")
+    base = map_get(job, "base")
+    iid = map_get(m, "issue_id")
+    head = map_get(m, "head")
+    rev = if (string_length(head) > 0) { head } else { "refs/o-train/" ++ iid }
+    dir = train_dir(map_get(job, "company_id"), 0) ++ "-rebase-" ++ iid
+    remote = string_trim(elem(sh(f"git -C {sq(repo)} rev-parse -q --verify refs/o-train/{iid}"), 1))
+    r = sh(f"git -C {sq(repo)} worktree remove --force {sq(dir)} 2>/dev/null; rm -rf {sq(dir)}; git -C {sq(repo)} fetch -q origin {sq("+refs/heads/" ++ base ++ ":refs/remotes/origin/" ++ base)} 2>&1 && git -C {sq(repo)} worktree add -q -f --detach {sq(dir)} {sq(rev)} 2>&1 && git -C {sq(dir)} rebase -q {sq("origin/" ++ base)} 2>&1")
+    ok = elem(r, 0) == 0
+    p = if (ok) { sh(f"git -C {sq(dir)} push -q --force-with-lease=o/{iid}:{remote} origin HEAD:refs/heads/o/{iid} 2>&1") } else { {1, ""} }
+    sha = string_trim(elem(sh(f"git -C {sq(dir)} rev-parse HEAD"), 1))
+    _ab = if (ok) { "" } else { sh(f"git -C {sq(dir)} rebase --abort 2>/dev/null") }
+    _c = sh(f"git -C {sq(repo)} worktree remove --force {sq(dir)} 2>/dev/null; rm -rf {sq(dir)}; git -C {sq(repo)} worktree prune")
+    if (ok && elem(p, 0) == 0) {
+        send(orch, {'train_member', iid, "reboard", sha, "", 0})
+    } else {
+        send(orch, {'train_member', iid, "conflict", "", "The PR for o/" ++ iid ++ " conflicts with the merge train it rode and does not rebase cleanly onto " ++ base ++ ":\n" ++ tail_text(elem(r, 1) ++ elem(p, 1), 1500), 0})
+    }
+}
+
+# ---- orchestrator side ----
+fun handle_train_event(db, cid, verb, n, target, data) {
+    st = str_or(map_get(data, "state"), "")
+    _t = if (string_length(st) > 0) { Store.train_put(db, cid, n, map_get(data, "parent"), st, json_encode(list_or_empty(map_get(data, "members"))), map_get(data, "pr"), str_or(map_get(data, "detail"), "")) } else { "" }
+    Store.log_activity_payload(db, cid, "orchestrator", verb, target, "train #" ++ to_string(n) ++ ": " ++ str_or(map_get(data, "detail"), ""))
+}
+
+fun handle_train_member(db, running, retry, issue_id, outcome, sha, tail, n) {
+    info = map_get(running, issue_id)
+    if (info == nil) { %{running: running, retry: retry} } else {
+        run_id = map_get(info, "run_id")
+        if (outcome == "reboard") {
+            now = timestamp()
+            i2 = map_put(map_put(map_put(map_put(info, "train", 0), "boarded_at", now), "started_at", now), "head", sha)
+            _a = Store.log_activity_payload(db, map_get(info, "company_id"), "orchestrator", "train.board", issue_id, "rebased, back in line")
+            %{running: map_put(running, issue_id, i2), retry: retry}
+        } else { if (outcome == "reboard_rebase") {
+            # back in line; the next train merges it onto current main or evicts it
+            now = timestamp()
+            %{running: map_put(running, issue_id, map_put(map_put(map_put(info, "train", 0), "boarded_at", now), "started_at", now)), retry: retry}
+        } else {
+            handle_ci_done(db, running, retry, run_id, issue_id, outcome, sha, tail)
+        }}
+    }
+}
+
 fun handle_gate_done(db, running, retry, run_id, issue_id, verdict, text, session, cost) {
     info = map_get(running, issue_id)
     if (info == nil) {
@@ -4537,11 +4901,14 @@ fun handle_gate_done(db, running, retry, run_id, issue_id, verdict, text, sessio
                     tp = getenv("HOME") ++ "/.o/maintainer/" ++ company_id ++ "/" ++ issue_id ++ "/tiers.json"
                     all_t = if (file_exists(tp) == 'true') { list_or_empty(json_decode(file_read(tp))) } else { waiting }
                     shadow_park(db, running, retry, run_id, issue_id, company_id, gh_repo, num, approved, waiting, all_t, shadow_needed(review_config(repo, base)))
+                } else { if (train_eligible(company_id, repo, base, issue_id) == 'true') {
+                    # O_TRAIN=1: an approved auto-merge PR rides the next merge train
+                    train_board(db, running, retry, info, issue_id, num, approved, now)
                 } else {
                 mpid = spawn(merge_worker(self(), run_id, issue_id, gh_repo, f"o/{issue_id}", num, approved))
                 info2 = map_put(map_put(map_put(info, "phase", 'ci'), "started_at", now), "worker_pid", mpid)
                 %{running: map_put(running, issue_id, info2), retry: map_remove(retry, issue_id)}
-                }
+                }}
             }
         } else {
             if (string_starts_with(verdict, "REJECT") == 'true') {

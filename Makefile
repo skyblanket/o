@@ -22,6 +22,7 @@ all: $(BIN)
 # port + temp DB, and drives the REST pipeline end to end.
 check: $(BIN)
 	@./scripts/check.sh
+	@./scripts/check-train.sh
 
 # About a minute: build + the held-out invariant suite (API, dispatch, verify
 # gate, protected paths). Run it before every push; `make check` before merge.

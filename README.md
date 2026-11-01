@@ -411,6 +411,36 @@ that judge it. Protect `.o-review.json` with `protected_paths`. (It is a root fi
   with the reason, so a superseded attempt can't be merged. The follow-up issue
   carries the `Closes #N` link.
 
+### Merge train (`O_TRAIN=1`)
+
+Without a train, every approved PR runs its own CI and merges on its own, and
+each merge leaves every other open PR behind main: O updates each one and CI
+runs again, so N waiting PRs cost about N² CI runs. With `O_TRAIN=1` (and the
+merge gate on), approved low-risk PRs merge in batches instead:
+
+- **Who boards:** a PR whose review, tier `required_checks` and merge gate are
+  all green, and whose tiers all merge automatically. A PR touching the
+  `runtime` tier, or any `"merge": "human"` tier, never boards: it keeps the
+  single-PR path and its human sign-off.
+- **Batching:** every `O_TRAIN_INTERVAL_S` (default 900), or as soon as
+  `O_TRAIN_MAX` (default 6) PRs wait, O makes `o/train-<n>` from current main
+  and merges the PRs into it in approval order. A PR that conflicts with the
+  train is dropped from it (`train.evict`), rebased onto main once the train is
+  done, and put back in line. One train runs per company at a time.
+- **CI once:** the train opens one PR, "O merge train #n: PRs #a, #b, #c", and
+  runs the full top-level `required_checks` once for the whole batch.
+- **Green:** the train PR merges with a merge commit, so each PR's commits stay
+  visible on main. Each member PR is closed with "merged in train #n" and its
+  issue goes Done (`train.merged`).
+- **Red:** O bisects: it splits the batch in half and runs each half as its own
+  train, recursively (`train.split`). The PR whose one-PR train goes red
+  (`train.red`) gets `red_ci` with the failing check names and goes back to its
+  builder; the rest merge. Main never sees the bad PR.
+- **Visible:** activity `train.board`, `train.start`, `train.evict`,
+  `train.split`, `train.red`, `train.merged`; `GET /api/trains` (and
+  `/api/companies/<id>/trains`, and `trains` in `/api/snapshot`) lists each
+  train with its state, PR, parent train and members.
+
 O acts with your GitHub token, and GitHub won't let a PR's author approve their
 own PR. So the maintainer's review is a comment, and the merge works as long as
 branch protection doesn't require an approving review.
@@ -584,6 +614,8 @@ The daemon reads its configuration from the environment. All are optional.
 | `O_SANDBOX_RW` | unset | extra comma-separated paths the sandbox keeps writable, if your agent CLI needs them. |
 | `O_MERGE_GATE` | unset | `1` sends every green PR to a merge-gate reviewer of its own (APPROVE / REJECT / UNVERIFIED), reviews in parallel. |
 | `O_MERGE_MODEL` | `claude-opus-5-5` | the merge-gate reviewer's model. |
+| `O_TRAIN` | unset | `1` turns on the merge train: gate-approved auto-merge PRs merge in batches, with the full CI run once per batch (needs `O_MERGE_GATE=1`). |
+| `O_TRAIN_INTERVAL_S` / `O_TRAIN_MAX` | `900` / `6` | a train leaves when its first PR has waited this long, or as soon as this many PRs wait. |
 | `O_ESCALATE_PATHS` / `O_ESCALATE_LINES` | unset / unset | PRs touching these path prefixes, or bigger than this many lines, always go to a human (on top of `.o-review.json` tiers). Off by default: the gate's hard rule `max_change_lines` bounds size. |
 | `O_MAX_ROUNDS` | `3` | Retry rounds per issue (`POST /api/issues/:id/retry`); past it a retry needs `{"force": true}`. |
 | `O_ENV_RETRY_S` | `120` | Pause before re-verifying after an environment failure (no attempt spent; at most 3 per issue). |
@@ -623,6 +655,7 @@ curl http://localhost:4100/api/issues/<id>/calls   # every model call for the is
 curl 'http://localhost:4100/api/calls/summary?days=7'   # by step and model: calls, cost, turns, tokens, time; builder pass/merge by model; cost per merged issue
 curl -o calls.csv 'http://localhost:4100/api/calls.csv?days=30&company=<id>'   # the raw rows, for a spreadsheet
 curl http://localhost:4100/api/snapshot       # one call for a control room: scheduler, companies, waiting, proof, activity
+curl http://localhost:4100/api/trains         # merge trains: state, PR, parent, members (also /api/companies/<id>/trains)
 curl http://localhost:4100/api/waiting        # everything waiting on a person, oldest first
 curl http://localhost:4100/api/proof          # the track record
 ```
