@@ -303,7 +303,7 @@ case "$method $path" in
   "PUT repos/acme/widgets/pulls/"*/merge)
     n="${path#repos/acme/widgets/pulls/}"; n="${n%/merge}"; b="$(cat "$GHS/pr_$n")"
     listed block_merge "$b" && { echo '{"message":"Required reviews: at least 1 approving review is required"}'; echo "gh: HTTP 405" >&2; exit 1; }
-    tmp="$(mktemp -d)"; git clone -q "$GHS/remote.git" "$tmp/c" && cd "$tmp/c" \
+    tmp="$(mktemp -d "$GHS/../stubtmp.XXXXXX")"; git clone -q "$GHS/remote.git" "$tmp/c" && cd "$tmp/c" \
       && git -c user.email=gh@x -c user.name=gh merge -q --no-ff --no-edit "origin/$b" \
       && git push -q origin main && touch "$GHS/merged_$n" \
       && echo "{\"merged\":true,\"sha\":\"$(git rev-parse HEAD)\"}" ;;
@@ -316,7 +316,7 @@ case "$method $path" in
     nb="$(git -C "$GHS/remote.git" rev-list --count "$csha..$cbase" 2>/dev/null || echo 0)"; echo "{\"behind_by\":$nb}" ;;
   "PUT repos/acme/widgets/pulls/"*/update-branch)
     n="${path#repos/acme/widgets/pulls/}"; n="${n%/update-branch}"; b="$(cat "$GHS/pr_$n")"
-    tmp="$(mktemp -d)"; git clone -q "$GHS/remote.git" "$tmp/c" && cd "$tmp/c" && git checkout -q "$b" \
+    tmp="$(mktemp -d "$GHS/../stubtmp.XXXXXX")"; git clone -q "$GHS/remote.git" "$tmp/c" && cd "$tmp/c" && git checkout -q "$b" \
       && git -c user.email=gh@x -c user.name=gh merge -q --no-edit origin/main && git push -q origin "$b" && touch "$GHS/updated_$n"
     echo '{"message":"Updating pull request branch."}' ;;
   "DELETE repos/acme/widgets/git/refs/heads/"*) git -C "$GHS/remote.git" branch -q -D "${path#repos/acme/widgets/git/refs/heads/}" ;;
@@ -422,6 +422,9 @@ git -C "$SEEDGH" add -A; git -C "$SEEDGH" commit -q -m "seed gh project"; seed_p
 GHREPO="$TMP4/ghclone"
 git clone -q "$GHS/remote.git" "$GHREPO"
 git -C "$GHREPO" config user.email "o@example.com"; git -C "$GHREPO" config user.name "O Test"
+# Left on a commit rather than a branch (a live checkout was found that way):
+# O must still build on the remote's default branch, not on git's error text.
+git -C "$GHREPO" checkout -q --detach
 resp="$(ocurl -s -w $'\n%{http_code}' -X POST "$BASE4/api/companies" -H 'Content-Type: application/json' \
   -d "{\"name\":\"GH Co\",\"issue_prefix\":\"GH\",\"budget_monthly_cents\":1000000,\"repo\":\"$GHREPO\",\"verify_cmd\":\"sh verify.sh\",\"protected_paths\":\"protected/\",\"github_repo\":\"acme/widgets\",\"ship\":\"pr\"}")"
 sc="$(printf '%s' "$resp" | tail -n1)"; body="$(printf '%s' "$resp" | sed '$d')"
@@ -580,7 +583,7 @@ git -C "$GHS/remote.git" log --oneline main | grep "o/$IID_PRO" >/dev/null || fa
 [ "$(sqlite3 "$TMP4/o.db" "SELECT status FROM issue WHERE id='$IID_BLK'")" = "In Review" ] || fail "poller: a refused merge left In Review"
 [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='pr.adopted' AND target IN ('$IID_BLK','$IID_GE','$IID_GS')")" = "0" ] || fail "poller: re-adopted a PR that must wait for a human"
 nblk="$(pr_of "$IID_BLK")"
-tmpm="$(mktemp -d)"; git clone -q "$GHS/remote.git" "$tmpm/c"
+tmpm="$(mktemp -d -p "$TMP4")"; git clone -q "$GHS/remote.git" "$tmpm/c"
 git -C "$tmpm/c" -c user.email=h@x -c user.name=human merge -q --no-ff --no-edit "origin/o/$IID_BLK" && git -C "$tmpm/c" push -q origin main
 touch "$GHS/merged_$nblk"
 wait_status_at "$BASE4" "$IID_BLK" "Done" 30 || fail "poller: a human merge was not picked up as Done"
@@ -679,7 +682,7 @@ IID_BH="$(gh_issue '[sim:good] lands after main moves')"
 echo "o/$IID_BH" >> "$GHS/hold_ci"
 for _i in $(seq 1 90); do [ -n "$(pr_of "$IID_BH" 2>/dev/null)" ] && break; sleep 1; done
 [ -n "$(pr_of "$IID_BH")" ] || fail "gate2: held PR never opened"
-tmpb="$(mktemp -d)"; git clone -q "$GHS/remote.git" "$tmpb/c"
+tmpb="$(mktemp -d -p "$TMP4")"; git clone -q "$GHS/remote.git" "$tmpb/c"
 echo moved > "$tmpb/c/main-moved.txt"; git -C "$tmpb/c" add main-moved.txt
 git -C "$tmpb/c" -c user.email=h@x -c user.name=human commit -q -m "main moves on"
 # Other gate2 PRs may still be landing on main: rebase and retry the push.
@@ -745,7 +748,7 @@ echo "o/$IID_FL2" >> "$GHS/flaky_ci"; echo "o/$IID_FL2" >> "$GHS/hold_ci"
 # Base must move AFTER the PR's branch is pushed, or the PR is never behind it.
 for _i in $(seq 1 180); do [ "$(sqlite3 "$TMP4/o.db" "SELECT COUNT(*) FROM activity WHERE verb='ci.start' AND target='$IID_FL2'")" -ge 1 ] && [ -n "$(pr_of "$IID_FL2" 2>/dev/null)" ] && break; sleep 1; done
 [ -n "$(pr_of "$IID_FL2" 2>/dev/null)" ] || { tail -30 "$TMP4/daemon.log"; fail "ci rerun: the no-permission PR never opened (no CI to hold)"; }
-tmpf="$(mktemp -d)"; git clone -q "$GHS/remote.git" "$tmpf/c"
+tmpf="$(mktemp -d -p "$TMP4")"; git clone -q "$GHS/remote.git" "$tmpf/c"
 echo fix > "$tmpf/c/base-fix.txt"; git -C "$tmpf/c" add base-fix.txt
 git -C "$tmpf/c" -c user.email=h@x -c user.name=human commit -q -m "base moves on"
 for _i in 1 2 3 4 5; do git -C "$tmpf/c" push -q origin main 2>/dev/null && break; git -C "$tmpf/c" -c user.email=h@x -c user.name=human pull -q --rebase origin main; done
@@ -1268,6 +1271,15 @@ if make >/dev/null 2>&1; then
 else
   make || true
   fail "build (make)"
+fi
+# O_STAGE_ONLY=tests/stages/<name>.sh: build, run just that stage, stop.
+if [ -n "${O_STAGE_ONLY:-}" ]; then
+  [ -f "$O_STAGE_ONLY" ] || fail "O_STAGE_ONLY: no such stage file: $O_STAGE_ONLY"
+  echo "=== stage $O_STAGE_ONLY (alone) ==="
+  ( . "./$O_STAGE_ONLY" ) || fail "stage $O_STAGE_ONLY failed"
+  echo
+  echo "STAGE GREEN"
+  exit 0
 fi
 D4LOG="$(mktemp)"
 ( trap 'exit 143' TERM; trap d4_cleanup EXIT; stage_d4 ) > "$D4LOG" 2>&1 &
@@ -2793,6 +2805,20 @@ echo "=== 4th daemon stages (ran in the background) ==="
 d4rc=0; wait "$D4JOB" || d4rc=$?; D4JOB=""
 cat "$D4LOG"; rm -f "$D4LOG"
 [ "$d4rc" = "0" ] || fail "4th daemon stages failed (exit $d4rc; output above)"
+
+# ============================================================
+# Stages O adds: tests/stages/*.sh
+# ============================================================
+# This file and tests/heldout/ are protected paths: an agent can't edit or
+# weaken them. Its new tests go in tests/stages/<name>.sh (see the README
+# there). Each runs here, in name order, in its own subshell: it sees this
+# file's helpers, and a `fail` ends only that stage (then the suite fails).
+for st in tests/stages/*.sh; do
+  [ -f "$st" ] || continue
+  echo
+  echo "=== stage $st ==="
+  ( . "./$st" ) || fail "stage $st failed"
+done
 
 # ============================================================
 # Held-out invariant suite — the frozen core (tests/heldout/core.sh)
