@@ -704,6 +704,9 @@ vs_rc="$(sqlite3 "$TMP4/o.db" "SELECT verify_state FROM run WHERE issue_id='$IID
 [ "$vs_rc" = "red_timeout" ] || { sqlite3 "$TMP4/o.db" "SELECT attempt, verify_state, substr(verify_output,1,200) FROM run WHERE issue_id='$IID_RC'"; fail "required: expected red_timeout, got '$vs_rc'"; }
 git -C "$GHS/remote.git" log --oneline main | grep "o/$IID_RC" >/dev/null && fail "required: merged without the required check"
 pass "required: a PR whose required check never passes is never merged (red_timeout)"
+# Back to the normal CI wait: the 6 s timeout above is for that case only. Left
+# on, it timed out the PRs below whenever the box was busy (red_timeout -> Failed).
+restart_d4 O_MERGE_GATE=1
 IID_DOC="$(gh_issue '[sim:docs] docs-only change')"
 echo "o/$IID_DOC" >> "$GHS/only_lint"
 echo "o/$IID_DOC" >> "$GHS/extra_fail"
