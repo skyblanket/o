@@ -13,6 +13,8 @@
 #   GET  /api/runs                          run history
 #   GET  /api/orchestrator                  live scheduler snapshot
 #   GET  /api/snapshot                      control room: scheduler, companies, waiting, proof, activity
+#   GET  /api/trains                        merge trains (o#22) and their members
+#   GET  /api/companies/:id/trains          one company's merge trains
 #   GET  /api/approvals                     pending approvals
 #   POST /api/approvals/:id                 decide an approval
 #   GET  /api/companies                     list companies
@@ -128,7 +130,7 @@ fun orch_snap() {
 # the track record and the latest activity.
 fun control_snapshot(db, conn) {
     cos = [%{id: map_get(c, "id"), name: map_get(c, "name"), status: map_get(c, "status"), pause_reason: default_str(map_get(c, "pause_reason"), ""), spent_today_cents: default_num(map_get(c, "spent_today_cents"), 0), github_repo: default_str(map_get(c, "github_repo"), "")} for c in Store.companies(db)]
-    respond(conn, 200, json_encode(%{ts: timestamp(), orchestrator: orch_snap(), companies: cos, waiting: Orchestrator.waiting_list(db), proof: Store.proof(db), activity: Store.activity_recent(db)}))
+    respond(conn, 200, json_encode(%{ts: timestamp(), orchestrator: orch_snap(), companies: cos, waiting: Orchestrator.waiting_list(db), proof: Store.proof(db), trains: Std.take(Store.trains(db, ""), 10), activity: Store.activity_recent(db)}))
 }
 
 # ---- dispatch ------------------------------------------------
@@ -293,6 +295,8 @@ fun route(db, dbpath, conn, method, path, body) {
         "/api/activity" -> respond(conn, 200, json_encode(Store.activity_recent(db)))
         "/api/proof" -> respond(conn, 200, json_encode(Store.proof(db)))
         "/api/waiting" -> respond(conn, 200, json_encode(Orchestrator.waiting_list(db)))
+        "/api/trains" -> respond(conn, 200, json_encode(Store.trains(db, "")))
+        p when string_starts_with(p, "/api/companies/") == 'true' && string_ends_with(p, "/trains") == 'true' -> respond(conn, 200, json_encode(Store.trains(db, string_sub(p, 15, string_length(p) - 15 - 7))))
         p when string_starts_with(p, "/api/memory") == 'true' -> route_memory(conn, method, p, body)
         "/api/orchestrator" -> orch_snapshot(conn)
         "/api/snapshot" -> control_snapshot(db, conn)

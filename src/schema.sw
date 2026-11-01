@@ -111,6 +111,8 @@ fun migrate(db) {
     # o#70: production errors, one row per tracker id / fingerprint
     _errors   = db_exec(db, "CREATE TABLE IF NOT EXISTS errors (company_id TEXT, key TEXT, issue_id TEXT, count INTEGER DEFAULT 0, users INTEGER DEFAULT 0, fresh INTEGER DEFAULT 0, escaped INTEGER DEFAULT 0, first_ts INTEGER, last_ts INTEGER, PRIMARY KEY (company_id, key))")
     # o#69: per tier, how many shadow PRs people merged unchanged in a row
+    # o#22: merge trains, one row per train (splits get their own n)
+    _train    = db_exec(db, "CREATE TABLE IF NOT EXISTS train (company_id TEXT, n INTEGER, parent INTEGER DEFAULT 0, state TEXT, members TEXT DEFAULT '[]', pr INTEGER DEFAULT 0, detail TEXT DEFAULT '', created_at INTEGER, updated_at INTEGER, PRIMARY KEY (company_id, n))")
     _shadow   = db_exec(db, "CREATE TABLE IF NOT EXISTS shadow (company_id TEXT, tier TEXT, streak INTEGER DEFAULT 0, promoted INTEGER DEFAULT 0, needed INTEGER DEFAULT 0, updated_at INTEGER, PRIMARY KEY (company_id, tier))")
 
     # ---- persona pass -------------------------------------------
