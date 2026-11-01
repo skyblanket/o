@@ -2593,9 +2593,17 @@ fun is_pr_mode(company) {
     if (company == nil) { 'false' } else { if (str_or(map_get(company, "ship"), "merge") == "pr") { 'true' } else { 'false' } }
 }
 
+# The branch O builds on: the checkout's own branch, else (a detached HEAD, as
+# a checkout left on a commit) the remote's default branch, else "main". Only a
+# command that succeeded counts: git's error text is never a branch name.
 fun detect_base(repo) {
-    b = string_trim(elem(sh(f"git -C {sq(repo)} symbolic-ref --short HEAD"), 1))
-    if (string_length(b) == 0) { "main" } else { b }
+    r = sh(f"git -C {sq(repo)} symbolic-ref --short -q HEAD")
+    b = if (elem(r, 0) == 0) { string_trim(elem(r, 1)) } else { "" }
+    if (string_length(b) > 0) { b } else {
+        o = sh(f"git -C {sq(repo)} symbolic-ref --short -q refs/remotes/origin/HEAD")
+        ob = if (elem(o, 0) == 0) { string_trim(elem(o, 1)) } else { "" }
+        if (string_starts_with(ob, "origin/") == 'true' && string_length(ob) > 7) { string_sub(ob, 7, string_length(ob) - 7) } else { "main" }
+    }
 }
 
 # Wrap a verify command in a hard wall-clock timeout using perl's alarm — a
